@@ -14,6 +14,8 @@
 #define CROP_HANDLE_SIZE 10.0
 #define CROP_HIT_TOLERANCE 8.0
 #define CROP_MIN_SIZE 2.0
+#define ZOOM_STEP 1.25
+#define ZOOM_MAX 16.0
 
 typedef struct {
   LoslesFormatRegistry *registry;
@@ -98,6 +100,7 @@ struct _LoslesWindow {
   LoslesColorManager *color_manager;
 
   GtkHeaderBar *header_bar;
+  GtkFixed *zoom_view;
   GtkPicture *picture;
   GtkDrawingArea *crop_area;
   GtkSpinner *spinner;
@@ -134,6 +137,21 @@ struct _LoslesWindow {
 
   gboolean monitor_signals_connected;
   gboolean operation_in_progress;
+  gdouble zoom_scale;
+  gdouble zoom_center_x;
+  gdouble zoom_center_y;
+  gdouble zoom_picture_x;
+  gdouble zoom_picture_y;
+  gdouble zoom_picture_width;
+  gdouble zoom_picture_height;
+  gdouble zoom_pointer_x;
+  gdouble zoom_pointer_y;
+  gdouble zoom_drag_center_x;
+  gdouble zoom_drag_center_y;
+  gint zoom_view_width;
+  gint zoom_view_height;
+  gboolean zoom_pointer_inside;
+  gboolean zoom_dragging;
   CropDragMode crop_drag_mode;
   gdouble crop_drag_origin_x;
   gdouble crop_drag_origin_y;
@@ -152,6 +170,8 @@ static void start_render_for_image(LoslesWindow *self,
 static void update_controls(LoslesWindow *self);
 static void preload_neighbors(LoslesWindow *self);
 static void preload_rendered_neighbors(LoslesWindow *self);
+static void apply_zoom_layout(LoslesWindow *self);
+static void reset_zoom(LoslesWindow *self);
 
 static void
 load_job_free(LoadJob *job)
@@ -256,12 +276,133 @@ show_error(LoslesWindow *self, const gchar *primary, const GError *error)
   g_object_unref(dialog);
 }
 
+static gboolean
+zoom_dimensions(LoslesWindow *self,
+                gdouble scale,
+                gdouble *width,
+                gdouble *height)
+{
+  if (!self->current_texture)
+    return FALSE;
+
+  const gint view_width = self->zoom_view_width;
+  const gint view_height = self->zoom_view_height;
+  const gint texture_width =
+    gdk_texture_get_width(self->current_texture);
+  const gint texture_height =
+    gdk_texture_get_height(self->current_texture);
+  if (view_width <= 0 || view_height <= 0 ||
+      texture_width <= 0 || texture_height <= 0)
+    return FALSE;
+
+  const gdouble fit =
+    MIN((gdouble)view_width / texture_width,
+        (gdouble)view_height / texture_height);
+  *width =
+    (gint)CLAMP(texture_width * fit * scale + 0.5,
+                1.0,
+                (gdouble)G_MAXINT);
+  *height =
+    (gint)CLAMP(texture_height * fit * scale + 0.5,
+                1.0,
+                (gdouble)G_MAXINT);
+  return TRUE;
+}
+
+static void
+update_zoom_cursor(LoslesWindow *self)
+{
+  const gboolean over_image =
+    self->zoom_pointer_inside &&
+    self->zoom_pointer_x >= self->zoom_picture_x &&
+    self->zoom_pointer_y >= self->zoom_picture_y &&
+    self->zoom_pointer_x <=
+      self->zoom_picture_x + self->zoom_picture_width &&
+    self->zoom_pointer_y <=
+      self->zoom_picture_y + self->zoom_picture_height;
+  const gchar *cursor = NULL;
+  if (self->zoom_dragging)
+    cursor = "grabbing";
+  else if (self->zoom_scale > 1.0 && over_image)
+    cursor = "grab";
+  gtk_widget_set_cursor_from_name(GTK_WIDGET(self->zoom_view), cursor);
+}
+
+static void
+apply_zoom_layout(LoslesWindow *self)
+{
+  gdouble picture_width = 0;
+  gdouble picture_height = 0;
+  if (!zoom_dimensions(self,
+                       self->zoom_scale,
+                       &picture_width,
+                       &picture_height)) {
+    self->zoom_picture_x = 0;
+    self->zoom_picture_y = 0;
+    self->zoom_picture_width = 0;
+    self->zoom_picture_height = 0;
+    gtk_widget_set_size_request(GTK_WIDGET(self->picture), 1, 1);
+    gtk_fixed_move(self->zoom_view, GTK_WIDGET(self->picture), 0, 0);
+    update_zoom_cursor(self);
+    return;
+  }
+
+  const gdouble view_width = self->zoom_view_width;
+  const gdouble view_height = self->zoom_view_height;
+  gdouble picture_x =
+    view_width / 2.0 - self->zoom_center_x * picture_width;
+  gdouble picture_y =
+    view_height / 2.0 - self->zoom_center_y * picture_height;
+  /*
+   * Permit cursor anchoring within a letterboxed axis, but never move the
+   * complete image outside the viewport or expose space beyond an overflow
+   * edge.
+   */
+  if (picture_width <= view_width)
+    picture_x = CLAMP(picture_x, 0, view_width - picture_width);
+  else
+    picture_x = CLAMP(picture_x, view_width - picture_width, 0);
+  if (picture_height <= view_height)
+    picture_y = CLAMP(picture_y, 0, view_height - picture_height);
+  else
+    picture_y = CLAMP(picture_y, view_height - picture_height, 0);
+
+  self->zoom_center_x =
+    (view_width / 2.0 - picture_x) / picture_width;
+  self->zoom_center_y =
+    (view_height / 2.0 - picture_y) / picture_height;
+  self->zoom_picture_x = picture_x;
+  self->zoom_picture_y = picture_y;
+  self->zoom_picture_width = picture_width;
+  self->zoom_picture_height = picture_height;
+
+  gtk_widget_set_size_request(GTK_WIDGET(self->picture),
+                              (gint)picture_width,
+                              (gint)picture_height);
+  gtk_fixed_move(self->zoom_view,
+                 GTK_WIDGET(self->picture),
+                 picture_x,
+                 picture_y);
+  update_zoom_cursor(self);
+}
+
+static void
+reset_zoom(LoslesWindow *self)
+{
+  self->zoom_scale = 1.0;
+  self->zoom_center_x = 0.5;
+  self->zoom_center_y = 0.5;
+  self->zoom_dragging = FALSE;
+  apply_zoom_layout(self);
+}
+
 static void
 clear_current_image(LoslesWindow *self)
 {
   g_clear_object(&self->current_image);
   g_clear_object(&self->current_texture);
   gtk_picture_set_paintable(self->picture, NULL);
+  reset_zoom(self);
   self->crop_valid = FALSE;
   gtk_toggle_button_set_active(self->crop_button, FALSE);
   gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
@@ -765,6 +906,7 @@ display_rendered_image(LoslesWindow *self,
       losles_rendered_image_create_texture(rendered);
   gtk_picture_set_paintable(self->picture,
                             GDK_PAINTABLE(self->current_texture));
+  apply_zoom_layout(self);
 
   const LoslesPixelFormat source_format =
     losles_image_get_pixel_format(image);
@@ -953,6 +1095,7 @@ invalidate_render_cache(LoslesWindow *self)
   self->render_cache_size = 0;
   g_clear_object(&self->current_texture);
   gtk_picture_set_paintable(self->picture, NULL);
+  apply_zoom_layout(self);
 }
 
 static void
@@ -1736,6 +1879,8 @@ static void
 crop_toggled(GtkToggleButton *button, LoslesWindow *self)
 {
   const gboolean active = gtk_toggle_button_get_active(button);
+  if (active)
+    reset_zoom(self);
   gtk_widget_set_visible(GTK_WIDGET(self->crop_area), active);
   gtk_widget_set_visible(GTK_WIDGET(self->apply_crop_button), active);
   self->crop_drag_mode = CROP_DRAG_NONE;
@@ -2023,6 +2168,169 @@ action_escape(GSimpleAction *action,
   LoslesWindow *self = LOSLES_WINDOW(user_data);
   if (gtk_toggle_button_get_active(self->crop_button))
     gtk_toggle_button_set_active(self->crop_button, FALSE);
+  else if (self->zoom_scale > 1.0)
+    reset_zoom(self);
+}
+
+static void
+zoom_pointer_moved(GtkEventControllerMotion *controller,
+                   gdouble x,
+                   gdouble y,
+                   LoslesWindow *self)
+{
+  (void)controller;
+  self->zoom_pointer_x = x;
+  self->zoom_pointer_y = y;
+  self->zoom_pointer_inside = TRUE;
+  update_zoom_cursor(self);
+}
+
+static void
+zoom_pointer_left(GtkEventControllerMotion *controller,
+                  LoslesWindow *self)
+{
+  (void)controller;
+  self->zoom_pointer_inside = FALSE;
+  update_zoom_cursor(self);
+}
+
+static gboolean
+zoom_scrolled(GtkEventControllerScroll *controller,
+              gdouble dx,
+              gdouble dy,
+              LoslesWindow *self)
+{
+  (void)controller;
+  (void)dx;
+  if (!self->current_texture || dy == 0 ||
+      gtk_toggle_button_get_active(self->crop_button))
+    return FALSE;
+
+  const gboolean over_image =
+    self->zoom_pointer_inside &&
+    self->zoom_pointer_x >= self->zoom_picture_x &&
+    self->zoom_pointer_y >= self->zoom_picture_y &&
+    self->zoom_pointer_x <=
+      self->zoom_picture_x + self->zoom_picture_width &&
+    self->zoom_pointer_y <=
+      self->zoom_picture_y + self->zoom_picture_height;
+  if (!over_image)
+    return FALSE;
+
+  const gdouble old_scale = self->zoom_scale;
+  const gdouble new_scale =
+    CLAMP(dy < 0 ? old_scale * ZOOM_STEP
+                 : old_scale / ZOOM_STEP,
+          1.0,
+          ZOOM_MAX);
+  if (new_scale == old_scale)
+    return TRUE;
+
+  const gdouble image_x =
+    (self->zoom_pointer_x - self->zoom_picture_x) /
+    self->zoom_picture_width;
+  const gdouble image_y =
+    (self->zoom_pointer_y - self->zoom_picture_y) /
+    self->zoom_picture_height;
+  gdouble new_width = 0;
+  gdouble new_height = 0;
+  if (!zoom_dimensions(self,
+                       new_scale,
+                       &new_width,
+                       &new_height))
+    return FALSE;
+
+  const gdouble view_width = self->zoom_view_width;
+  const gdouble view_height = self->zoom_view_height;
+  self->zoom_scale = new_scale;
+  if (new_scale == 1.0) {
+    self->zoom_center_x = 0.5;
+    self->zoom_center_y = 0.5;
+  } else {
+    /*
+     * Store the image point which must land at the viewport center. This is
+     * algebraically equivalent to keeping image_x/image_y under the pointer.
+     */
+    self->zoom_center_x =
+      image_x +
+      (view_width / 2.0 - self->zoom_pointer_x) / new_width;
+    self->zoom_center_y =
+      image_y +
+      (view_height / 2.0 - self->zoom_pointer_y) / new_height;
+  }
+  apply_zoom_layout(self);
+  return TRUE;
+}
+
+static void
+zoom_drag_begin(GtkGestureDrag *gesture,
+                gdouble start_x,
+                gdouble start_y,
+                LoslesWindow *self)
+{
+  const gboolean over_image =
+    start_x >= self->zoom_picture_x &&
+    start_y >= self->zoom_picture_y &&
+    start_x <= self->zoom_picture_x + self->zoom_picture_width &&
+    start_y <= self->zoom_picture_y + self->zoom_picture_height;
+  if (self->zoom_scale <= 1.0 || !self->current_texture ||
+      gtk_toggle_button_get_active(self->crop_button) ||
+      !over_image) {
+    gtk_gesture_set_state(GTK_GESTURE(gesture),
+                          GTK_EVENT_SEQUENCE_DENIED);
+    return;
+  }
+
+  self->zoom_dragging = TRUE;
+  self->zoom_drag_center_x = self->zoom_center_x;
+  self->zoom_drag_center_y = self->zoom_center_y;
+  update_zoom_cursor(self);
+}
+
+static void
+zoom_drag_update(GtkGestureDrag *gesture,
+                 gdouble offset_x,
+                 gdouble offset_y,
+                 LoslesWindow *self)
+{
+  (void)gesture;
+  if (!self->zoom_dragging ||
+      self->zoom_picture_width <= 0 ||
+      self->zoom_picture_height <= 0)
+    return;
+
+  if (self->zoom_picture_width > self->zoom_view_width) {
+    self->zoom_center_x =
+      self->zoom_drag_center_x - offset_x / self->zoom_picture_width;
+  }
+  if (self->zoom_picture_height > self->zoom_view_height) {
+    self->zoom_center_y =
+      self->zoom_drag_center_y - offset_y / self->zoom_picture_height;
+  }
+  apply_zoom_layout(self);
+}
+
+static void
+zoom_drag_end(GtkGestureDrag *gesture,
+              gdouble offset_x,
+              gdouble offset_y,
+              LoslesWindow *self)
+{
+  zoom_drag_update(gesture, offset_x, offset_y, self);
+  self->zoom_dragging = FALSE;
+  update_zoom_cursor(self);
+}
+
+static void
+zoom_canvas_resized(GtkDrawingArea *area,
+                    gint width,
+                    gint height,
+                    LoslesWindow *self)
+{
+  (void)area;
+  self->zoom_view_width = width;
+  self->zoom_view_height = height;
+  apply_zoom_layout(self);
 }
 
 static gboolean
@@ -2253,6 +2561,9 @@ losles_window_init(LoslesWindow *self)
   self->render_blocked =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->render_cancellable = g_cancellable_new();
+  self->zoom_scale = 1.0;
+  self->zoom_center_x = 0.5;
+  self->zoom_center_y = 0.5;
 
   gtk_window_set_default_size(GTK_WINDOW(self), 960, 700);
   gtk_window_set_title(GTK_WINDOW(self), "losles");
@@ -2390,12 +2701,74 @@ losles_window_init(LoslesWindow *self)
   gtk_widget_add_css_class(overlay, "losles-canvas");
   gtk_window_set_child(GTK_WINDOW(self), overlay);
 
+  GtkWidget *canvas = gtk_drawing_area_new();
+  gtk_widget_set_hexpand(canvas, TRUE);
+  gtk_widget_set_vexpand(canvas, TRUE);
+  gtk_widget_add_css_class(canvas, "losles-canvas");
+  gtk_overlay_set_child(GTK_OVERLAY(overlay), canvas);
+  g_signal_connect(canvas,
+                   "resize",
+                   G_CALLBACK(zoom_canvas_resized),
+                   self);
+
+  self->zoom_view = GTK_FIXED(gtk_fixed_new());
+  gtk_widget_set_hexpand(GTK_WIDGET(self->zoom_view), TRUE);
+  gtk_widget_set_vexpand(GTK_WIDGET(self->zoom_view), TRUE);
+  gtk_widget_set_halign(GTK_WIDGET(self->zoom_view), GTK_ALIGN_FILL);
+  gtk_widget_set_valign(GTK_WIDGET(self->zoom_view), GTK_ALIGN_FILL);
+  gtk_widget_set_overflow(GTK_WIDGET(self->zoom_view),
+                          GTK_OVERFLOW_HIDDEN);
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay),
+                          GTK_WIDGET(self->zoom_view));
+
   self->picture = GTK_PICTURE(gtk_picture_new());
   gtk_picture_set_content_fit(self->picture, GTK_CONTENT_FIT_CONTAIN);
   gtk_picture_set_can_shrink(self->picture, TRUE);
-  gtk_widget_set_hexpand(GTK_WIDGET(self->picture), TRUE);
-  gtk_widget_set_vexpand(GTK_WIDGET(self->picture), TRUE);
-  gtk_overlay_set_child(GTK_OVERLAY(overlay), GTK_WIDGET(self->picture));
+  gtk_fixed_put(self->zoom_view, GTK_WIDGET(self->picture), 0, 0);
+
+  GtkEventController *zoom_motion =
+    gtk_event_controller_motion_new();
+  gtk_widget_add_controller(GTK_WIDGET(self->zoom_view), zoom_motion);
+  g_signal_connect(zoom_motion,
+                   "enter",
+                   G_CALLBACK(zoom_pointer_moved),
+                   self);
+  g_signal_connect(zoom_motion,
+                   "motion",
+                   G_CALLBACK(zoom_pointer_moved),
+                   self);
+  g_signal_connect(zoom_motion,
+                   "leave",
+                   G_CALLBACK(zoom_pointer_left),
+                   self);
+
+  GtkEventController *zoom_scroll =
+    gtk_event_controller_scroll_new(
+      GTK_EVENT_CONTROLLER_SCROLL_VERTICAL |
+      GTK_EVENT_CONTROLLER_SCROLL_DISCRETE);
+  gtk_widget_add_controller(GTK_WIDGET(self->zoom_view), zoom_scroll);
+  g_signal_connect(zoom_scroll,
+                   "scroll",
+                   G_CALLBACK(zoom_scrolled),
+                   self);
+
+  GtkGesture *zoom_drag = gtk_gesture_drag_new();
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(zoom_drag),
+                                GDK_BUTTON_PRIMARY);
+  gtk_widget_add_controller(GTK_WIDGET(self->zoom_view),
+                            GTK_EVENT_CONTROLLER(zoom_drag));
+  g_signal_connect(zoom_drag,
+                   "drag-begin",
+                   G_CALLBACK(zoom_drag_begin),
+                   self);
+  g_signal_connect(zoom_drag,
+                   "drag-update",
+                   G_CALLBACK(zoom_drag_update),
+                   self);
+  g_signal_connect(zoom_drag,
+                   "drag-end",
+                   G_CALLBACK(zoom_drag_end),
+                   self);
 
   GtkGesture *click = gtk_gesture_click_new();
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click),

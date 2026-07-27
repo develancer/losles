@@ -135,9 +135,17 @@ consume layout space. It is hidden by default and can be toggled with the
 information button or the `I` key. The image canvas is always pure black,
 independently of the desktop color scheme and in fullscreen.
 
+Scroll the mouse wheel over the image to zoom in or back out toward the
+initial fit. The image point under the mouse remains under the mouse while
+zooming, except when an image edge reaches the edge of the canvas. While
+zoomed in, drag the image with the primary mouse button to inspect another
+portion. Zooming scales the existing color-managed texture and does not
+decode or color-convert the source again.
+
 Double-click the picture or press `Alt+Enter` to enter or leave fullscreen.
 The header bar is hidden while fullscreen is active. `Escape` does not leave
-fullscreen; it only cancels crop mode when crop mode is active.
+fullscreen. It first cancels Crop mode when active; otherwise it restores the
+initial fitted view when zoomed in.
 
 Press `C` to enter or leave crop mode, including while fullscreen. In crop
 mode, drag over the image to create a selection. Drag inside an existing
@@ -145,7 +153,8 @@ selection to move it, or drag any of its four edges or eight visible
 edge/corner handles to resize it. JPEG selections move in legal MCU-block
 increments, while supported PNGs use exact pixels, so the overlay always
 previews the crop that will be written. Press `Enter` to apply a valid
-selection.
+selection. Entering Crop mode restores the fitted view; wheel zoom and image
+panning are inactive until Crop mode is left.
 
 Use the warning-icon orientation control when it is enabled to bake a
 non-default EXIF orientation into the JPEG coefficients and set the tag to

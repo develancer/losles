@@ -76,10 +76,12 @@ them:
   monitor, with a built-in sRGB output fallback.
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
+- Viewing interaction: cursor-anchored wheel zoom from fit to 16× and
+  primary-button panning on overflowing axes.
 
 Important current exclusions include CMYK/YCCK JPEG display, editing of
 palette/sub-8-bit/16-bit/interlaced/animated PNGs, 16-bit display buffers,
-HDR, animations, and zoom/pan controls.
+HDR, animations, free rotation, and zooming out below the initial fit.
 
 ## Toolchain and dependencies
 
@@ -496,8 +498,10 @@ profile identity must become part of the key.
 ## UI behavior and coordinate assumptions
 
 The UI is built directly in `losles-window.c`; there is no `.ui` resource.
-It consists of a header bar and one `GtkOverlay` containing a contained
-`GtkPicture`, crop drawing layer, spinner, and bottom-left information OSD.
+It consists of a header bar and one `GtkOverlay`. The overlay's main child is
+a canvas `GtkDrawingArea`; a clipped `GtkFixed` overlay positions and sizes
+the `GtkPicture`, followed by the crop drawing layer, spinner, and bottom-left
+information OSD.
 The information OSD is hidden by default and does not participate in the
 content layout. Its widget has no external margin: its opaque `#000000`
 background begins at the exact bottom-left corner, with only internal text
@@ -516,7 +520,9 @@ Current actions and shortcuts:
 - enter/leave fullscreen: double-click the picture or `Alt+Enter`;
 - enter/leave crop mode: crop header button or `C`;
 - apply a valid crop selection: Crop header button or `Enter`;
-- cancel active crop mode, without leaving fullscreen: `Escape`;
+- zoom at the pointer: mouse wheel over the image;
+- pan a zoomed image: primary-button drag;
+- cancel active crop mode, or reset zoom when Crop is inactive: `Escape`;
 - move the current image to Trash and advance: `Delete`;
 - open a dropped file: drag a Nautilus-style `GdkFileList` anywhere onto the
   window; the first file enters the normal open/directory-scan pipeline;
@@ -537,9 +543,24 @@ when the window manager changes fullscreen state outside the application
 action. The double-click gesture is attached to the content overlay so it
 continues to work over the picture and crop layer. Crop and apply-crop are
 window actions rather than visibility-dependent button handling, so `C` and
-`Enter` continue to work while the header is hidden. `Escape` deliberately
-does nothing when crop mode is inactive; fullscreen is left only by
-double-click or `Alt+Enter`.
+`Enter` continue to work while the header is hidden. `Escape` never changes
+fullscreen state: it leaves Crop mode when active and otherwise resets a
+zoomed image. Fullscreen is left only by double-click or `Alt+Enter`.
+
+The fitted image is zoom level `1.0`; wheel steps multiply or divide it by
+`1.25`, clamped to `1.0`–`16.0`. `zoom_center_x/y` store the normalized image
+point at the viewport center. A wheel event first derives the normalized image
+point under the pointer, changes scale, then updates the center so that point
+retains its canvas position. Placement is clamped only when an image edge
+would expose space beyond that edge. Dragging changes the normalized center
+only on axes where the scaled image is larger than the viewport.
+
+`GtkPicture` displays the already color-managed `GdkTexture`; zoom only changes
+the picture widget's size and position inside the clipped `GtkFixed`. It must
+not trigger a new decode, ICC transform, or scaled-pixel cache. The canvas
+`GtkDrawingArea::resize` signal updates the viewport dimensions; resizing or
+entering fullscreen keeps the normalized image center. Loading another image
+resets scale and center.
 
 The crop overlay maps between the contained picture rectangle and display
 pixel coordinates. Crop is disabled unless EXIF orientation is `1`, so those
@@ -547,6 +568,12 @@ coordinates currently equal encoded JPEG or PNG coordinates. If oriented
 cropping is implemented, a real display-to-source coordinate transform is
 required; simply enabling the button will crop the wrong area for
 orientations 2–8.
+
+Entering Crop mode calls `reset_zoom()` before showing the crop overlay.
+Wheel zoom and view panning are inactive in Crop mode, so the existing crop
+geometry always describes the initial fitted image. If zoomed cropping is
+implemented later, both hit testing and pointer-to-image mapping must be
+updated together.
 
 Crop interaction is a small state machine (`CropDragMode`). Hit testing is
 performed in widget coordinates with a fixed screen-space tolerance so narrow
@@ -566,10 +593,6 @@ right or bottom edge may consequently be pinned on that axis until the edge is
 resized to a movable block-aligned size. Keep the application layer
 format-agnostic: future formats must express their crop constraints through
 `adjust_crop`, rather than adding format-name checks here.
-
-If crop zooming or free rotation is added, update both hit testing and
-pointer-to-image mapping together; never infer source coordinates directly
-from the window.
 
 The information OSD is part of the color-management contract: it reports
 whether the source used embedded ICC or an assumption and identifies the
