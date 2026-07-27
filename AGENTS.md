@@ -71,8 +71,8 @@ rotation writing for mirrored EXIF orientations.
 
 ## Toolchain and dependencies
 
-Build system: Meson with Ninja. C standard: C17. Default build type:
-`debugoptimized`.
+Build system: GNU Make. The Makefile defaults to `-O2 -g`, compiles as C17,
+and keeps generated output outside the source tree.
 
 Compile/link dependencies:
 
@@ -95,7 +95,7 @@ Install the Ubuntu dependencies with:
 
 ```sh
 sudo apt install \
-  build-essential meson ninja-build \
+  build-essential pkg-config \
   libgtk-4-dev liblcms2-dev libcolord-dev \
   libjpeg-dev libpng-dev libjpeg-turbo-progs
 ```
@@ -103,25 +103,22 @@ sudo apt install \
 Normal build, test, and run:
 
 ```sh
-meson setup build -Dtests=true
-meson compile -C build
-meson test -C build --print-errorlogs
-./build/src/losles /path/to/photo.jpg
+make
+make test
+./build/losles /path/to/photo.jpg
 ```
 
-For an existing build directory, Meson regenerates automatically after build
-file changes. Use `meson setup --reconfigure build` when an explicit
-reconfigure is useful.
-
-The existing sanitizer configuration was created with:
+The Makefile uses `pkg-config`, generates header dependency files, and keeps
+all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
+`applicationsdir`, `metainfodir`, `localedir`, `DESTDIR`, `BUILD_DIR`,
+`CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE` overrides. Use a distinct
+`BUILD_DIR` after changing compiler/sanitizer modes because Make does not
+record command-line flag changes:
 
 ```sh
-meson setup build-asan \
-  -Dtests=true \
-  -Db_sanitize=address,undefined \
-  -Db_lundef=false
-meson compile -C build-asan
-meson test -C build-asan --print-errorlogs
+make BUILD_DIR=build-asan \
+  SANITIZE=address,undefined \
+  test
 ```
 
 LeakSanitizer aborts under some ptraced/containerized agent environments even
@@ -130,17 +127,19 @@ AddressSanitizer/UBSan with:
 
 ```sh
 ASAN_OPTIONS=detect_leaks=0 \
-  meson test -C build-asan --print-errorlogs
+  make BUILD_DIR=build-asan \
+    SANITIZE=address,undefined \
+    test
 ```
 
 This workaround disables only leak detection and is not a substitute for a
 normal LeakSanitizer run on an unrestricted host.
 
 Build directories and their generated files are ignored and must not be
-committed. Installation uses the normal Meson prefix, `/usr/local` by default:
+committed. Installation uses the normal Make prefix, `/usr/local` by default:
 
 ```sh
-meson install -C build
+make install
 ```
 
 For a non-privileged installation smoke test, use a temporary `DESTDIR`
@@ -156,14 +155,11 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── AGENTS.md                    This technical handoff
 ├── README.md                    User-facing capabilities and build guide
 ├── COPYING                      MIT license
-├── meson.build                  Project, dependencies, global compiler policy
-├── meson_options.txt            `tests` option
+├── Makefile                     Build, install, test, and sanitizer rules
 ├── data/
-│   ├── meson.build              Installs desktop and AppStream metadata
 │   ├── io.github.losles.Losles.desktop
 │   └── io.github.losles.Losles.metainfo.xml
 ├── src/
-│   ├── meson.build              Application target and source list
 │   ├── main.c                   Locale setup and GApplication entry point
 │   ├── losles-application.[ch]  Single-window app, open handling, shortcuts
 │   ├── losles-window.[ch]       UI, directory scan, jobs, caches, editing flow
@@ -183,7 +179,6 @@ color manager logs connector names, lookup failures, and the selected profile.
 │       └── losles-png-format.[ch]
 │                                 PNG decoder and iCCP extraction
 └── tests/
-    ├── meson.build
     ├── test-jpeg-metadata.c     Endian/orientation parser tests
     └── test-formats.c           Decode, ICC render, invalid data, jpegtran
 ```
@@ -259,7 +254,7 @@ When adding a format:
 4. Honor `GCancellable`, particularly between rows or other bounded work
    units.
 5. Register the object in `losles-format-registry.c`.
-6. Add its files to `src/meson.build` and extensions to
+6. Add its files to `Makefile` and extensions to
    `losles_format_registry_supports_file()`.
 7. Add decoder, malformed-input, ICC, alpha, and orientation tests as relevant.
 8. Update desktop MIME types, AppStream metadata, `README.md`, and this file.
@@ -473,8 +468,7 @@ does not validate editing.
 For ordinary C changes, at minimum run:
 
 ```sh
-meson compile -C build
-meson test -C build --print-errorlogs
+make test
 ```
 
 Run the sanitizer build for parser, memory-ownership, cache, cancellation, or
@@ -506,10 +500,10 @@ display-color correctness based only on an sRGB-to-sRGB unit test.
 - Do not weaken `jpegtran -perfect` merely to make more rotations succeed.
 - Do not label an 8-bit decode/re-encode path as lossless.
 
-The project disables GCC's pedantic warning globally because GTK 4.14's public
-`gdkdmabufformats.h` contains an extra top-level semicolon. Other warning-level
-3 diagnostics remain enabled. Revisit that exception only when the supported
-GTK baseline no longer needs it.
+The Makefile carries `-Wno-pedantic` because GTK 4.14's public
+`gdkdmabufformats.h` contains an extra top-level semicolon. It otherwise
+enables `-Wall`, `-Wextra`, and `-Wformat=2`. Revisit the exception only when
+the supported GTK baseline no longer needs it.
 
 ## Known constraints worth remembering
 

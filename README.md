@@ -41,21 +41,34 @@ All dependencies are in the standard Ubuntu repositories:
 
 ```sh
 sudo apt install \
-  build-essential meson ninja-build \
+  build-essential pkg-config \
   libgtk-4-dev liblcms2-dev libcolord-dev \
   libjpeg-dev libpng-dev libjpeg-turbo-progs
 
-meson setup build -Dtests=true
-meson compile -C build
-meson test -C build --print-errorlogs
-./build/src/losles /path/to/photo.jpg
+make
+make test
+./build/losles /path/to/photo.jpg
 ```
 
-To install under the configured Meson prefix:
+The Makefile uses `pkg-config` to find the system libraries and writes all
+output under `build` by default. Installation follows the usual Make
+variables and honors `DESTDIR`:
 
 ```sh
-meson install -C build
+sudo make install                 # prefix=/usr/local by default
+make DESTDIR=/tmp/losles-stage install
 ```
+
+For AddressSanitizer and UndefinedBehaviorSanitizer, use a separate output
+directory because Make does not track changes to compiler flags:
+
+```sh
+make BUILD_DIR=build-asan \
+  SANITIZE=address,undefined \
+  test
+```
+
+Run `make help` for the available targets and overrides.
 
 ## Lossless editing semantics
 
