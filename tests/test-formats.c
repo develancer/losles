@@ -8,6 +8,7 @@
 
 #include "../src/formats/losles-format-registry.h"
 #include "../src/formats/losles-format.h"
+#include "../src/formats/losles-jpeg-metadata.h"
 #include "../src/losles-color-manager.h"
 #include "../src/losles-image.h"
 #include "../src/losles-rendered-image.h"
@@ -65,6 +66,57 @@ contains_bytes(const guint8 *haystack,
       return TRUE;
   }
   return FALSE;
+}
+
+static void
+assert_pixel_bytes_close(GBytes *actual,
+                         GBytes *expected,
+                         guint maximum_difference)
+{
+  gsize actual_size = 0;
+  gsize expected_size = 0;
+  const guint8 *actual_data =
+    g_bytes_get_data(actual, &actual_size);
+  const guint8 *expected_data =
+    g_bytes_get_data(expected, &expected_size);
+  g_assert_cmpuint(actual_size, ==, expected_size);
+
+  guint observed_maximum = 0;
+  for (gsize i = 0; i < actual_size; i++) {
+    const guint difference =
+      ABS((gint)actual_data[i] - (gint)expected_data[i]);
+    observed_maximum = MAX(observed_maximum, difference);
+  }
+  g_assert_cmpuint(observed_maximum, <=, maximum_difference);
+}
+
+static GBytes *
+rotate_rendered_pixels_right(LoslesRenderedImage *image)
+{
+  const guint components =
+    image->pixel_format == LOSLES_PIXEL_FORMAT_RGBA8 ? 4 : 3;
+  g_assert_cmpuint(image->stride, ==, image->width * components);
+
+  const guint destination_stride = image->height * components;
+  guint8 *destination =
+    g_malloc_n(image->width, destination_stride);
+  const guint8 *source = g_bytes_get_data(image->pixels, NULL);
+  for (guint y = 0; y < image->height; y++) {
+    for (guint x = 0; x < image->width; x++) {
+      const guint destination_x = image->height - 1 - y;
+      const guint destination_y = x;
+      memcpy(destination +
+               (gsize)destination_y * destination_stride +
+               (gsize)destination_x * components,
+             source +
+               (gsize)y * image->stride +
+               (gsize)x * components,
+             components);
+    }
+  }
+
+  return g_bytes_new_take(destination,
+                          (gsize)image->width * destination_stride);
 }
 
 static void
@@ -386,6 +438,7 @@ test_embedded_profiles_and_render(void)
   g_assert_cmpuint(losles_image_get_display_width(jpeg), ==, 16);
   g_assert_cmpuint(losles_image_get_display_height(jpeg), ==, 24);
   g_assert_cmpuint(losles_image_get_orientation(jpeg), ==, 6);
+  g_assert_true(losles_image_has_exif_orientation(jpeg));
   g_assert_nonnull(losles_image_get_icc_profile(jpeg));
 
   g_autoptr(LoslesColorTarget) target =
@@ -410,6 +463,7 @@ test_embedded_profiles_and_render(void)
   g_assert_cmpint(losles_image_get_pixel_format(png),
                   ==,
                   LOSLES_PIXEL_FORMAT_RGBA8);
+  g_assert_false(losles_image_has_exif_orientation(png));
   g_assert_nonnull(losles_image_get_icc_profile(png));
   g_autoptr(LoslesRenderedImage) png_rendered =
     losles_color_target_render(target, png, NULL, &error);
@@ -432,6 +486,7 @@ test_embedded_profiles_and_render(void)
   g_assert_cmpint(losles_image_get_pixel_format(gray_jpeg),
                   ==,
                   LOSLES_PIXEL_FORMAT_G8);
+  g_assert_false(losles_image_has_exif_orientation(gray_jpeg));
   g_assert_true(g_bytes_equal(losles_image_get_icc_profile(gray_jpeg),
                               gray_profile));
   g_autoptr(LoslesRenderedImage) gray_rendered =
@@ -499,6 +554,8 @@ test_lossless_jpeg_operations(void)
   g_assert_true(g_bytes_equal(rotated_metadata, oriented_metadata));
 
   g_autoptr(LoslesImage) plain = load_path(registry, plain_path);
+  g_assert_true(losles_image_has_exif_orientation(plain));
+  g_assert_cmpuint(losles_image_get_orientation(plain), ==, 1);
   format = LOSLES_FORMAT(losles_image_get_format(plain));
   LoslesCrop requested = {.x = 9, .y = 1, .width = 5, .height = 5};
   LoslesCrop adjusted = {0};
@@ -798,6 +855,222 @@ test_rotation_round_trip_is_byte_identical(void)
 }
 
 static void
+test_all_orientation_rotation(void)
+{
+  static const guint orientations[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-all-orientation-rotation-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_autoptr(GBytes) profile = make_srgb_profile();
+  g_autoptr(LoslesColorTarget) target =
+    losles_color_target_new_for_profile(profile,
+                                        "Test sRGB monitor",
+                                        "test-srgb",
+                                        &error);
+  g_assert_no_error(error);
+  g_assert_nonnull(target);
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+
+  for (guint i = 0; i < G_N_ELEMENTS(orientations); i++) {
+    const guint orientation = orientations[i];
+    g_autofree gchar *name =
+      g_strdup_printf("orientation-rotation-%u.jpg", orientation);
+    g_autofree gchar *jpeg_path =
+      g_build_filename(directory, name, NULL);
+    write_test_jpeg(jpeg_path, profile, orientation);
+
+    g_autofree gchar *original_contents = NULL;
+    gsize original_size = 0;
+    g_assert_true(g_file_get_contents(jpeg_path,
+                                      &original_contents,
+                                      &original_size,
+                                      &error));
+    g_assert_no_error(error);
+
+    g_autoptr(LoslesImage) before =
+      load_path(registry, jpeg_path);
+    g_autoptr(LoslesRenderedImage) rendered_before =
+      losles_color_target_render(target, before, NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(rendered_before);
+    g_autoptr(GBytes) expected_pixels =
+      rotate_rendered_pixels_right(rendered_before);
+
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(before));
+    g_autoptr(GFile) source = g_file_new_for_path(jpeg_path);
+    g_assert_true(losles_format_rotate_lossless(format,
+                                                before,
+                                                source,
+                                                LOSLES_ROTATE_RIGHT,
+                                                NULL,
+                                                &error));
+    g_assert_no_error(error);
+
+    g_autoptr(LoslesImage) rotated =
+      load_path(registry, jpeg_path);
+    g_assert_true(losles_image_has_exif_orientation(rotated));
+    g_assert_cmpuint(losles_image_get_orientation(rotated),
+                     ==,
+                     orientation);
+    g_autoptr(LoslesRenderedImage) rendered_rotated =
+      losles_color_target_render(target, rotated, NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(rendered_rotated);
+    g_assert_cmpuint(rendered_rotated->width,
+                     ==,
+                     rendered_before->height);
+    g_assert_cmpuint(rendered_rotated->height,
+                     ==,
+                     rendered_before->width);
+    assert_pixel_bytes_close(rendered_rotated->pixels,
+                             expected_pixels,
+                             3);
+
+    format = LOSLES_FORMAT(losles_image_get_format(rotated));
+    g_assert_true(losles_format_rotate_lossless(format,
+                                                rotated,
+                                                source,
+                                                LOSLES_ROTATE_LEFT,
+                                                NULL,
+                                                &error));
+    g_assert_no_error(error);
+
+    g_autofree gchar *round_trip_contents = NULL;
+    gsize round_trip_size = 0;
+    g_assert_true(g_file_get_contents(jpeg_path,
+                                      &round_trip_contents,
+                                      &round_trip_size,
+                                      &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(round_trip_size, ==, original_size);
+    g_assert_cmpmem(round_trip_contents,
+                    round_trip_size,
+                    original_contents,
+                    original_size);
+
+    g_autofree gchar *trashed_path =
+      g_build_filename(test_data_home, "Trash", "files", name, NULL);
+    g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_remove(jpeg_path), ==, 0);
+  }
+
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
+test_orientation_normalization(void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-normalize-orientation-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_autoptr(GBytes) profile = make_srgb_profile();
+  g_autoptr(LoslesColorTarget) target =
+    losles_color_target_new_for_profile(profile,
+                                        "Test sRGB monitor",
+                                        "test-srgb",
+                                        &error);
+  g_assert_no_error(error);
+  g_assert_nonnull(target);
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+
+  for (guint orientation = 2; orientation <= 8; orientation++) {
+    g_autofree gchar *name =
+      g_strdup_printf("orientation-%u.jpg", orientation);
+    g_autofree gchar *jpeg_path =
+      g_build_filename(directory, name, NULL);
+    g_autofree gchar *expected_path =
+      g_build_filename(directory, "expected-metadata.jpg", NULL);
+    write_test_jpeg(jpeg_path, profile, orientation);
+
+    g_autofree gchar *original_contents = NULL;
+    gsize original_size = 0;
+    g_assert_true(g_file_get_contents(jpeg_path,
+                                      &original_contents,
+                                      &original_size,
+                                      &error));
+    g_assert_no_error(error);
+    g_assert_true(g_file_set_contents(expected_path,
+                                      original_contents,
+                                      original_size,
+                                      &error));
+    g_assert_no_error(error);
+    g_assert_true(losles_jpeg_metadata_set_orientation_in_file(
+      expected_path,
+      1,
+      &error));
+    g_assert_no_error(error);
+    g_autoptr(GBytes) expected_metadata =
+      read_jpeg_marker_metadata(expected_path);
+
+    g_autoptr(LoslesImage) before =
+      load_path(registry, jpeg_path);
+    g_assert_true(losles_image_has_exif_orientation(before));
+    g_assert_cmpuint(losles_image_get_orientation(before),
+                     ==,
+                     orientation);
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(before));
+    g_assert_true(
+      losles_format_supports_lossless_orientation_normalization(format));
+
+    g_autoptr(LoslesRenderedImage) rendered_before =
+      losles_color_target_render(target, before, NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(rendered_before);
+
+    g_autoptr(GFile) source = g_file_new_for_path(jpeg_path);
+    g_assert_true(losles_format_normalize_orientation_lossless(
+      format,
+      before,
+      source,
+      NULL,
+      &error));
+    g_assert_no_error(error);
+
+    g_autoptr(LoslesImage) after =
+      load_path(registry, jpeg_path);
+    g_assert_true(losles_image_has_exif_orientation(after));
+    g_assert_cmpuint(losles_image_get_orientation(after), ==, 1);
+    g_assert_cmpuint(losles_image_get_width(after),
+                     ==,
+                     rendered_before->width);
+    g_assert_cmpuint(losles_image_get_height(after),
+                     ==,
+                     rendered_before->height);
+    g_assert_true(g_bytes_equal(losles_image_get_icc_profile(after),
+                                profile));
+    g_autoptr(LoslesRenderedImage) rendered_after =
+      losles_color_target_render(target, after, NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(rendered_after);
+    g_assert_cmpuint(rendered_after->width, ==, rendered_before->width);
+    g_assert_cmpuint(rendered_after->height, ==, rendered_before->height);
+    assert_pixel_bytes_close(rendered_after->pixels,
+                             rendered_before->pixels,
+                             3);
+
+    assert_test_metadata_preserved(jpeg_path);
+    g_autoptr(GBytes) normalized_metadata =
+      read_jpeg_marker_metadata(jpeg_path);
+    g_assert_true(g_bytes_equal(normalized_metadata, expected_metadata));
+
+    g_autofree gchar *trashed_path =
+      g_build_filename(test_data_home, "Trash", "files", name, NULL);
+    g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+
+    g_assert_cmpint(g_remove(jpeg_path), ==, 0);
+    g_assert_cmpint(g_remove(expected_path), ==, 0);
+  }
+
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
 test_in_place_rotation_rejects_symlink(void)
 {
   g_autoptr(GError) error = NULL;
@@ -934,6 +1207,10 @@ main(int argc, char **argv)
                   test_in_place_crop_uses_trash);
   g_test_add_func("/formats/rotation-round-trip-is-byte-identical",
                   test_rotation_round_trip_is_byte_identical);
+  g_test_add_func("/formats/all-orientation-rotation",
+                  test_all_orientation_rotation);
+  g_test_add_func("/formats/orientation-normalization",
+                  test_orientation_normalization);
   g_test_add_func("/formats/in-place-rotation-rejects-symlink",
                   test_in_place_rotation_rejects_symlink);
   g_test_add_func("/formats/invalid-inputs", test_invalid_inputs);

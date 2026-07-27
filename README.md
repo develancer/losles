@@ -23,6 +23,9 @@ libpng decode pixels, and colord supplies the selected monitor profile.
 - Lossless JPEG rotation and MCU-aligned cropping through libturbojpeg, while
   preserving JPEG marker metadata including ICC, EXIF, XMP, IPTC, comments,
   and unknown APP markers.
+- Explicit lossless EXIF-orientation normalization: the displayed orientation
+  is baked into JPEG coefficients and the existing orientation tag is set to
+  `1`.
 - Fast previous/next navigation. Losles decodes and color-converts up to two
   images on either side in the background. Decoded sources and
   display-profile textures have separate 512 MiB cache limits, with at most
@@ -84,10 +87,19 @@ and the crop fails.
 
 JPEG transforms operate on DCT coefficients through libturbojpeg, not by
 decoding and re-encoding pixels. JPEG marker metadata is copied without
-selectively rewriting or discarding fields. Rotation retains the original EXIF
-orientation tag and applies only the requested coefficient rotation, so a
-right rotation followed by a left rotation is byte-identical for the supported
-perfect-transform path.
+selectively rewriting or discarding fields. Ordinary left/right rotation
+retains the original EXIF orientation tag. For mirrored EXIF orientations,
+Losles reverses the raw coefficient direction so that the result still rotates
+in the direction requested on screen. A right rotation followed by a left
+rotation is byte-identical for the supported perfect-transform path.
+
+The separate warning-icon normalization button is enabled only for a JPEG
+containing an EXIF orientation tag whose value is not `1`. It applies that
+orientation to the coefficients and changes the existing tag to `1`, without
+changing the displayed image. Its tooltip explains whether a non-default
+orientation is present. Like ordinary rotation, normalization overwrites the
+source without creating a Trash backup. This explicit action is useful for
+software that ignores EXIF orientation and enables Losles cropping afterward.
 
 JPEG crop coordinates must start on an MCU boundary. While the rectangle is
 drawn, moved, or resized, Losles snaps it to the format module's nearest legal
@@ -99,7 +111,8 @@ silently trim edge pixels.
 Metadata fields whose meaning depends on image dimensions, such as an embedded
 thumbnail or EXIF pixel dimensions, are retained unchanged rather than
 discarded or regenerated. They can therefore describe the pre-edit image after
-a crop.
+a crop, a quarter-turn rotation, or orientation normalization. The JPEG's own
+encoded dimensions are updated correctly.
 
 PNG editing is intentionally disabled in this first version. Although PNG
 recompression is pixel-lossless, preserving 16-bit samples and all relevant
@@ -124,6 +137,11 @@ selection to move it, or drag any of its four edges or eight visible
 edge/corner handles to resize it. The handles move in lossless JPEG block
 increments, so the overlay always previews the exact crop result. Press
 `Enter` to apply a valid selection.
+
+Use the warning-icon orientation control when it is enabled to bake a
+non-default EXIF orientation into the JPEG coefficients and set the tag to
+`1`. The image keeps the same visual orientation, and the operation is
+coefficient-lossless.
 
 Press `Delete` to move the current image to the system Trash. Losles then
 opens the next image in directory order when one exists. If there is no next

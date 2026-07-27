@@ -48,8 +48,9 @@ them:
   Trash backup. Crop prepares the transformed file, moves the exact original
   into the system Trash, then installs the cropped file at its original path.
 - JPEG marker metadata must be retained. Do not discard EXIF, XMP, IPTC, ICC,
-  COM, or unrecognized APP markers. Do not normalize EXIF orientation when
-  coefficient rotation can retain it.
+  COM, or unrecognized APP markers. Ordinary rotation retains EXIF
+  orientation. Only the explicit Normalize action may bake it into the
+  coefficients and set the existing orientation tag to `1`.
 - Image formats stay behind the `LoslesFormat` module interface so adding a
   decoder/editor does not require format-specific logic in the window or color
   manager.
@@ -64,16 +65,15 @@ them:
 - JPEG ICC: `ICC_PROFILE` APP2 chunks, including multi-marker profiles.
 - PNG ICC: `iCCP`.
 - Orientation: all eight JPEG EXIF orientation values are displayed.
-- Editing: coefficient-level JPEG rotation and MCU-aligned JPEG crop through
-  libturbojpeg.
+- Editing: coefficient-level JPEG rotation, EXIF-orientation normalization,
+  and MCU-aligned JPEG crop through libturbojpeg.
 - Display color: selected/default colord profile for the window's current
   monitor, with a built-in sRGB output fallback.
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
 
 Important current exclusions include CMYK/YCCK JPEG display, PNG editing,
-16-bit display buffers, HDR, animations, zoom/pan controls, and lossless
-rotation writing for mirrored EXIF orientations.
+16-bit display buffers, HDR, animations, and zoom/pan controls.
 
 ## Toolchain and dependencies
 
@@ -218,13 +218,18 @@ LoslesImage + requested transform
   -> format-specific TurboJPEG operation in a worker
   -> transformed temporary file with JPEG marker metadata retained
   -> rotation: overwrite original path, without a Trash entry
+  -> orientation normalization: rewrite the existing tag to 1, then overwrite
+     the original path without a Trash entry
   -> crop: safety backup, original to Trash, replacement at original path
   -> result reopened and its directory rescanned
 ```
 
 `LoslesImage` stores decoded pixels in encoded-file orientation, the embedded
-ICC bytes, EXIF orientation, JPEG MCU dimensions, a format label, and a strong
-reference to the format object which created it. Keep it format-neutral.
+ICC bytes, effective EXIF orientation, whether a valid EXIF orientation tag
+was actually present, JPEG MCU dimensions, a format label, and a strong
+reference to the format object which created it. Keep it format-neutral. The
+presence flag is necessary because absent orientation and a stored value of
+`1` have the same effective rendering but different UI semantics.
 
 `LoslesRenderedImage` stores pixels after color conversion and orientation.
 Its output is RGB8 or RGBA8 even when the source is gray. It also records the
@@ -238,9 +243,10 @@ retains both the rendered description and texture.
 
 - name and encoded-byte matching;
 - decode to `LoslesImage`;
-- capability queries for lossless rotation/crop;
+- capability queries for lossless rotation, orientation normalization, and
+  crop;
 - crop adjustment;
-- lossless rotation/crop execution.
+- lossless rotation, orientation-normalization, and crop execution.
 
 The registry reads the complete `GFile` into memory once, then asks modules to
 match the encoded signature in registration order. Directory discovery is
@@ -278,7 +284,8 @@ to the output device.
 - APP2 `ICC_PROFILE` segments are validated for sequence/count consistency and
   concatenated in sequence order.
 - APP1 EXIF parsing is deliberately narrow: it finds the TIFF IFD0 orientation
-  tag in either byte order. Missing/malformed orientation becomes `1`.
+  tag in either byte order and separately reports whether a valid stored tag
+  was present. Missing/malformed orientation becomes effective value `1`.
 - Grayscale decodes to `G8`; other supported JPEG data decodes to `RGB8`.
 - CMYK and YCCK are rejected rather than converted incorrectly.
 - Fancy chroma upsampling is enabled.
@@ -289,14 +296,24 @@ The transform uses `TJXOPT_PERFECT` and does not set `TJXOPT_COPYNONE`, so
 TurboJPEG copies extra markers including ICC and EXIF. Output first goes to a
 `.losles-output-XXXXXX` temporary file in the destination directory.
 
-Rotation applies only the requested visual left/right coefficient rotation and
-retains the existing non-mirrored EXIF orientation tag. Rotations commute with
-orientations `1`, `3`, `6`, and `8`, so this produces the requested display
-rotation without rewriting metadata. Orientations `2`, `4`, `5`, and `7`
-render correctly but rotation writing refuses them. `TJXOPT_PERFECT` means a
-rotation that would require trimming incomplete edge blocks fails. A supported
-right rotation followed by a left rotation must reproduce the complete encoded
-file byte for byte; keep the regression test for this invariant.
+Ordinary rotation retains the EXIF orientation tag. Requested visual rotations
+commute with orientations `1`, `3`, `6`, and `8`, so their raw coefficient
+direction is unchanged. Orientations `2`, `4`, `5`, and `7` contain a
+reflection; conjugating a rotation through a reflection reverses it, so a
+visual right turn uses `TJXOP_ROT270` and a visual left turn uses
+`TJXOP_ROT90`. `TJXOPT_PERFECT` means a rotation that would require trimming
+incomplete edge blocks fails. A supported right rotation followed by a left
+rotation must reproduce the complete encoded file byte for byte for all eight
+orientations; keep the regression tests for this invariant.
+
+The explicit orientation-normalization operation is available only when a
+valid stored EXIF orientation tag exists and has value `2`–`8`. It maps those
+values to the corresponding TurboJPEG symmetry operation (`HFLIP`, `ROT180`,
+`VFLIP`, `TRANSPOSE`, `ROT90`, `TRANSVERSE`, or `ROT270`), then rewrites only
+the copied orientation value to `1`. It leaves the displayed image unchanged.
+Normalization uses the same direct-overwrite/no-Trash commit semantics as
+ordinary rotation. Never remove the tag or synthesize one for an image that
+does not have it.
 
 The UI passes the source itself as the destination for both editing actions.
 In-place editing requires a regular local file. Rotation completes the
@@ -320,12 +337,14 @@ starts, so the visible rectangle already shows that expansion. Do not bypass
 the format method in the UI, change the operation to lossy pixel cropping, or
 silently discard edge pixels.
 
-TurboJPEG preserves JPEG COM and APP markers. Losles does not selectively
-rewrite them, so ICC, EXIF (including orientation), XMP, IPTC, comments,
-maker-specific metadata, and unknown APP markers remain. This means semantic
-dimension fields and embedded thumbnails are retained but are not regenerated
-after a crop; they can describe the pre-crop image. Treat that as a known
-metadata-consistency limitation, not permission to drop those fields.
+TurboJPEG preserves JPEG COM and APP markers. Except for the explicit
+orientation-value rewrite during normalization, Losles does not selectively
+rewrite them, so ICC, EXIF, XMP, IPTC, comments, maker-specific metadata, and
+unknown APP markers remain. This means semantic dimension fields and embedded
+thumbnails are retained but are not regenerated after a crop, quarter-turn
+rotation, or normalization; they can describe the pre-edit image. Treat that
+as a known metadata-consistency limitation, not permission to drop those
+fields.
 
 ### PNG module details
 
@@ -465,6 +484,11 @@ Current actions and shortcuts:
 - move the current image to Trash and advance: `Delete`;
 - lossless rotate left/right in place: header-bar buttons; the transformed
   file overwrites the source without creating a Trash entry;
+- normalize orientation: a header-bar `dialog-warning-symbolic` icon button,
+  enabled only for a valid stored EXIF orientation value `2`–`8`; its dynamic
+  tooltip states whether a non-default EXIF orientation is present. It bakes
+  the current display orientation into JPEG coefficients, sets the tag to
+  `1`, and overwrites without creating a Trash entry;
 - lossless crop in place: toggle, drag a new selection, move it from its
   interior, or resize it from any edge/corner, then Crop; the original goes to
   Trash before the cropped replacement is installed.
@@ -514,6 +538,12 @@ selected display target/fallback. Updating its text while hidden is
 intentional; toggling it on must reveal the current state rather than a stale
 snapshot.
 
+The normalization icon is wrapped in a sensitive `GtkBox` which carries the
+same dynamic tooltip as the button. GTK's default widget picking excludes an
+insensitive button, so the wrapper is what makes the disabled-state “No
+rotation is stored in EXIF” tooltip discoverable. Keep the wrapper and button
+tooltip properties synchronized if this control changes.
+
 Delete is an explicit destructive action with recoverability through the
 system Trash. It runs in a worker and uses `g_file_trash()`; never replace it
 with unlinking. After Trash succeeds, the same worker rescans the directory.
@@ -529,7 +559,7 @@ inflight work before installing the fresh file list. Completed neighbor
 caches are retained so the successor can still display quickly; only entries
 for the deleted URI are removed. Stale callbacks must continue checking their
 generation before touching these tables. `operation_in_progress` serializes
-rotation, crop, deletion, navigation, and opening.
+rotation, normalization, crop, deletion, navigation, and opening.
 
 ## Application and installed metadata
 
@@ -549,8 +579,9 @@ the C target but currently unused; strings are hard-coded English.
 
 ## Tests and verification expectations
 
-`test-jpeg-metadata` checks little-endian, big-endian, and absent EXIF
-orientation. `test-formats` creates fixtures at runtime and checks:
+`test-jpeg-metadata` checks little-endian, big-endian, stored value `1`,
+absent EXIF orientation, and in-file tag rewriting. `test-formats` creates
+fixtures at runtime and checks:
 
 - JPEG/PNG embedded ICC extraction and conversion to a supplied test target;
 - JPEG EXIF orientation dimensions;
@@ -562,6 +593,11 @@ orientation. `test-formats` creates fixtures at runtime and checks:
 - preservation of EXIF, XMP, IPTC, ICC, COM, and unknown APP marker metadata;
 - byte-identical right-then-left rotation, including a non-default EXIF
   orientation;
+- visually correct rotation and byte-identical right/left round trips for all
+  eight EXIF orientation values, including mirrored values;
+- normalization of values `2`–`8`, including unchanged displayed pixels,
+  canonical dimensions, an orientation value of `1`, preserved marker
+  metadata, and no Trash entry;
 - rejection of unsafe in-place rotation through symbolic links;
 - invalid JPEG/PNG rejection.
 
@@ -624,8 +660,9 @@ the supported GTK baseline no longer needs it.
   fallback; this is reported as an assumed profile in the information OSD.
 - PNG 16-bit samples and non-iCCP color chunks are not preserved in the view
   pipeline.
-- JPEG marker metadata is retained byte-for-byte, but dimension-dependent
-  metadata is not regenerated after a crop.
+- JPEG marker metadata is retained byte-for-byte except for the intentional
+  orientation-tag rewrite during normalization, but dimension-dependent
+  metadata is not regenerated after coefficient edits.
 - Viewing may use any `GFile` that GIO can load, but lossless JPEG editing
   requires local filesystem paths.
 - There is no file watching, thumbnail view, recursive scanning, recent-files

@@ -32,6 +32,8 @@ struct _LoslesFormatInterface {
                        GCancellable *cancellable,
                        GError **error);
   gboolean (*supports_lossless_rotation)(LoslesFormat *self);
+  gboolean (*supports_lossless_orientation_normalization)(
+    LoslesFormat *self);
   gboolean (*supports_lossless_crop)(LoslesFormat *self);
   gboolean (*adjust_crop)(LoslesFormat *self,
                           LoslesImage *image,
@@ -44,6 +46,11 @@ struct _LoslesFormatInterface {
                               LoslesRotation rotation,
                               GCancellable *cancellable,
                               GError **error);
+  gboolean (*normalize_orientation_lossless)(LoslesFormat *self,
+                                             LoslesImage *image,
+                                             GFile *destination,
+                                             GCancellable *cancellable,
+                                             GError **error);
   gboolean (*crop_lossless)(LoslesFormat *self,
                             LoslesImage *image,
                             GFile *destination,
@@ -60,6 +67,8 @@ LoslesImage *losles_format_load(LoslesFormat *self,
                                 GCancellable *cancellable,
                                 GError **error);
 gboolean losles_format_supports_lossless_rotation(LoslesFormat *self);
+gboolean losles_format_supports_lossless_orientation_normalization(
+  LoslesFormat *self);
 gboolean losles_format_supports_lossless_crop(LoslesFormat *self);
 gboolean losles_format_adjust_crop(LoslesFormat *self,
                                    LoslesImage *image,
@@ -72,6 +81,12 @@ gboolean losles_format_rotate_lossless(LoslesFormat *self,
                                        LoslesRotation rotation,
                                        GCancellable *cancellable,
                                        GError **error);
+gboolean losles_format_normalize_orientation_lossless(
+  LoslesFormat *self,
+  LoslesImage *image,
+  GFile *destination,
+  GCancellable *cancellable,
+  GError **error);
 gboolean losles_format_crop_lossless(LoslesFormat *self,
                                      LoslesImage *image,
                                      GFile *destination,

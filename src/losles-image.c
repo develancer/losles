@@ -11,6 +11,7 @@ struct _LoslesImage {
   GBytes *pixels;
   GBytes *icc_profile;
   guint orientation;
+  gboolean has_exif_orientation;
   guint jpeg_mcu_width;
   guint jpeg_mcu_height;
   gchar *format_name;
@@ -55,6 +56,7 @@ losles_image_new(GFile *file,
                  GBytes *pixels,
                  GBytes *icc_profile,
                  guint orientation,
+                 gboolean has_exif_orientation,
                  guint jpeg_mcu_width,
                  guint jpeg_mcu_height,
                  const gchar *format_name,
@@ -73,6 +75,7 @@ losles_image_new(GFile *file,
   self->pixels = g_bytes_ref(pixels);
   self->icc_profile = icc_profile ? g_bytes_ref(icc_profile) : NULL;
   self->orientation = orientation >= 1 && orientation <= 8 ? orientation : 1;
+  self->has_exif_orientation = has_exif_orientation;
   self->jpeg_mcu_width = jpeg_mcu_width;
   self->jpeg_mcu_height = jpeg_mcu_height;
   self->format_name = g_strdup(format_name);
@@ -153,6 +156,13 @@ losles_image_get_orientation(LoslesImage *self)
 {
   g_return_val_if_fail(LOSLES_IS_IMAGE(self), 1);
   return self->orientation;
+}
+
+gboolean
+losles_image_has_exif_orientation(LoslesImage *self)
+{
+  g_return_val_if_fail(LOSLES_IS_IMAGE(self), FALSE);
+  return self->has_exif_orientation;
 }
 
 guint

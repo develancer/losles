@@ -44,6 +44,7 @@ typedef struct {
 
 typedef enum {
   EDIT_ROTATE,
+  EDIT_NORMALIZE_ORIENTATION,
   EDIT_CROP,
 } EditKind;
 
@@ -106,6 +107,8 @@ struct _LoslesWindow {
   GtkButton *next_button;
   GtkButton *rotate_left_button;
   GtkButton *rotate_right_button;
+  GtkWidget *normalize_orientation_tooltip_area;
+  GtkButton *normalize_orientation_button;
   GtkToggleButton *info_button;
   GtkToggleButton *crop_button;
   GtkButton *apply_crop_button;
@@ -1620,6 +1623,13 @@ edit_worker(GTask *task,
                                             job->rotation,
                                             cancellable,
                                             &error);
+  } else if (job->kind == EDIT_NORMALIZE_ORIENTATION) {
+    success = losles_format_normalize_orientation_lossless(
+      format,
+      job->image,
+      job->destination,
+      cancellable,
+      &error);
   } else {
     success = losles_format_crop_lossless(format,
                                           job->image,
@@ -1679,9 +1689,13 @@ start_edit(LoslesWindow *self,
   update_controls(self);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
   gtk_spinner_start(self->spinner);
-  set_status(self, kind == EDIT_ROTATE
-                     ? "Rotating losslessly in place…"
-                     : "Cropping losslessly; moving the original to Trash…");
+  if (kind == EDIT_ROTATE)
+    set_status(self, "Rotating losslessly in place…");
+  else if (kind == EDIT_NORMALIZE_ORIENTATION)
+    set_status(self, "Normalizing EXIF orientation losslessly in place…");
+  else
+    set_status(self,
+               "Cropping losslessly; moving the original to Trash…");
 
   GTask *task = g_task_new(self, NULL, edit_done, NULL);
   g_task_set_task_data(task, job, (GDestroyNotify)edit_job_free);
@@ -1702,6 +1716,19 @@ rotate_clicked(GtkButton *button, LoslesWindow *self)
              losles_image_get_file(self->current_image),
              EDIT_ROTATE,
              direction,
+             NULL);
+}
+
+static void
+normalize_orientation_clicked(GtkButton *button, LoslesWindow *self)
+{
+  (void)button;
+  if (!self->current_image || self->operation_in_progress)
+    return;
+  start_edit(self,
+             losles_image_get_file(self->current_image),
+             EDIT_NORMALIZE_ORIENTATION,
+             LOSLES_ROTATE_LEFT,
              NULL);
 }
 
@@ -2073,11 +2100,16 @@ update_controls(LoslesWindow *self)
   const gboolean idle = !self->operation_in_progress;
   const gboolean has_image = self->current_image != NULL && idle;
   gboolean rotation = FALSE;
+  gboolean normalize_orientation = FALSE;
   gboolean crop = FALSE;
   if (has_image) {
     LoslesFormat *format =
       LOSLES_FORMAT(losles_image_get_format(self->current_image));
     rotation = losles_format_supports_lossless_rotation(format);
+    normalize_orientation =
+      losles_format_supports_lossless_orientation_normalization(format) &&
+      losles_image_has_exif_orientation(self->current_image) &&
+      losles_image_get_orientation(self->current_image) != 1;
     crop = losles_format_supports_lossless_crop(format) &&
            losles_image_get_orientation(self->current_image) == 1;
   }
@@ -2090,6 +2122,20 @@ update_controls(LoslesWindow *self)
                              self->current_index + 1 < self->files->len);
   gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_left_button), rotation);
   gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_right_button), rotation);
+  gtk_widget_set_sensitive(
+    GTK_WIDGET(self->normalize_orientation_button),
+    normalize_orientation);
+  const gchar *normalize_orientation_tooltip =
+    normalize_orientation
+      ? "EXIF stores a non-default orientation. Click to apply it "
+        "losslessly to the JPEG data and set the tag to 1"
+      : "No rotation is stored in EXIF";
+  gtk_widget_set_tooltip_text(
+    GTK_WIDGET(self->normalize_orientation_button),
+    normalize_orientation_tooltip);
+  gtk_widget_set_tooltip_text(
+    self->normalize_orientation_tooltip_area,
+    normalize_orientation_tooltip);
   gtk_widget_set_sensitive(GTK_WIDGET(self->crop_button), crop);
   if (!crop)
     gtk_toggle_button_set_active(self->crop_button, FALSE);
@@ -2236,6 +2282,23 @@ losles_window_init(LoslesWindow *self)
   g_signal_connect(self->rotate_right_button,
                    "clicked",
                    G_CALLBACK(rotate_clicked),
+                   self);
+
+  self->normalize_orientation_button =
+    GTK_BUTTON(icon_button("dialog-warning-symbolic",
+                           "No rotation is stored in EXIF"));
+  self->normalize_orientation_tooltip_area =
+    gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_tooltip_text(self->normalize_orientation_tooltip_area,
+                              "No rotation is stored in EXIF");
+  gtk_box_append(GTK_BOX(self->normalize_orientation_tooltip_area),
+                 GTK_WIDGET(self->normalize_orientation_button));
+  gtk_header_bar_pack_end(
+    self->header_bar,
+    self->normalize_orientation_tooltip_area);
+  g_signal_connect(self->normalize_orientation_button,
+                   "clicked",
+                   G_CALLBACK(normalize_orientation_clicked),
                    self);
 
   self->info_button =

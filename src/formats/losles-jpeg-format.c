@@ -203,7 +203,9 @@ jpeg_load(LoslesFormat *format,
   g_autoptr(GBytes) pixel_bytes =
     g_bytes_new_take((gpointer)pixels, (gsize)stride * height);
   pixels = NULL;
-  const guint orientation = losles_jpeg_metadata_get_orientation(encoded);
+  guint orientation = 1;
+  const gboolean has_exif_orientation =
+    losles_jpeg_metadata_read_orientation(encoded, &orientation);
 
   LoslesImage *image =
     losles_image_new(file,
@@ -215,6 +217,7 @@ jpeg_load(LoslesFormat *format,
                      pixel_bytes,
                      (GBytes *)icc_profile,
                      orientation,
+                     has_exif_orientation,
                      mcu_width,
                      mcu_height,
                      "JPEG",
@@ -226,6 +229,13 @@ jpeg_load(LoslesFormat *format,
 
 static gboolean
 jpeg_supports_lossless_rotation(LoslesFormat *format)
+{
+  (void)format;
+  return TRUE;
+}
+
+static gboolean
+jpeg_supports_lossless_orientation_normalization(LoslesFormat *format)
 {
   (void)format;
   return TRUE;
@@ -252,7 +262,7 @@ jpeg_adjust_crop(LoslesFormat *format,
       G_IO_ERROR,
       G_IO_ERROR_NOT_SUPPORTED,
       "Lossless crop currently requires EXIF orientation 1. "
-      "Save a losslessly rotated copy first.");
+      "Use Normalize first.");
     return FALSE;
   }
 
@@ -466,6 +476,7 @@ run_turbojpeg_transform(LoslesImage *image,
                         GFile *destination,
                         gint operation,
                         const LoslesCrop *crop,
+                        gboolean normalize_orientation,
                         gboolean trash_source,
                         GCancellable *cancellable,
                         GError **error)
@@ -598,6 +609,13 @@ run_turbojpeg_transform(LoslesImage *image,
     remove_temporary_file(temporary_path);
     return FALSE;
   }
+  if (normalize_orientation &&
+      !losles_jpeg_metadata_set_orientation_in_file(temporary_path,
+                                                    1,
+                                                    error)) {
+    remove_temporary_file(temporary_path);
+    return FALSE;
+  }
   copy_source_permissions(source_path, temporary_path);
 
   const gboolean installed =
@@ -623,24 +641,12 @@ jpeg_rotate_lossless(LoslesFormat *format,
 {
   (void)format;
   const guint orientation = losles_image_get_orientation(image);
-  switch (orientation) {
-  case 1:
-  case 3:
-  case 6:
-  case 8:
-    break;
-  default:
-    g_set_error_literal(
-      error,
-      G_IO_ERROR,
-      G_IO_ERROR_NOT_SUPPORTED,
-      "Mirrored EXIF orientations are displayed correctly but are not yet "
-      "supported by the lossless rotation writer");
-    return FALSE;
-  }
-
-  const gint operation =
-    rotation == LOSLES_ROTATE_RIGHT ? TJXOP_ROT90 : TJXOP_ROT270;
+  const gboolean mirrored =
+    orientation == 2 || orientation == 4 ||
+    orientation == 5 || orientation == 7;
+  const gint operation = rotation == LOSLES_ROTATE_RIGHT
+                           ? (mirrored ? TJXOP_ROT270 : TJXOP_ROT90)
+                           : (mirrored ? TJXOP_ROT90 : TJXOP_ROT270);
 
   return run_turbojpeg_transform(
     image,
@@ -648,8 +654,49 @@ jpeg_rotate_lossless(LoslesFormat *format,
     operation,
     NULL,
     FALSE,
+    FALSE,
     cancellable,
     error);
+}
+
+static gboolean
+jpeg_normalize_orientation_lossless(LoslesFormat *format,
+                                    LoslesImage *image,
+                                    GFile *destination,
+                                    GCancellable *cancellable,
+                                    GError **error)
+{
+  (void)format;
+  if (!losles_image_has_exif_orientation(image) ||
+      losles_image_get_orientation(image) == 1) {
+    g_set_error_literal(
+      error,
+      G_IO_ERROR,
+      G_IO_ERROR_NOT_SUPPORTED,
+      "This JPEG has no non-default EXIF orientation to normalize");
+    return FALSE;
+  }
+
+  static const gint operations[] = {
+    TJXOP_NONE,
+    TJXOP_NONE,
+    TJXOP_HFLIP,
+    TJXOP_ROT180,
+    TJXOP_VFLIP,
+    TJXOP_TRANSPOSE,
+    TJXOP_ROT90,
+    TJXOP_TRANSVERSE,
+    TJXOP_ROT270,
+  };
+  const guint orientation = losles_image_get_orientation(image);
+  return run_turbojpeg_transform(image,
+                                 destination,
+                                 operations[orientation],
+                                 NULL,
+                                 TRUE,
+                                 FALSE,
+                                 cancellable,
+                                 error);
 }
 
 static gboolean
@@ -668,6 +715,7 @@ jpeg_crop_lossless(LoslesFormat *format,
                                  destination,
                                  TJXOP_NONE,
                                  &adjusted,
+                                 FALSE,
                                  g_file_equal(losles_image_get_file(image),
                                               destination),
                                  cancellable,
@@ -681,9 +729,13 @@ losles_jpeg_format_iface_init(LoslesFormatInterface *iface)
   iface->matches = jpeg_matches;
   iface->load = jpeg_load;
   iface->supports_lossless_rotation = jpeg_supports_lossless_rotation;
+  iface->supports_lossless_orientation_normalization =
+    jpeg_supports_lossless_orientation_normalization;
   iface->supports_lossless_crop = jpeg_supports_lossless_crop;
   iface->adjust_crop = jpeg_adjust_crop;
   iface->rotate_lossless = jpeg_rotate_lossless;
+  iface->normalize_orientation_lossless =
+    jpeg_normalize_orientation_lossless;
   iface->crop_lossless = jpeg_crop_lossless;
 }
 

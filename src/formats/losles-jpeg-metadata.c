@@ -145,11 +145,24 @@ losles_jpeg_metadata_get_orientation(GBytes *encoded)
 {
   g_return_val_if_fail(encoded != NULL, 1);
 
+  guint orientation = 1;
+  losles_jpeg_metadata_read_orientation(encoded, &orientation);
+  return orientation;
+}
+
+gboolean
+losles_jpeg_metadata_read_orientation(GBytes *encoded, guint *orientation)
+{
+  g_return_val_if_fail(encoded != NULL, FALSE);
+
   gsize size = 0;
   const guint8 *data = g_bytes_get_data(encoded, &size);
-  guint orientation = 1;
-  find_orientation((guint8 *)data, size, &orientation, NULL, NULL);
-  return orientation;
+  guint value = 1;
+  const gboolean found =
+    find_orientation((guint8 *)data, size, &value, NULL, NULL);
+  if (orientation)
+    *orientation = value;
+  return found;
 }
 
 gboolean
@@ -171,8 +184,13 @@ losles_jpeg_metadata_set_orientation_in_file(const gchar *path,
                         size,
                         NULL,
                         &offset,
-                        &endian))
-    return TRUE;
+                        &endian)) {
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_INVALID_DATA,
+                        "JPEG has no valid EXIF orientation tag");
+    return FALSE;
+  }
 
   if (endian == TIFF_ENDIAN_LITTLE) {
     contents[offset] = (guint8)orientation;

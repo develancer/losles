@@ -52,6 +52,16 @@ losles_format_supports_lossless_rotation(LoslesFormat *self)
 }
 
 gboolean
+losles_format_supports_lossless_orientation_normalization(
+  LoslesFormat *self)
+{
+  g_return_val_if_fail(LOSLES_IS_FORMAT(self), FALSE);
+  LoslesFormatInterface *iface = LOSLES_FORMAT_GET_IFACE(self);
+  return iface->supports_lossless_orientation_normalization &&
+         iface->supports_lossless_orientation_normalization(self);
+}
+
+gboolean
 losles_format_supports_lossless_crop(LoslesFormat *self)
 {
   g_return_val_if_fail(LOSLES_IS_FORMAT(self), FALSE);
@@ -101,6 +111,31 @@ losles_format_rotate_lossless(LoslesFormat *self,
                                 rotation,
                                 cancellable,
                                 error);
+}
+
+gboolean
+losles_format_normalize_orientation_lossless(
+  LoslesFormat *self,
+  LoslesImage *image,
+  GFile *destination,
+  GCancellable *cancellable,
+  GError **error)
+{
+  g_return_val_if_fail(LOSLES_IS_FORMAT(self), FALSE);
+  LoslesFormatInterface *iface = LOSLES_FORMAT_GET_IFACE(self);
+  if (!iface->normalize_orientation_lossless) {
+    g_set_error_literal(
+      error,
+      G_IO_ERROR,
+      G_IO_ERROR_NOT_SUPPORTED,
+      "This format does not support lossless orientation normalization");
+    return FALSE;
+  }
+  return iface->normalize_orientation_lossless(self,
+                                               image,
+                                               destination,
+                                               cancellable,
+                                               error);
 }
 
 gboolean

@@ -22,6 +22,7 @@ LoslesImage *losles_image_new(GFile *file,
                               GBytes *pixels,
                               GBytes *icc_profile,
                               guint orientation,
+                              gboolean has_exif_orientation,
                               guint jpeg_mcu_width,
                               guint jpeg_mcu_height,
                               const gchar *format_name,
@@ -37,6 +38,7 @@ LoslesPixelFormat losles_image_get_pixel_format(LoslesImage *self);
 GBytes *losles_image_get_pixels(LoslesImage *self);
 GBytes *losles_image_get_icc_profile(LoslesImage *self);
 guint losles_image_get_orientation(LoslesImage *self);
+gboolean losles_image_has_exif_orientation(LoslesImage *self);
 guint losles_image_get_jpeg_mcu_width(LoslesImage *self);
 guint losles_image_get_jpeg_mcu_height(LoslesImage *self);
 const gchar *losles_image_get_format_name(LoslesImage *self);
