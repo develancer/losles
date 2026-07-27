@@ -1,0 +1,1625 @@
+#include "losles-window.h"
+
+#include "formats/losles-format-registry.h"
+#include "formats/losles-format.h"
+#include "losles-color-manager.h"
+#include "losles-image.h"
+#include "losles-rendered-image.h"
+
+#include <string.h>
+
+#define SOURCE_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
+#define RENDER_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
+#define PRELOAD_DISTANCE 2
+#define MAX_CONCURRENT_DECODES 2
+#define MAX_CONCURRENT_RENDERS 2
+
+typedef struct {
+  LoslesFormatRegistry *registry;
+  GFile *file;
+  gchar *uri;
+  guint generation;
+  gboolean foreground;
+} LoadJob;
+
+typedef struct {
+  GFile *opened_file;
+  GFile *directory;
+  guint generation;
+} ScanJob;
+
+typedef struct {
+  LoslesColorTarget *target;
+  LoslesImage *image;
+  gchar *uri;
+  guint generation;
+} RenderJob;
+
+typedef struct {
+  LoslesRenderedImage *rendered;
+  GdkTexture *texture;
+  gsize size;
+} RenderCacheEntry;
+
+typedef enum {
+  EDIT_ROTATE,
+  EDIT_CROP,
+} EditKind;
+
+typedef struct {
+  LoslesImage *image;
+  GFile *destination;
+  EditKind kind;
+  LoslesRotation rotation;
+  LoslesCrop crop;
+} EditJob;
+
+typedef struct {
+  LoslesWindow *window;
+  EditKind kind;
+  LoslesRotation rotation;
+  LoslesCrop crop;
+} SaveRequest;
+
+struct _LoslesWindow {
+  GtkApplicationWindow parent_instance;
+
+  LoslesFormatRegistry *registry;
+  LoslesColorManager *color_manager;
+
+  GtkPicture *picture;
+  GtkDrawingArea *crop_area;
+  GtkSpinner *spinner;
+  GtkLabel *status;
+  GtkButton *previous_button;
+  GtkButton *next_button;
+  GtkButton *rotate_left_button;
+  GtkButton *rotate_right_button;
+  GtkToggleButton *crop_button;
+  GtkButton *apply_crop_button;
+
+  GPtrArray *files;
+  guint current_index;
+  GHashTable *cache;
+  GHashTable *inflight;
+  GHashTable *failed;
+  gsize cache_size;
+  guint generation;
+
+  GHashTable *render_cache;
+  GHashTable *render_inflight;
+  GHashTable *render_blocked;
+  gsize render_cache_size;
+  guint render_generation;
+
+  LoslesImage *current_image;
+  GdkTexture *current_texture;
+  GCancellable *load_cancellable;
+  GCancellable *render_cancellable;
+
+  gboolean monitor_signals_connected;
+  gboolean crop_drag_started_inside;
+  gdouble crop_drag_x;
+  gdouble crop_drag_y;
+  LoslesCrop crop;
+  gboolean crop_valid;
+};
+
+G_DEFINE_FINAL_TYPE(LoslesWindow, losles_window, GTK_TYPE_APPLICATION_WINDOW)
+
+static void show_index(LoslesWindow *self, guint index);
+static void start_render(LoslesWindow *self);
+static void start_render_for_image(LoslesWindow *self,
+                                   LoslesImage *image,
+                                   gboolean foreground);
+static void update_controls(LoslesWindow *self);
+static void preload_neighbors(LoslesWindow *self);
+static void preload_rendered_neighbors(LoslesWindow *self);
+
+static void
+load_job_free(LoadJob *job)
+{
+  g_clear_object(&job->registry);
+  g_clear_object(&job->file);
+  g_clear_pointer(&job->uri, g_free);
+  g_free(job);
+}
+
+static void
+scan_job_free(ScanJob *job)
+{
+  g_clear_object(&job->opened_file);
+  g_clear_object(&job->directory);
+  g_free(job);
+}
+
+static void
+render_job_free(RenderJob *job)
+{
+  g_clear_pointer(&job->target, losles_color_target_unref);
+  g_clear_object(&job->image);
+  g_clear_pointer(&job->uri, g_free);
+  g_free(job);
+}
+
+static void
+render_cache_entry_free(RenderCacheEntry *entry)
+{
+  if (!entry)
+    return;
+  g_clear_object(&entry->texture);
+  g_clear_pointer(&entry->rendered, losles_rendered_image_free);
+  g_free(entry);
+}
+
+static void
+edit_job_free(EditJob *job)
+{
+  g_clear_object(&job->image);
+  g_clear_object(&job->destination);
+  g_free(job);
+}
+
+static void
+save_request_free(SaveRequest *request)
+{
+  g_clear_object(&request->window);
+  g_free(request);
+}
+
+static GFile *
+current_file(LoslesWindow *self)
+{
+  if (!self->files || self->current_index >= self->files->len)
+    return NULL;
+  return g_ptr_array_index(self->files, self->current_index);
+}
+
+static gchar *
+file_uri(GFile *file)
+{
+  return g_file_get_uri(file);
+}
+
+static gboolean
+is_current_file(LoslesWindow *self, GFile *file)
+{
+  GFile *current = current_file(self);
+  return current && g_file_equal(current, file);
+}
+
+static void
+set_status(LoslesWindow *self, const gchar *text)
+{
+  gtk_label_set_text(self->status, text ? text : "");
+}
+
+static void
+show_error(LoslesWindow *self, const gchar *primary, const GError *error)
+{
+  g_autofree gchar *message =
+    error ? g_strdup_printf("%s: %s", primary, error->message)
+          : g_strdup(primary);
+  set_status(self, message);
+
+  GtkAlertDialog *dialog = gtk_alert_dialog_new("%s", primary);
+  if (error)
+    gtk_alert_dialog_set_detail(dialog, error->message);
+  gtk_alert_dialog_show(dialog, GTK_WINDOW(self));
+  g_object_unref(dialog);
+}
+
+static void
+clear_current_image(LoslesWindow *self)
+{
+  g_clear_object(&self->current_image);
+  g_clear_object(&self->current_texture);
+  gtk_picture_set_paintable(self->picture, NULL);
+  self->crop_valid = FALSE;
+  gtk_toggle_button_set_active(self->crop_button, FALSE);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  update_controls(self);
+}
+
+static gint
+find_file_index(GPtrArray *files, GFile *file)
+{
+  for (guint i = 0; i < files->len; i++) {
+    if (g_file_equal(g_ptr_array_index(files, i), file))
+      return (gint)i;
+  }
+  return -1;
+}
+
+static void
+prune_cache(LoslesWindow *self)
+{
+  if (!self->files || self->files->len == 0)
+    return;
+
+  g_autoptr(GHashTable) allowed =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  const gint first =
+    MAX(0, (gint)self->current_index - PRELOAD_DISTANCE);
+  const guint last =
+    MIN(self->files->len - 1, self->current_index + PRELOAD_DISTANCE);
+  for (gint i = first; i <= (gint)last; i++) {
+    g_autofree gchar *uri =
+      file_uri(g_ptr_array_index(self->files, (guint)i));
+    g_hash_table_add(allowed, g_steal_pointer(&uri));
+  }
+
+  GHashTableIter iter;
+  gpointer key = NULL;
+  gpointer value = NULL;
+  g_hash_table_iter_init(&iter, self->cache);
+  while (g_hash_table_iter_next(&iter, &key, &value)) {
+    if (!g_hash_table_contains(allowed, key)) {
+      self->cache_size -= losles_image_get_memory_size(value);
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+
+  if (self->cache_size <= SOURCE_CACHE_LIMIT)
+    return;
+
+  g_autofree gchar *current_uri =
+    current_file(self) ? file_uri(current_file(self)) : NULL;
+  g_hash_table_iter_init(&iter, self->cache);
+  while (self->cache_size > SOURCE_CACHE_LIMIT &&
+         g_hash_table_iter_next(&iter, &key, &value)) {
+    if (g_strcmp0(key, current_uri) != 0) {
+      self->cache_size -= losles_image_get_memory_size(value);
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+}
+
+static gboolean
+cache_image(LoslesWindow *self,
+            const gchar *uri,
+            LoslesImage *image,
+            gboolean foreground)
+{
+  LoslesImage *old = g_hash_table_lookup(self->cache, uri);
+  if (old)
+    self->cache_size -= losles_image_get_memory_size(old);
+
+  const gsize size = losles_image_get_memory_size(image);
+  if (!foreground && !old && self->cache_size + size > SOURCE_CACHE_LIMIT)
+    return FALSE;
+
+  self->cache_size += size;
+  g_hash_table_replace(self->cache, g_strdup(uri), g_object_ref(image));
+  prune_cache(self);
+  return TRUE;
+}
+
+static void
+prune_render_cache(LoslesWindow *self)
+{
+  if (!self->files || self->files->len == 0)
+    return;
+
+  g_autoptr(GHashTable) allowed =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  const gint first =
+    MAX(0, (gint)self->current_index - PRELOAD_DISTANCE);
+  const guint last =
+    MIN(self->files->len - 1, self->current_index + PRELOAD_DISTANCE);
+  for (gint i = first; i <= (gint)last; i++) {
+    g_autofree gchar *uri =
+      file_uri(g_ptr_array_index(self->files, (guint)i));
+    g_hash_table_add(allowed, g_steal_pointer(&uri));
+  }
+
+  GHashTableIter iter;
+  gpointer key = NULL;
+  gpointer value = NULL;
+  g_hash_table_iter_init(&iter, self->render_cache);
+  while (g_hash_table_iter_next(&iter, &key, &value)) {
+    RenderCacheEntry *entry = value;
+    if (!g_hash_table_contains(allowed, key)) {
+      self->render_cache_size -= entry->size;
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+
+  if (self->render_cache_size <= RENDER_CACHE_LIMIT)
+    return;
+
+  g_autofree gchar *current_uri =
+    current_file(self) ? file_uri(current_file(self)) : NULL;
+  g_hash_table_iter_init(&iter, self->render_cache);
+  while (self->render_cache_size > RENDER_CACHE_LIMIT &&
+         g_hash_table_iter_next(&iter, &key, &value)) {
+    RenderCacheEntry *entry = value;
+    if (g_strcmp0(key, current_uri) != 0) {
+      self->render_cache_size -= entry->size;
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+}
+
+static RenderCacheEntry *
+cache_rendered(LoslesWindow *self,
+               const gchar *uri,
+               LoslesRenderedImage *rendered,
+               gboolean foreground)
+{
+  RenderCacheEntry *old =
+    g_hash_table_lookup(self->render_cache, uri);
+  if (old)
+    self->render_cache_size -= old->size;
+
+  const gsize size = g_bytes_get_size(rendered->pixels);
+  if (!foreground && !old &&
+      self->render_cache_size + size > RENDER_CACHE_LIMIT)
+    return NULL;
+
+  RenderCacheEntry *entry = g_new0(RenderCacheEntry, 1);
+  entry->rendered = rendered;
+  entry->texture = losles_rendered_image_create_texture(rendered);
+  entry->size = size;
+  self->render_cache_size += size;
+  g_hash_table_replace(self->render_cache, g_strdup(uri), entry);
+  prune_render_cache(self);
+  return entry;
+}
+
+static void
+load_worker(GTask *task,
+            gpointer source_object,
+            gpointer task_data,
+            GCancellable *cancellable)
+{
+  (void)source_object;
+  LoadJob *job = task_data;
+  g_autoptr(GError) error = NULL;
+  LoslesImage *image =
+    losles_format_registry_load(job->registry,
+                                job->file,
+                                cancellable,
+                                &error);
+  if (!image)
+    g_task_return_error(task, g_steal_pointer(&error));
+  else
+    g_task_return_pointer(task, image, g_object_unref);
+}
+
+static void
+update_title(LoslesWindow *self, GFile *file)
+{
+  g_autofree gchar *basename = g_file_get_basename(file);
+  g_autofree gchar *title =
+    g_strdup_printf("%s — losles", basename ? basename : "Image");
+  gtk_window_set_title(GTK_WINDOW(self), title);
+}
+
+static void
+set_current_image(LoslesWindow *self, LoslesImage *image)
+{
+  if (self->current_image == image)
+    return;
+
+  g_set_object(&self->current_image, image);
+  self->crop_valid = FALSE;
+  gtk_toggle_button_set_active(self->crop_button, FALSE);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  update_controls(self);
+  start_render(self);
+}
+
+static void
+load_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  LoadJob *job = g_task_get_task_data(task);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(LoslesImage) image = g_task_propagate_pointer(task, &error);
+
+  if (job->generation != self->generation)
+    return;
+
+  g_hash_table_remove(self->inflight, job->uri);
+  if (!image) {
+    g_hash_table_add(self->failed, g_strdup(job->uri));
+    if (is_current_file(self, job->file)) {
+      gtk_spinner_stop(self->spinner);
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+      show_error(self, "Could not open the image", error);
+    }
+    preload_neighbors(self);
+    return;
+  }
+
+  /*
+   * A low-priority neighbor load can become the foreground load while it is
+   * in flight.  Decide from the current file, not from how the task started.
+  */
+  const gboolean foreground = is_current_file(self, job->file);
+  const gboolean cached =
+    cache_image(self, job->uri, image, foreground);
+  if (!cached)
+    g_hash_table_add(self->failed, g_strdup(job->uri));
+  if (foreground) {
+    gtk_spinner_stop(self->spinner);
+    gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+    set_current_image(self, image);
+  } else if (cached) {
+    start_render_for_image(self, image, FALSE);
+  }
+  preload_neighbors(self);
+}
+
+static void
+start_load(LoslesWindow *self, GFile *file, gboolean foreground)
+{
+  g_autofree gchar *uri = file_uri(file);
+  LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (cached) {
+    if (foreground)
+      set_current_image(self, cached);
+    return;
+  }
+
+  if (g_hash_table_contains(self->inflight, uri))
+    return;
+  if (g_hash_table_contains(self->failed, uri)) {
+    if (!foreground)
+      return;
+    g_hash_table_remove(self->failed, uri);
+  }
+  if (!foreground &&
+      g_hash_table_size(self->inflight) >= MAX_CONCURRENT_DECODES)
+    return;
+
+  g_hash_table_add(self->inflight, g_strdup(uri));
+  LoadJob *job = g_new0(LoadJob, 1);
+  job->registry = g_object_ref(self->registry);
+  job->file = g_object_ref(file);
+  job->uri = g_strdup(uri);
+  job->generation = self->generation;
+  job->foreground = foreground;
+
+  GTask *task =
+    g_task_new(self, self->load_cancellable, load_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)load_job_free);
+  g_task_set_priority(task,
+                      foreground ? G_PRIORITY_DEFAULT : G_PRIORITY_LOW);
+  g_task_run_in_thread(task, load_worker);
+  g_object_unref(task);
+}
+
+static void
+preload_neighbors(LoslesWindow *self)
+{
+  for (guint distance = 1; distance <= PRELOAD_DISTANCE; distance++) {
+    if (self->current_index + distance < self->files->len)
+      start_load(self,
+                 g_ptr_array_index(self->files,
+                                   self->current_index + distance),
+                 FALSE);
+    if (self->current_index >= distance)
+      start_load(self,
+                 g_ptr_array_index(self->files,
+                                   self->current_index - distance),
+                 FALSE);
+  }
+  preload_rendered_neighbors(self);
+}
+
+static gint
+compare_files(gconstpointer a, gconstpointer b)
+{
+  GFile *file_a = *(GFile *const *)a;
+  GFile *file_b = *(GFile *const *)b;
+  g_autofree gchar *name_a = g_file_get_basename(file_a);
+  g_autofree gchar *name_b = g_file_get_basename(file_b);
+  return g_utf8_collate(name_a ? name_a : "", name_b ? name_b : "");
+}
+
+static void
+scan_worker(GTask *task,
+            gpointer source_object,
+            gpointer task_data,
+            GCancellable *cancellable)
+{
+  (void)source_object;
+  ScanJob *job = task_data;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GFileEnumerator) enumerator =
+    g_file_enumerate_children(job->directory,
+                              G_FILE_ATTRIBUTE_STANDARD_NAME ","
+                              G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                              G_FILE_QUERY_INFO_NONE,
+                              cancellable,
+                              &error);
+  if (!enumerator) {
+    g_task_return_error(task, g_steal_pointer(&error));
+    return;
+  }
+
+  GPtrArray *files =
+    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  while (TRUE) {
+    g_autoptr(GFileInfo) info =
+      g_file_enumerator_next_file(enumerator, cancellable, &error);
+    if (!info)
+      break;
+    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR)
+      continue;
+
+    GFile *child =
+      g_file_get_child(job->directory, g_file_info_get_name(info));
+    if (losles_format_registry_supports_file(child))
+      g_ptr_array_add(files, child);
+    else
+      g_object_unref(child);
+  }
+
+  if (error) {
+    g_ptr_array_unref(files);
+    g_task_return_error(task, g_steal_pointer(&error));
+    return;
+  }
+
+  g_ptr_array_sort(files, compare_files);
+  g_task_return_pointer(task, files, (GDestroyNotify)g_ptr_array_unref);
+}
+
+static void
+scan_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  ScanJob *job = g_task_get_task_data(task);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GPtrArray) files =
+    g_task_propagate_pointer(task, &error);
+
+  if (job->generation != self->generation)
+    return;
+  if (!files) {
+    g_debug("Could not scan image directory: %s", error->message);
+    return;
+  }
+
+  const gint index = find_file_index(files, job->opened_file);
+  if (index < 0)
+    g_ptr_array_add(files, g_object_ref(job->opened_file));
+
+  g_clear_pointer(&self->files, g_ptr_array_unref);
+  self->files = g_steal_pointer(&files);
+  self->current_index =
+    index >= 0 ? (guint)index : self->files->len - 1;
+  update_controls(self);
+  preload_neighbors(self);
+  prune_cache(self);
+}
+
+static void
+scan_directory(LoslesWindow *self, GFile *file)
+{
+  g_autoptr(GFile) directory = g_file_get_parent(file);
+  if (!directory)
+    return;
+
+  ScanJob *job = g_new0(ScanJob, 1);
+  job->opened_file = g_object_ref(file);
+  job->directory = g_object_ref(directory);
+  job->generation = self->generation;
+
+  GTask *task =
+    g_task_new(self, self->load_cancellable, scan_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)scan_job_free);
+  g_task_set_priority(task, G_PRIORITY_LOW);
+  g_task_run_in_thread(task, scan_worker);
+  g_object_unref(task);
+}
+
+static GdkMonitor *
+current_monitor(LoslesWindow *self)
+{
+  GdkSurface *surface =
+    gtk_native_get_surface(GTK_NATIVE(self));
+  if (!surface)
+    return NULL;
+  return gdk_display_get_monitor_at_surface(gtk_widget_get_display(
+                                              GTK_WIDGET(self)),
+                                            surface);
+}
+
+static void
+render_worker(GTask *task,
+              gpointer source_object,
+              gpointer task_data,
+              GCancellable *cancellable)
+{
+  (void)source_object;
+  RenderJob *job = task_data;
+  g_autoptr(GError) error = NULL;
+  LoslesRenderedImage *rendered =
+    losles_color_target_render(job->target,
+                               job->image,
+                               cancellable,
+                               &error);
+  if (!rendered)
+    g_task_return_error(task, g_steal_pointer(&error));
+  else
+    g_task_return_pointer(task,
+                          rendered,
+                          (GDestroyNotify)losles_rendered_image_free);
+}
+
+static void
+display_rendered_image(LoslesWindow *self,
+                       LoslesImage *image,
+                       LoslesRenderedImage *rendered,
+                       GdkTexture *cached_texture)
+{
+  if (!self->current_image ||
+      !is_current_file(self, losles_image_get_file(image)))
+    return;
+
+  gtk_spinner_stop(self->spinner);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+
+  g_clear_object(&self->current_texture);
+  if (cached_texture)
+    self->current_texture = g_object_ref(cached_texture);
+  else
+    self->current_texture =
+      losles_rendered_image_create_texture(rendered);
+  gtk_picture_set_paintable(self->picture,
+                            GDK_PAINTABLE(self->current_texture));
+
+  const LoslesPixelFormat source_format =
+    losles_image_get_pixel_format(image);
+  const gchar *source_description =
+    rendered->used_embedded_profile
+      ? "embedded ICC"
+      : (source_format == LOSLES_PIXEL_FORMAT_G8 ||
+         source_format == LOSLES_PIXEL_FORMAT_GA8)
+          ? "assumed D65 gray"
+          : "assumed sRGB";
+  g_autofree gchar *status =
+    g_strdup_printf("%s  •  %u×%u  •  %s → %s%s",
+                    losles_image_get_format_name(image),
+                    losles_image_get_display_width(image),
+                    losles_image_get_display_height(image),
+                    source_description,
+                    rendered->display_profile_name,
+                    g_str_equal(rendered->display_profile_id,
+                                "builtin-srgb")
+                      ? " (no display profile found)"
+                      : "");
+  set_status(self, status);
+}
+
+static void
+render_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  RenderJob *job = g_task_get_task_data(task);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(LoslesRenderedImage) rendered =
+    g_task_propagate_pointer(task, &error);
+
+  if (job->generation != self->render_generation)
+    return;
+
+  g_hash_table_remove(self->render_inflight, job->uri);
+  const gboolean foreground =
+    is_current_file(self, losles_image_get_file(job->image));
+  if (!rendered) {
+    g_hash_table_add(self->render_blocked, g_strdup(job->uri));
+    if (foreground &&
+        !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+      gtk_spinner_stop(self->spinner);
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+      show_error(self, "Could not color-manage the image", error);
+    }
+    preload_rendered_neighbors(self);
+    return;
+  }
+
+  RenderCacheEntry *entry =
+    cache_rendered(self, job->uri, rendered, foreground);
+  if (entry)
+    g_steal_pointer(&rendered);
+  else
+    g_hash_table_add(self->render_blocked, g_strdup(job->uri));
+
+  if (foreground) {
+    if (entry)
+      display_rendered_image(self,
+                             job->image,
+                             entry->rendered,
+                             entry->texture);
+    else
+      display_rendered_image(self, job->image, rendered, NULL);
+  }
+  preload_rendered_neighbors(self);
+}
+
+static void
+start_render_for_image(LoslesWindow *self,
+                       LoslesImage *image,
+                       gboolean foreground)
+{
+  if (!gtk_widget_get_mapped(GTK_WIDGET(self)))
+    return;
+
+  g_autofree gchar *uri =
+    file_uri(losles_image_get_file(image));
+  RenderCacheEntry *cached =
+    g_hash_table_lookup(self->render_cache, uri);
+  if (cached) {
+    if (foreground)
+      display_rendered_image(self,
+                             image,
+                             cached->rendered,
+                             cached->texture);
+    return;
+  }
+
+  if (g_hash_table_contains(self->render_inflight, uri)) {
+    if (foreground) {
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+      gtk_spinner_start(self->spinner);
+      set_status(self, "Finishing prefetched color conversion…");
+    }
+    return;
+  }
+  if (g_hash_table_contains(self->render_blocked, uri)) {
+    if (!foreground)
+      return;
+    g_hash_table_remove(self->render_blocked, uri);
+  }
+  if (!foreground &&
+      g_hash_table_size(self->render_inflight) >=
+        MAX_CONCURRENT_RENDERS)
+    return;
+
+  g_autoptr(LoslesColorTarget) target =
+    losles_color_manager_get_target(self->color_manager,
+                                    current_monitor(self));
+  if (!target) {
+    if (foreground)
+      set_status(self, "No usable display color profile");
+    return;
+  }
+
+  if (foreground) {
+    gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+    gtk_spinner_start(self->spinner);
+    set_status(self, "Converting to the active display profile…");
+  }
+
+  RenderJob *job = g_new0(RenderJob, 1);
+  job->target = losles_color_target_ref(target);
+  job->image = g_object_ref(image);
+  job->uri = g_strdup(uri);
+  job->generation = self->render_generation;
+
+  g_hash_table_add(self->render_inflight, g_strdup(uri));
+  GTask *task =
+    g_task_new(self, self->render_cancellable, render_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)render_job_free);
+  g_task_set_priority(task,
+                      foreground ? G_PRIORITY_DEFAULT : G_PRIORITY_LOW);
+  g_task_run_in_thread(task, render_worker);
+  g_object_unref(task);
+}
+
+static void
+preload_rendered_neighbors(LoslesWindow *self)
+{
+  if (!self->files || !gtk_widget_get_mapped(GTK_WIDGET(self)))
+    return;
+
+  for (guint distance = 1; distance <= PRELOAD_DISTANCE; distance++) {
+    const gint indices[] = {
+      (gint)self->current_index + (gint)distance,
+      (gint)self->current_index - (gint)distance,
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(indices); i++) {
+      if (indices[i] < 0 || indices[i] >= (gint)self->files->len)
+        continue;
+      GFile *file = g_ptr_array_index(self->files, (guint)indices[i]);
+      g_autofree gchar *uri = file_uri(file);
+      LoslesImage *image = g_hash_table_lookup(self->cache, uri);
+      if (image)
+        start_render_for_image(self, image, FALSE);
+    }
+  }
+}
+
+static void
+start_render(LoslesWindow *self)
+{
+  if (!self->current_image)
+    return;
+  start_render_for_image(self, self->current_image, TRUE);
+  preload_rendered_neighbors(self);
+}
+
+static void
+invalidate_render_cache(LoslesWindow *self)
+{
+  if (self->render_cancellable)
+    g_cancellable_cancel(self->render_cancellable);
+  g_clear_object(&self->render_cancellable);
+  self->render_cancellable = g_cancellable_new();
+  self->render_generation++;
+  g_hash_table_remove_all(self->render_inflight);
+  g_hash_table_remove_all(self->render_blocked);
+  g_hash_table_remove_all(self->render_cache);
+  self->render_cache_size = 0;
+  g_clear_object(&self->current_texture);
+  gtk_picture_set_paintable(self->picture, NULL);
+}
+
+static void
+show_index(LoslesWindow *self, guint index)
+{
+  if (!self->files || index >= self->files->len)
+    return;
+
+  self->current_index = index;
+  GFile *file = current_file(self);
+  update_title(self, file);
+  clear_current_image(self);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+  gtk_spinner_start(self->spinner);
+  set_status(self, "Loading…");
+  start_load(self, file, TRUE);
+  update_controls(self);
+  preload_neighbors(self);
+  prune_cache(self);
+  prune_render_cache(self);
+}
+
+static void
+previous_image(LoslesWindow *self)
+{
+  if (self->current_index > 0)
+    show_index(self, self->current_index - 1);
+}
+
+static void
+next_image(LoslesWindow *self)
+{
+  if (self->files && self->current_index + 1 < self->files->len)
+    show_index(self, self->current_index + 1);
+}
+
+static gboolean
+widget_to_image(LoslesWindow *self,
+                gdouble widget_x,
+                gdouble widget_y,
+                gdouble *image_x,
+                gdouble *image_y)
+{
+  if (!self->current_image)
+    return FALSE;
+
+  const gdouble area_width = gtk_widget_get_width(GTK_WIDGET(self->crop_area));
+  const gdouble area_height =
+    gtk_widget_get_height(GTK_WIDGET(self->crop_area));
+  const gdouble image_width =
+    losles_image_get_display_width(self->current_image);
+  const gdouble image_height =
+    losles_image_get_display_height(self->current_image);
+  if (area_width <= 0 || area_height <= 0 ||
+      image_width <= 0 || image_height <= 0)
+    return FALSE;
+
+  const gdouble scale =
+    MIN(area_width / image_width, area_height / image_height);
+  const gdouble shown_width = image_width * scale;
+  const gdouble shown_height = image_height * scale;
+  const gdouble left = (area_width - shown_width) / 2.0;
+  const gdouble top = (area_height - shown_height) / 2.0;
+  const gboolean inside =
+    widget_x >= left && widget_y >= top &&
+    widget_x <= left + shown_width &&
+    widget_y <= top + shown_height;
+  *image_x =
+    CLAMP((widget_x - left) / scale, 0, image_width - 1);
+  *image_y =
+    CLAMP((widget_y - top) / scale, 0, image_height - 1);
+  return inside;
+}
+
+static void
+crop_drag_begin(GtkGestureDrag *gesture,
+                gdouble start_x,
+                gdouble start_y,
+                LoslesWindow *self)
+{
+  (void)gesture;
+  gdouble image_x = 0;
+  gdouble image_y = 0;
+  self->crop_drag_started_inside =
+    widget_to_image(self, start_x, start_y, &image_x, &image_y);
+  self->crop_drag_x = image_x;
+  self->crop_drag_y = image_y;
+  self->crop_valid = FALSE;
+  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button), FALSE);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+}
+
+static void
+crop_drag_update(GtkGestureDrag *gesture,
+                 gdouble offset_x,
+                 gdouble offset_y,
+                 LoslesWindow *self)
+{
+  if (!self->crop_drag_started_inside || !self->current_image)
+    return;
+
+  gdouble start_widget_x = 0;
+  gdouble start_widget_y = 0;
+  gtk_gesture_drag_get_start_point(gesture,
+                                   &start_widget_x,
+                                   &start_widget_y);
+  gdouble image_x = 0;
+  gdouble image_y = 0;
+  widget_to_image(self,
+                  start_widget_x + offset_x,
+                  start_widget_y + offset_y,
+                  &image_x,
+                  &image_y);
+
+  const gdouble left = MIN(self->crop_drag_x, image_x);
+  const gdouble top = MIN(self->crop_drag_y, image_y);
+  const gdouble right = MAX(self->crop_drag_x, image_x);
+  const gdouble bottom = MAX(self->crop_drag_y, image_y);
+  self->crop.x = (guint)left;
+  self->crop.y = (guint)top;
+  self->crop.width = MAX(1, (guint)(right - left + 1));
+  self->crop.height = MAX(1, (guint)(bottom - top + 1));
+  self->crop_valid = self->crop.width > 1 && self->crop.height > 1;
+  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button),
+                           self->crop_valid);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+}
+
+static void
+crop_draw(GtkDrawingArea *area,
+          cairo_t *cr,
+          gint width,
+          gint height,
+          LoslesWindow *self)
+{
+  (void)area;
+  if (!self->crop_valid || !self->current_image)
+    return;
+
+  const gdouble image_width =
+    losles_image_get_display_width(self->current_image);
+  const gdouble image_height =
+    losles_image_get_display_height(self->current_image);
+  const gdouble scale =
+    MIN(width / image_width, height / image_height);
+  const gdouble shown_width = image_width * scale;
+  const gdouble shown_height = image_height * scale;
+  const gdouble image_left = (width - shown_width) / 2.0;
+  const gdouble image_top = (height - shown_height) / 2.0;
+  const gdouble left = image_left + self->crop.x * scale;
+  const gdouble top = image_top + self->crop.y * scale;
+  const gdouble crop_width = self->crop.width * scale;
+  const gdouble crop_height = self->crop.height * scale;
+
+  cairo_rectangle(cr, image_left, image_top, shown_width, shown_height);
+  cairo_rectangle(cr, left, top, crop_width, crop_height);
+  cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+  cairo_set_source_rgba(cr, 0, 0, 0, 0.48);
+  cairo_fill(cr);
+
+  cairo_rectangle(cr,
+                  left + 0.5,
+                  top + 0.5,
+                  MAX(0, crop_width - 1),
+                  MAX(0, crop_height - 1));
+  cairo_set_source_rgba(cr, 1, 1, 1, 0.95);
+  cairo_set_line_width(cr, 1);
+  cairo_stroke(cr);
+}
+
+static void
+edit_worker(GTask *task,
+            gpointer source_object,
+            gpointer task_data,
+            GCancellable *cancellable)
+{
+  (void)source_object;
+  EditJob *job = task_data;
+  LoslesFormat *format =
+    LOSLES_FORMAT(losles_image_get_format(job->image));
+  g_autoptr(GError) error = NULL;
+  gboolean success = FALSE;
+  if (job->kind == EDIT_ROTATE) {
+    success = losles_format_rotate_lossless(format,
+                                            job->image,
+                                            job->destination,
+                                            job->rotation,
+                                            cancellable,
+                                            &error);
+  } else {
+    success = losles_format_crop_lossless(format,
+                                          job->image,
+                                          job->destination,
+                                          &job->crop,
+                                          cancellable,
+                                          &error);
+  }
+
+  if (!success)
+    g_task_return_error(task, g_steal_pointer(&error));
+  else
+    g_task_return_boolean(task, TRUE);
+}
+
+static void
+edit_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  EditJob *job = g_task_get_task_data(task);
+  g_autoptr(GFile) destination = g_object_ref(job->destination);
+  g_autoptr(GError) error = NULL;
+
+  gtk_spinner_stop(self->spinner);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+  if (!g_task_propagate_boolean(task, &error)) {
+    show_error(self, "The lossless operation failed", error);
+    return;
+  }
+
+  losles_window_open_file(self, destination);
+}
+
+static void
+start_edit(LoslesWindow *self,
+           GFile *destination,
+           EditKind kind,
+           LoslesRotation rotation,
+           const LoslesCrop *crop)
+{
+  EditJob *job = g_new0(EditJob, 1);
+  job->image = g_object_ref(self->current_image);
+  job->destination = g_object_ref(destination);
+  job->kind = kind;
+  job->rotation = rotation;
+  if (crop)
+    job->crop = *crop;
+
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+  gtk_spinner_start(self->spinner);
+  set_status(self, kind == EDIT_ROTATE
+                     ? "Writing losslessly rotated JPEG…"
+                     : "Writing losslessly cropped JPEG…");
+
+  GTask *task = g_task_new(self, NULL, edit_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)edit_job_free);
+  g_task_run_in_thread(task, edit_worker);
+  g_object_unref(task);
+}
+
+static void
+save_chosen(GObject *source_object,
+            GAsyncResult *result,
+            gpointer user_data)
+{
+  SaveRequest *request = user_data;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GFile) destination =
+    gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source_object),
+                                result,
+                                &error);
+  if (!destination) {
+    if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED))
+      show_error(request->window, "Could not choose a destination", error);
+    save_request_free(request);
+    return;
+  }
+
+  start_edit(request->window,
+             destination,
+             request->kind,
+             request->rotation,
+             request->kind == EDIT_CROP ? &request->crop : NULL);
+  save_request_free(request);
+}
+
+static gchar *
+suggested_filename(GFile *source, const gchar *suffix)
+{
+  g_autofree gchar *basename = g_file_get_basename(source);
+  const gchar *dot = basename ? strrchr(basename, '.') : NULL;
+  if (!dot || dot == basename)
+    return g_strdup_printf("%s-%s", basename ? basename : "image", suffix);
+  return g_strdup_printf("%.*s-%s%s",
+                         (gint)(dot - basename),
+                         basename,
+                         suffix,
+                         dot);
+}
+
+static void
+prompt_save(LoslesWindow *self,
+            EditKind kind,
+            LoslesRotation rotation,
+            const LoslesCrop *crop)
+{
+  if (!self->current_image)
+    return;
+
+  SaveRequest *request = g_new0(SaveRequest, 1);
+  request->window = g_object_ref(self);
+  request->kind = kind;
+  request->rotation = rotation;
+  if (crop)
+    request->crop = *crop;
+
+  GtkFileDialog *dialog = gtk_file_dialog_new();
+  gtk_file_dialog_set_title(dialog,
+                            kind == EDIT_ROTATE
+                              ? "Save Rotated Image"
+                              : "Save Cropped Image");
+  g_autofree gchar *name =
+    suggested_filename(losles_image_get_file(self->current_image),
+                       kind == EDIT_ROTATE ? "rotated" : "cropped");
+  gtk_file_dialog_set_initial_name(dialog, name);
+  g_autoptr(GFile) parent =
+    g_file_get_parent(losles_image_get_file(self->current_image));
+  if (parent)
+    gtk_file_dialog_set_initial_folder(dialog, parent);
+  gtk_file_dialog_save(dialog,
+                       GTK_WINDOW(self),
+                       NULL,
+                       save_chosen,
+                       request);
+  g_object_unref(dialog);
+}
+
+static void
+rotate_clicked(GtkButton *button, LoslesWindow *self)
+{
+  const LoslesRotation direction =
+    button == self->rotate_left_button
+      ? LOSLES_ROTATE_LEFT
+      : LOSLES_ROTATE_RIGHT;
+  prompt_save(self, EDIT_ROTATE, direction, NULL);
+}
+
+static void
+crop_toggled(GtkToggleButton *button, LoslesWindow *self)
+{
+  const gboolean active = gtk_toggle_button_get_active(button);
+  gtk_widget_set_visible(GTK_WIDGET(self->crop_area), active);
+  gtk_widget_set_visible(GTK_WIDGET(self->apply_crop_button), active);
+  self->crop_valid = FALSE;
+  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button), FALSE);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+}
+
+static void
+apply_crop_clicked(GtkButton *button, LoslesWindow *self)
+{
+  (void)button;
+  if (!self->current_image || !self->crop_valid)
+    return;
+
+  LoslesFormat *format =
+    LOSLES_FORMAT(losles_image_get_format(self->current_image));
+  LoslesCrop adjusted = {0};
+  g_autoptr(GError) error = NULL;
+  if (!losles_format_adjust_crop(format,
+                                 self->current_image,
+                                 &self->crop,
+                                 &adjusted,
+                                 &error)) {
+    show_error(self, "This crop cannot be performed losslessly", error);
+    return;
+  }
+  self->crop = adjusted;
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  set_status(self, "Selection aligned to JPEG lossless block boundaries");
+  prompt_save(self, EDIT_CROP, LOSLES_ROTATE_LEFT, &adjusted);
+}
+
+static void
+open_chosen(GObject *source_object,
+            GAsyncResult *result,
+            gpointer user_data)
+{
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GFile) file =
+    gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source_object),
+                                result,
+                                &error);
+  if (file)
+    losles_window_open_file(self, file);
+  else if (!g_error_matches(error, GTK_DIALOG_ERROR,
+                            GTK_DIALOG_ERROR_DISMISSED))
+    show_error(self, "Could not choose an image", error);
+  g_object_unref(self);
+}
+
+static void
+open_dialog(LoslesWindow *self)
+{
+  GtkFileDialog *dialog = gtk_file_dialog_new();
+  gtk_file_dialog_set_title(dialog, "Open Image");
+  gtk_file_dialog_open(dialog,
+                       GTK_WINDOW(self),
+                       NULL,
+                       open_chosen,
+                       g_object_ref(self));
+  g_object_unref(dialog);
+}
+
+static void
+action_open(GSimpleAction *action,
+            GVariant *parameter,
+            gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  open_dialog(LOSLES_WINDOW(user_data));
+}
+
+static void
+action_previous(GSimpleAction *action,
+                GVariant *parameter,
+                gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  previous_image(LOSLES_WINDOW(user_data));
+}
+
+static void
+action_next(GSimpleAction *action,
+            GVariant *parameter,
+            gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  next_image(LOSLES_WINDOW(user_data));
+}
+
+static void
+monitor_changed(GdkSurface *surface,
+                GdkMonitor *monitor,
+                LoslesWindow *self)
+{
+  (void)surface;
+  (void)monitor;
+  invalidate_render_cache(self);
+  start_render(self);
+}
+
+static void
+window_mapped(GtkWidget *widget, LoslesWindow *self)
+{
+  (void)widget;
+  if (!self->monitor_signals_connected) {
+    GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(self));
+    if (surface) {
+      g_signal_connect_object(surface,
+                              "enter-monitor",
+                              G_CALLBACK(monitor_changed),
+                              self,
+                              0);
+      g_signal_connect_object(surface,
+                              "leave-monitor",
+                              G_CALLBACK(monitor_changed),
+                              self,
+                              0);
+      self->monitor_signals_connected = TRUE;
+    }
+  }
+  start_render(self);
+}
+
+static void
+color_target_changed(LoslesColorManager *manager, LoslesWindow *self)
+{
+  (void)manager;
+  invalidate_render_cache(self);
+  start_render(self);
+}
+
+static void
+update_controls(LoslesWindow *self)
+{
+  const gboolean has_image = self->current_image != NULL;
+  gboolean rotation = FALSE;
+  gboolean crop = FALSE;
+  if (has_image) {
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(self->current_image));
+    rotation = losles_format_supports_lossless_rotation(format);
+    crop = losles_format_supports_lossless_crop(format) &&
+           losles_image_get_orientation(self->current_image) == 1;
+  }
+
+  gtk_widget_set_sensitive(GTK_WIDGET(self->previous_button),
+                           self->files && self->current_index > 0);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->next_button),
+                           self->files &&
+                             self->current_index + 1 < self->files->len);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_left_button), rotation);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_right_button), rotation);
+  gtk_widget_set_sensitive(GTK_WIDGET(self->crop_button), crop);
+  if (!crop)
+    gtk_toggle_button_set_active(self->crop_button, FALSE);
+}
+
+static GtkWidget *
+icon_button(const gchar *icon_name, const gchar *tooltip)
+{
+  GtkWidget *button = gtk_button_new_from_icon_name(icon_name);
+  gtk_widget_set_tooltip_text(button, tooltip);
+  gtk_widget_add_css_class(button, "flat");
+  return button;
+}
+
+static void
+losles_window_dispose(GObject *object)
+{
+  LoslesWindow *self = LOSLES_WINDOW(object);
+
+  if (self->load_cancellable)
+    g_cancellable_cancel(self->load_cancellable);
+  if (self->render_cancellable)
+    g_cancellable_cancel(self->render_cancellable);
+  g_clear_object(&self->load_cancellable);
+  g_clear_object(&self->render_cancellable);
+  g_clear_object(&self->current_texture);
+  g_clear_object(&self->current_image);
+  g_clear_pointer(&self->files, g_ptr_array_unref);
+  g_clear_pointer(&self->cache, g_hash_table_unref);
+  g_clear_pointer(&self->inflight, g_hash_table_unref);
+  g_clear_pointer(&self->failed, g_hash_table_unref);
+  g_clear_pointer(&self->render_cache, g_hash_table_unref);
+  g_clear_pointer(&self->render_inflight, g_hash_table_unref);
+  g_clear_pointer(&self->render_blocked, g_hash_table_unref);
+  g_clear_object(&self->color_manager);
+  g_clear_object(&self->registry);
+
+  G_OBJECT_CLASS(losles_window_parent_class)->dispose(object);
+}
+
+static void
+losles_window_class_init(LoslesWindowClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->dispose = losles_window_dispose;
+}
+
+static void
+losles_window_init(LoslesWindow *self)
+{
+  self->registry = losles_format_registry_new();
+  self->color_manager = losles_color_manager_new();
+  self->files =
+    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  self->cache =
+    g_hash_table_new_full(g_str_hash,
+                          g_str_equal,
+                          g_free,
+                          (GDestroyNotify)g_object_unref);
+  self->inflight =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->failed =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->load_cancellable = g_cancellable_new();
+  self->render_cache =
+    g_hash_table_new_full(g_str_hash,
+                          g_str_equal,
+                          g_free,
+                          (GDestroyNotify)render_cache_entry_free);
+  self->render_inflight =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->render_blocked =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->render_cancellable = g_cancellable_new();
+
+  gtk_window_set_default_size(GTK_WINDOW(self), 960, 700);
+  gtk_window_set_title(GTK_WINDOW(self), "losles");
+
+  GtkWidget *header = gtk_header_bar_new();
+  gtk_window_set_titlebar(GTK_WINDOW(self), header);
+
+  GtkWidget *open_button =
+    icon_button("document-open-symbolic", "Open image (Ctrl+O)");
+  gtk_header_bar_pack_start(GTK_HEADER_BAR(header), open_button);
+  g_signal_connect_swapped(open_button,
+                           "clicked",
+                           G_CALLBACK(open_dialog),
+                           self);
+
+  self->previous_button =
+    GTK_BUTTON(icon_button("go-previous-symbolic", "Previous image (Left)"));
+  self->next_button =
+    GTK_BUTTON(icon_button("go-next-symbolic", "Next image (Right)"));
+  gtk_header_bar_pack_start(GTK_HEADER_BAR(header),
+                            GTK_WIDGET(self->previous_button));
+  gtk_header_bar_pack_start(GTK_HEADER_BAR(header),
+                            GTK_WIDGET(self->next_button));
+  g_signal_connect_swapped(self->previous_button,
+                           "clicked",
+                           G_CALLBACK(previous_image),
+                           self);
+  g_signal_connect_swapped(self->next_button,
+                           "clicked",
+                           G_CALLBACK(next_image),
+                           self);
+
+  self->rotate_left_button =
+    GTK_BUTTON(icon_button("object-rotate-left-symbolic",
+                           "Lossless rotate left"));
+  self->rotate_right_button =
+    GTK_BUTTON(icon_button("object-rotate-right-symbolic",
+                           "Lossless rotate right"));
+  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+                          GTK_WIDGET(self->rotate_right_button));
+  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+                          GTK_WIDGET(self->rotate_left_button));
+  g_signal_connect(self->rotate_left_button,
+                   "clicked",
+                   G_CALLBACK(rotate_clicked),
+                   self);
+  g_signal_connect(self->rotate_right_button,
+                   "clicked",
+                   G_CALLBACK(rotate_clicked),
+                   self);
+
+  self->crop_button =
+    GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
+  gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
+                           "edit-cut-symbolic");
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->crop_button),
+                              "Lossless JPEG crop");
+  gtk_widget_add_css_class(GTK_WIDGET(self->crop_button), "flat");
+  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+                          GTK_WIDGET(self->crop_button));
+  g_signal_connect(self->crop_button,
+                   "toggled",
+                   G_CALLBACK(crop_toggled),
+                   self);
+
+  self->apply_crop_button =
+    GTK_BUTTON(gtk_button_new_with_label("Crop"));
+  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+                          GTK_WIDGET(self->apply_crop_button));
+  g_signal_connect(self->apply_crop_button,
+                   "clicked",
+                   G_CALLBACK(apply_crop_clicked),
+                   self);
+
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+  gtk_window_set_child(GTK_WINDOW(self), box);
+  GtkWidget *overlay = gtk_overlay_new();
+  gtk_widget_set_hexpand(overlay, TRUE);
+  gtk_widget_set_vexpand(overlay, TRUE);
+  gtk_box_append(GTK_BOX(box), overlay);
+
+  self->picture = GTK_PICTURE(gtk_picture_new());
+  gtk_picture_set_content_fit(self->picture, GTK_CONTENT_FIT_CONTAIN);
+  gtk_picture_set_can_shrink(self->picture, TRUE);
+  gtk_widget_set_hexpand(GTK_WIDGET(self->picture), TRUE);
+  gtk_widget_set_vexpand(GTK_WIDGET(self->picture), TRUE);
+  gtk_overlay_set_child(GTK_OVERLAY(overlay), GTK_WIDGET(self->picture));
+
+  self->crop_area = GTK_DRAWING_AREA(gtk_drawing_area_new());
+  gtk_widget_set_hexpand(GTK_WIDGET(self->crop_area), TRUE);
+  gtk_widget_set_vexpand(GTK_WIDGET(self->crop_area), TRUE);
+  gtk_drawing_area_set_draw_func(self->crop_area,
+                                 (GtkDrawingAreaDrawFunc)crop_draw,
+                                 self,
+                                 NULL);
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay),
+                          GTK_WIDGET(self->crop_area));
+  GtkGesture *drag = gtk_gesture_drag_new();
+  gtk_widget_add_controller(GTK_WIDGET(self->crop_area),
+                            GTK_EVENT_CONTROLLER(drag));
+  g_signal_connect(drag,
+                   "drag-begin",
+                   G_CALLBACK(crop_drag_begin),
+                   self);
+  g_signal_connect(drag,
+                   "drag-update",
+                   G_CALLBACK(crop_drag_update),
+                   self);
+
+  self->spinner = GTK_SPINNER(gtk_spinner_new());
+  gtk_widget_set_halign(GTK_WIDGET(self->spinner), GTK_ALIGN_CENTER);
+  gtk_widget_set_valign(GTK_WIDGET(self->spinner), GTK_ALIGN_CENTER);
+  gtk_widget_set_can_target(GTK_WIDGET(self->spinner), FALSE);
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay),
+                          GTK_WIDGET(self->spinner));
+
+  self->status = GTK_LABEL(gtk_label_new(
+    "Open a JPEG or PNG image"));
+  gtk_label_set_ellipsize(self->status, PANGO_ELLIPSIZE_MIDDLE);
+  gtk_label_set_xalign(self->status, 0);
+  gtk_widget_set_margin_start(GTK_WIDGET(self->status), 10);
+  gtk_widget_set_margin_end(GTK_WIDGET(self->status), 10);
+  gtk_widget_set_margin_top(GTK_WIDGET(self->status), 5);
+  gtk_widget_set_margin_bottom(GTK_WIDGET(self->status), 5);
+  gtk_box_append(GTK_BOX(box), GTK_WIDGET(self->status));
+
+  gtk_widget_set_visible(GTK_WIDGET(self->crop_area), FALSE);
+  gtk_widget_set_visible(GTK_WIDGET(self->apply_crop_button), FALSE);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+
+  static const GActionEntry actions[] = {
+    {.name = "open", .activate = action_open},
+    {.name = "previous", .activate = action_previous},
+    {.name = "next", .activate = action_next},
+  };
+  g_action_map_add_action_entries(G_ACTION_MAP(self),
+                                  actions,
+                                  G_N_ELEMENTS(actions),
+                                  self);
+
+  g_signal_connect(self,
+                   "map",
+                   G_CALLBACK(window_mapped),
+                   self);
+  g_signal_connect(self->color_manager,
+                   "target-changed",
+                   G_CALLBACK(color_target_changed),
+                   self);
+  update_controls(self);
+}
+
+LoslesWindow *
+losles_window_new(GtkApplication *application)
+{
+  return g_object_new(LOSLES_TYPE_WINDOW,
+                      "application",
+                      application,
+                      NULL);
+}
+
+void
+losles_window_open_file(LoslesWindow *self, GFile *file)
+{
+  g_return_if_fail(LOSLES_IS_WINDOW(self));
+  g_return_if_fail(G_IS_FILE(file));
+
+  self->generation++;
+  if (self->load_cancellable)
+    g_cancellable_cancel(self->load_cancellable);
+  g_clear_object(&self->load_cancellable);
+  self->load_cancellable = g_cancellable_new();
+  g_hash_table_remove_all(self->inflight);
+  g_hash_table_remove_all(self->failed);
+  g_hash_table_remove_all(self->cache);
+  self->cache_size = 0;
+  invalidate_render_cache(self);
+
+  g_clear_pointer(&self->files, g_ptr_array_unref);
+  self->files =
+    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  g_ptr_array_add(self->files, g_object_ref(file));
+  self->current_index = 0;
+  show_index(self, 0);
+  scan_directory(self, file);
+  gtk_window_present(GTK_WINDOW(self));
+}

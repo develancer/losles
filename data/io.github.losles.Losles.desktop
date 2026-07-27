@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Losles
+Comment=Color-managed lossless photo viewer
+Exec=losles %f
+Icon=image-x-generic
+Terminal=false
+Type=Application
+Categories=Graphics;Viewer;Photography;
+MimeType=image/jpeg;image/png;
+StartupNotify=true
