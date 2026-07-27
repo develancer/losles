@@ -5,6 +5,7 @@
 #include <jpeglib.h>
 #include <setjmp.h>
 #include <string.h>
+#include <turbojpeg.h>
 #include <unistd.h>
 
 #include "losles-jpeg-metadata.h"
@@ -286,28 +287,191 @@ jpeg_adjust_crop(LoslesFormat *format,
   return adjusted->width > 0 && adjusted->height > 0;
 }
 
-static gboolean
-run_jpegtran(LoslesImage *image,
-             GFile *destination,
-             const gchar *operation,
-             const gchar *argument,
-             gboolean reset_orientation,
-             GCancellable *cancellable,
-             GError **error)
+static gchar *
+create_temporary_file(const gchar *directory,
+                      const gchar *name_template,
+                      GError **error)
 {
-  g_autofree gchar *jpegtran = g_find_program_in_path("jpegtran");
-  if (!jpegtran) {
-    g_set_error_literal(
-      error,
-      G_IO_ERROR,
-      G_IO_ERROR_NOT_FOUND,
-      "jpegtran is required. Install the Ubuntu package "
-      "“libjpeg-turbo-progs”.");
+  gchar *path = g_build_filename(directory, name_template, NULL);
+  const gint fd = g_mkstemp(path);
+  if (fd < 0) {
+    g_set_error(error,
+                G_IO_ERROR,
+                g_io_error_from_errno(errno),
+                "Could not create a temporary file: %s",
+                g_strerror(errno));
+    g_free(path);
+    return NULL;
+  }
+  close(fd);
+  return path;
+}
+
+static void
+remove_temporary_file(const gchar *path)
+{
+  if (path && g_unlink(path) != 0 && errno != ENOENT)
+    g_warning("Could not remove temporary file %s: %s",
+              path,
+              g_strerror(errno));
+}
+
+static gchar *
+create_source_backup(const gchar *source_path,
+                     const gchar *directory,
+                     GCancellable *cancellable,
+                     GError **error)
+{
+  g_autofree gchar *backup_path =
+    create_temporary_file(directory, ".losles-backup-XXXXXX", error);
+  if (!backup_path)
+    return NULL;
+
+  if (g_unlink(backup_path) != 0) {
+    g_set_error(error,
+                G_IO_ERROR,
+                g_io_error_from_errno(errno),
+                "Could not prepare the crop safety backup: %s",
+                g_strerror(errno));
+    return NULL;
+  }
+
+  /*
+   * A hard link is fast and retains the exact original inode while GIO moves
+   * the source directory entry to Trash. Fall back to a metadata-preserving
+   * copy for filesystems that do not support hard links.
+   */
+  if (link(source_path, backup_path) == 0)
+    return g_steal_pointer(&backup_path);
+
+  g_debug("Could not hard-link the crop backup: %s; copying instead",
+          g_strerror(errno));
+  g_autoptr(GFile) source = g_file_new_for_path(source_path);
+  g_autoptr(GFile) backup = g_file_new_for_path(backup_path);
+  if (!g_file_copy(source,
+                   backup,
+                   G_FILE_COPY_ALL_METADATA,
+                   cancellable,
+                   NULL,
+                   NULL,
+                   error)) {
+    remove_temporary_file(backup_path);
+    return NULL;
+  }
+
+  return g_steal_pointer(&backup_path);
+}
+
+static void
+copy_source_permissions(const gchar *source_path,
+                        const gchar *temporary_path)
+{
+  GStatBuf source_stat;
+  if (g_stat(source_path, &source_stat) == 0 &&
+      g_chmod(temporary_path, source_stat.st_mode & 07777) != 0) {
+    g_debug("Could not preserve JPEG permissions on %s: %s",
+            temporary_path,
+            g_strerror(errno));
+  }
+}
+
+static gboolean
+install_transformed_file(GFile *source,
+                         GFile *destination,
+                         const gchar *source_path,
+                         const gchar *temporary_path,
+                         gboolean trash_source,
+                         GCancellable *cancellable,
+                         GError **error)
+{
+  g_autoptr(GFile) temporary = g_file_new_for_path(temporary_path);
+  if (!trash_source) {
+    return g_file_move(temporary,
+                       destination,
+                       G_FILE_COPY_OVERWRITE,
+                       cancellable,
+                       NULL,
+                       NULL,
+                       error);
+  }
+
+  g_autofree gchar *source_directory = g_path_get_dirname(source_path);
+  g_autofree gchar *backup_path =
+    create_source_backup(source_path,
+                         source_directory,
+                         cancellable,
+                         error);
+  if (!backup_path)
+    return FALSE;
+
+  if (g_cancellable_set_error_if_cancelled(cancellable, error)) {
+    remove_temporary_file(backup_path);
     return FALSE;
   }
 
-  g_autofree gchar *source_path =
-    g_file_get_path(losles_image_get_file(image));
+  /*
+   * Do not allow cancellation to interrupt the commit phase. Once the
+   * original has entered Trash, either the transformed file or the safety
+   * backup must be installed at the original path.
+   */
+  if (!g_file_trash(source, cancellable, error)) {
+    remove_temporary_file(backup_path);
+    return FALSE;
+  }
+
+  g_autoptr(GError) install_error = NULL;
+  if (!g_file_move(temporary,
+                   source,
+                   G_FILE_COPY_NONE,
+                   NULL,
+                   NULL,
+                   NULL,
+                   &install_error)) {
+    g_autoptr(GFile) backup = g_file_new_for_path(backup_path);
+    g_autoptr(GError) restore_error = NULL;
+    if (g_file_move(backup,
+                    source,
+                    G_FILE_COPY_NONE,
+                    NULL,
+                    NULL,
+                    NULL,
+                    &restore_error)) {
+      g_set_error(error,
+                  G_IO_ERROR,
+                  G_IO_ERROR_FAILED,
+                  "Could not install the transformed image after moving the "
+                  "original to Trash: %s. The original was restored; another "
+                  "recoverable copy remains in Trash.",
+                  install_error->message);
+    } else {
+      g_set_error(error,
+                  G_IO_ERROR,
+                  G_IO_ERROR_FAILED,
+                  "Could not install the transformed image after moving the "
+                  "original to Trash: %s. Automatic restoration also failed: "
+                  "%s. The safety backup remains at %s.",
+                  install_error->message,
+                  restore_error->message,
+                  backup_path);
+    }
+    return FALSE;
+  }
+
+  remove_temporary_file(backup_path);
+  return TRUE;
+}
+
+static gboolean
+run_turbojpeg_transform(LoslesImage *image,
+                        GFile *destination,
+                        gint operation,
+                        const LoslesCrop *crop,
+                        gboolean trash_source,
+                        GCancellable *cancellable,
+                        GError **error)
+{
+  GFile *source = losles_image_get_file(image);
+  g_autofree gchar *source_path = g_file_get_path(source);
   g_autofree gchar *destination_path = g_file_get_path(destination);
   if (!source_path || !destination_path) {
     g_set_error_literal(error,
@@ -317,84 +481,136 @@ run_jpegtran(LoslesImage *image,
     return FALSE;
   }
 
-  g_autofree gchar *destination_dir = g_path_get_dirname(destination_path);
-  g_autofree gchar *temporary_path =
-    g_build_filename(destination_dir, ".losles-XXXXXX", NULL);
-  const gint temporary_fd = g_mkstemp(temporary_path);
-  if (temporary_fd < 0) {
+  const gboolean in_place = g_file_equal(source, destination);
+  if (in_place) {
+    g_autoptr(GFileInfo) info =
+      g_file_query_info(source,
+                        G_FILE_ATTRIBUTE_STANDARD_TYPE ","
+                        G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK,
+                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                        cancellable,
+                        error);
+    if (!info)
+      return FALSE;
+    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR ||
+        g_file_info_get_is_symlink(info)) {
+      g_set_error_literal(error,
+                          G_IO_ERROR,
+                          G_IO_ERROR_NOT_SUPPORTED,
+                          "In-place editing requires a regular local file");
+      return FALSE;
+    }
+  }
+
+  gchar *source_data = NULL;
+  gsize source_size = 0;
+  if (!g_file_load_contents(source,
+                            cancellable,
+                            &source_data,
+                            &source_size,
+                            NULL,
+                            error))
+    return FALSE;
+  g_autofree gchar *source_bytes = source_data;
+  if (source_size > G_MAXULONG) {
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_NO_SPACE,
+                        "The JPEG file is too large for TurboJPEG");
+    return FALSE;
+  }
+
+  tjhandle transformer = tjInitTransform();
+  if (!transformer) {
     g_set_error(error,
                 G_IO_ERROR,
-                g_io_error_from_errno(errno),
-                "Could not create temporary output: %s",
-                g_strerror(errno));
-    return FALSE;
-  }
-  close(temporary_fd);
-
-  g_autoptr(GPtrArray) arguments = g_ptr_array_new();
-  g_ptr_array_add(arguments, jpegtran);
-  g_ptr_array_add(arguments, "-copy");
-  g_ptr_array_add(arguments, "all");
-  if (operation) {
-    g_ptr_array_add(arguments, "-perfect");
-    g_ptr_array_add(arguments, (gpointer)operation);
-    g_ptr_array_add(arguments, (gpointer)argument);
-  }
-  g_ptr_array_add(arguments, "-outfile");
-  g_ptr_array_add(arguments, temporary_path);
-  g_ptr_array_add(arguments, source_path);
-  g_ptr_array_add(arguments, NULL);
-
-  g_autoptr(GSubprocessLauncher) launcher =
-    g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDERR_PIPE);
-  g_autoptr(GSubprocess) process =
-    g_subprocess_launcher_spawnv(
-      launcher,
-      (const gchar *const *)arguments->pdata,
-      error);
-  if (!process) {
-    g_unlink(temporary_path);
+                G_IO_ERROR_FAILED,
+                "Could not initialize TurboJPEG: %s",
+                tjGetErrorStr2(NULL));
     return FALSE;
   }
 
-  g_autofree gchar *stderr_text = NULL;
-  if (!g_subprocess_communicate_utf8(process,
-                                     NULL,
-                                     cancellable,
-                                     NULL,
-                                     &stderr_text,
-                                     error) ||
-      !g_subprocess_get_successful(process)) {
-    if (error && !*error) {
-      g_set_error(error,
-                  G_IO_ERROR,
-                  G_IO_ERROR_FAILED,
-                  "jpegtran could not perform a perfect lossless transform: %s",
-                  stderr_text && *stderr_text ? stderr_text : "unknown error");
-    }
-    g_unlink(temporary_path);
+  tjtransform transform = {0};
+  transform.op = operation;
+  transform.options = TJXOPT_PERFECT;
+  if (crop) {
+    transform.options |= TJXOPT_CROP;
+    transform.r.x = crop->x;
+    transform.r.y = crop->y;
+    transform.r.w = crop->width;
+    transform.r.h = crop->height;
+  }
+
+  unsigned char *output = NULL;
+  unsigned long output_size = 0;
+  const gint transform_result =
+    tjTransform(transformer,
+                (const unsigned char *)source_bytes,
+                (unsigned long)source_size,
+                1,
+                &output,
+                &output_size,
+                &transform,
+                TJFLAG_STOPONWARNING);
+  if (transform_result != 0) {
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_FAILED,
+                "TurboJPEG could not perform a perfect lossless transform: %s",
+                tjGetErrorStr2(transformer));
+    tjDestroy(transformer);
+    tjFree(output);
+    return FALSE;
+  }
+  tjDestroy(transformer);
+
+  if (output_size > G_MAXSSIZE) {
+    tjFree(output);
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_NO_SPACE,
+                        "The transformed JPEG is too large to save");
+    return FALSE;
+  }
+  if (g_cancellable_set_error_if_cancelled(cancellable, error)) {
+    tjFree(output);
     return FALSE;
   }
 
-  if (reset_orientation &&
-      !losles_jpeg_metadata_set_orientation_in_file(temporary_path, 1, error)) {
-    g_unlink(temporary_path);
+  g_autofree gchar *destination_directory =
+    g_path_get_dirname(destination_path);
+  g_autofree gchar *temporary_path =
+    create_temporary_file(destination_directory,
+                          ".losles-output-XXXXXX",
+                          error);
+  if (!temporary_path) {
+    tjFree(output);
     return FALSE;
   }
 
-  g_autoptr(GFile) temporary = g_file_new_for_path(temporary_path);
-  if (!g_file_move(temporary,
-                   destination,
-                   G_FILE_COPY_OVERWRITE,
-                   cancellable,
-                   NULL,
-                   NULL,
-                   error)) {
-    g_unlink(temporary_path);
+  const gboolean wrote_output =
+    g_file_set_contents(temporary_path,
+                        (const gchar *)output,
+                        (gssize)output_size,
+                        error);
+  tjFree(output);
+  if (!wrote_output) {
+    remove_temporary_file(temporary_path);
     return FALSE;
   }
+  copy_source_permissions(source_path, temporary_path);
 
-  return TRUE;
+  const gboolean installed =
+    install_transformed_file(source,
+                             destination,
+                             source_path,
+                             temporary_path,
+                             trash_source,
+                             cancellable,
+                             error);
+  if (!installed)
+    remove_temporary_file(temporary_path);
+  return installed;
 }
 
 static gboolean
@@ -407,19 +623,11 @@ jpeg_rotate_lossless(LoslesFormat *format,
 {
   (void)format;
   const guint orientation = losles_image_get_orientation(image);
-  gint current_degrees;
   switch (orientation) {
   case 1:
-    current_degrees = 0;
-    break;
   case 3:
-    current_degrees = 180;
-    break;
   case 6:
-    current_degrees = 90;
-    break;
   case 8:
-    current_degrees = 270;
     break;
   default:
     g_set_error_literal(
@@ -431,26 +639,17 @@ jpeg_rotate_lossless(LoslesFormat *format,
     return FALSE;
   }
 
-  const gint delta = rotation == LOSLES_ROTATE_RIGHT ? 90 : -90;
-  const gint result_degrees = (current_degrees + delta + 360) % 360;
-  if (result_degrees == 0) {
-    return run_jpegtran(image,
-                        destination,
-                        NULL,
-                        NULL,
-                        TRUE,
-                        cancellable,
-                        error);
-  }
+  const gint operation =
+    rotation == LOSLES_ROTATE_RIGHT ? TJXOP_ROT90 : TJXOP_ROT270;
 
-  g_autofree gchar *degrees = g_strdup_printf("%d", result_degrees);
-  return run_jpegtran(image,
-                      destination,
-                      "-rotate",
-                      degrees,
-                      TRUE,
-                      cancellable,
-                      error);
+  return run_turbojpeg_transform(
+    image,
+    destination,
+    operation,
+    NULL,
+    FALSE,
+    cancellable,
+    error);
 }
 
 static gboolean
@@ -465,19 +664,14 @@ jpeg_crop_lossless(LoslesFormat *format,
   if (!jpeg_adjust_crop(format, image, crop, &adjusted, error))
     return FALSE;
 
-  g_autofree gchar *geometry =
-    g_strdup_printf("%ux%u+%u+%u",
-                    adjusted.width,
-                    adjusted.height,
-                    adjusted.x,
-                    adjusted.y);
-  return run_jpegtran(image,
-                      destination,
-                      "-crop",
-                      geometry,
-                      FALSE,
-                      cancellable,
-                      error);
+  return run_turbojpeg_transform(image,
+                                 destination,
+                                 TJXOP_NONE,
+                                 &adjusted,
+                                 g_file_equal(losles_image_get_file(image),
+                                              destination),
+                                 cancellable,
+                                 error);
 }
 
 static void

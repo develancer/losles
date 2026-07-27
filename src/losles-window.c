@@ -6,13 +6,14 @@
 #include "losles-image.h"
 #include "losles-rendered-image.h"
 
-#include <string.h>
-
 #define SOURCE_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
 #define RENDER_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
 #define PRELOAD_DISTANCE 2
 #define MAX_CONCURRENT_DECODES 2
 #define MAX_CONCURRENT_RENDERS 2
+#define CROP_HANDLE_SIZE 10.0
+#define CROP_HIT_TOLERANCE 8.0
+#define CROP_MIN_SIZE 2.0
 
 typedef struct {
   LoslesFormatRegistry *registry;
@@ -46,6 +47,30 @@ typedef enum {
   EDIT_CROP,
 } EditKind;
 
+typedef enum {
+  CROP_DRAG_NONE,
+  CROP_DRAG_NEW,
+  CROP_DRAG_MOVE,
+  CROP_DRAG_LEFT,
+  CROP_DRAG_RIGHT,
+  CROP_DRAG_TOP,
+  CROP_DRAG_BOTTOM,
+  CROP_DRAG_TOP_LEFT,
+  CROP_DRAG_TOP_RIGHT,
+  CROP_DRAG_BOTTOM_LEFT,
+  CROP_DRAG_BOTTOM_RIGHT,
+} CropDragMode;
+
+typedef struct {
+  gdouble image_width;
+  gdouble image_height;
+  gdouble scale;
+  gdouble left;
+  gdouble top;
+  gdouble shown_width;
+  gdouble shown_height;
+} CropGeometry;
+
 typedef struct {
   LoslesImage *image;
   GFile *destination;
@@ -54,27 +79,23 @@ typedef struct {
   LoslesCrop crop;
 } EditJob;
 
-typedef struct {
-  LoslesWindow *window;
-  EditKind kind;
-  LoslesRotation rotation;
-  LoslesCrop crop;
-} SaveRequest;
-
 struct _LoslesWindow {
   GtkApplicationWindow parent_instance;
 
   LoslesFormatRegistry *registry;
   LoslesColorManager *color_manager;
 
+  GtkHeaderBar *header_bar;
   GtkPicture *picture;
   GtkDrawingArea *crop_area;
   GtkSpinner *spinner;
   GtkLabel *status;
+  GtkButton *open_button;
   GtkButton *previous_button;
   GtkButton *next_button;
   GtkButton *rotate_left_button;
   GtkButton *rotate_right_button;
+  GtkToggleButton *info_button;
   GtkToggleButton *crop_button;
   GtkButton *apply_crop_button;
 
@@ -98,9 +119,11 @@ struct _LoslesWindow {
   GCancellable *render_cancellable;
 
   gboolean monitor_signals_connected;
-  gboolean crop_drag_started_inside;
-  gdouble crop_drag_x;
-  gdouble crop_drag_y;
+  gboolean edit_in_progress;
+  CropDragMode crop_drag_mode;
+  gdouble crop_drag_origin_x;
+  gdouble crop_drag_origin_y;
+  LoslesCrop crop_drag_initial;
   LoslesCrop crop;
   gboolean crop_valid;
 };
@@ -158,13 +181,6 @@ edit_job_free(EditJob *job)
   g_clear_object(&job->image);
   g_clear_object(&job->destination);
   g_free(job);
-}
-
-static void
-save_request_free(SaveRequest *request)
-{
-  g_clear_object(&request->window);
-  g_free(request);
 }
 
 static GFile *
@@ -889,15 +905,45 @@ show_index(LoslesWindow *self, guint index)
 static void
 previous_image(LoslesWindow *self)
 {
-  if (self->current_index > 0)
+  if (!self->edit_in_progress && self->current_index > 0)
     show_index(self, self->current_index - 1);
 }
 
 static void
 next_image(LoslesWindow *self)
 {
-  if (self->files && self->current_index + 1 < self->files->len)
+  if (!self->edit_in_progress &&
+      self->files &&
+      self->current_index + 1 < self->files->len)
     show_index(self, self->current_index + 1);
+}
+
+static gboolean
+crop_geometry(LoslesWindow *self,
+              gdouble area_width,
+              gdouble area_height,
+              CropGeometry *geometry)
+{
+  if (!self->current_image)
+    return FALSE;
+
+  const gdouble image_width =
+    losles_image_get_display_width(self->current_image);
+  const gdouble image_height =
+    losles_image_get_display_height(self->current_image);
+  if (area_width <= 0 || area_height <= 0 ||
+      image_width <= 0 || image_height <= 0)
+    return FALSE;
+
+  geometry->image_width = image_width;
+  geometry->image_height = image_height;
+  geometry->scale =
+    MIN(area_width / image_width, area_height / image_height);
+  geometry->shown_width = image_width * geometry->scale;
+  geometry->shown_height = image_height * geometry->scale;
+  geometry->left = (area_width - geometry->shown_width) / 2.0;
+  geometry->top = (area_height - geometry->shown_height) / 2.0;
+  return TRUE;
 }
 
 static gboolean
@@ -907,35 +953,235 @@ widget_to_image(LoslesWindow *self,
                 gdouble *image_x,
                 gdouble *image_y)
 {
-  if (!self->current_image)
+  CropGeometry geometry = {0};
+  if (!crop_geometry(self,
+                     gtk_widget_get_width(GTK_WIDGET(self->crop_area)),
+                     gtk_widget_get_height(GTK_WIDGET(self->crop_area)),
+                     &geometry))
     return FALSE;
 
-  const gdouble area_width = gtk_widget_get_width(GTK_WIDGET(self->crop_area));
-  const gdouble area_height =
-    gtk_widget_get_height(GTK_WIDGET(self->crop_area));
+  const gboolean inside =
+    widget_x >= geometry.left && widget_y >= geometry.top &&
+    widget_x <= geometry.left + geometry.shown_width &&
+    widget_y <= geometry.top + geometry.shown_height;
+  *image_x =
+    CLAMP((widget_x - geometry.left) / geometry.scale,
+          0,
+          geometry.image_width);
+  *image_y =
+    CLAMP((widget_y - geometry.top) / geometry.scale,
+          0,
+          geometry.image_height);
+  return inside;
+}
+
+static CropDragMode
+crop_hit_test(LoslesWindow *self, gdouble widget_x, gdouble widget_y)
+{
+  CropGeometry geometry = {0};
+  if (!crop_geometry(self,
+                     gtk_widget_get_width(GTK_WIDGET(self->crop_area)),
+                     gtk_widget_get_height(GTK_WIDGET(self->crop_area)),
+                     &geometry))
+    return CROP_DRAG_NONE;
+
+  const gboolean inside_image =
+    widget_x >= geometry.left && widget_y >= geometry.top &&
+    widget_x <= geometry.left + geometry.shown_width &&
+    widget_y <= geometry.top + geometry.shown_height;
+  if (!self->crop_valid)
+    return inside_image ? CROP_DRAG_NEW : CROP_DRAG_NONE;
+
+  const gdouble left =
+    geometry.left + self->crop.x * geometry.scale;
+  const gdouble top =
+    geometry.top + self->crop.y * geometry.scale;
+  const gdouble right =
+    left + self->crop.width * geometry.scale;
+  const gdouble bottom =
+    top + self->crop.height * geometry.scale;
+  const gboolean near_left =
+    ABS(widget_x - left) <= CROP_HIT_TOLERANCE;
+  const gboolean near_right =
+    ABS(widget_x - right) <= CROP_HIT_TOLERANCE;
+  const gboolean near_top =
+    ABS(widget_y - top) <= CROP_HIT_TOLERANCE;
+  const gboolean near_bottom =
+    ABS(widget_y - bottom) <= CROP_HIT_TOLERANCE;
+  const gboolean within_x =
+    widget_x >= left - CROP_HIT_TOLERANCE &&
+    widget_x <= right + CROP_HIT_TOLERANCE;
+  const gboolean within_y =
+    widget_y >= top - CROP_HIT_TOLERANCE &&
+    widget_y <= bottom + CROP_HIT_TOLERANCE;
+
+  if (near_left && near_top)
+    return CROP_DRAG_TOP_LEFT;
+  if (near_right && near_top)
+    return CROP_DRAG_TOP_RIGHT;
+  if (near_left && near_bottom)
+    return CROP_DRAG_BOTTOM_LEFT;
+  if (near_right && near_bottom)
+    return CROP_DRAG_BOTTOM_RIGHT;
+  if (near_left && within_y)
+    return CROP_DRAG_LEFT;
+  if (near_right && within_y)
+    return CROP_DRAG_RIGHT;
+  if (near_top && within_x)
+    return CROP_DRAG_TOP;
+  if (near_bottom && within_x)
+    return CROP_DRAG_BOTTOM;
+  if (widget_x >= left && widget_x <= right &&
+      widget_y >= top && widget_y <= bottom)
+    return CROP_DRAG_MOVE;
+  return inside_image ? CROP_DRAG_NEW : CROP_DRAG_NONE;
+}
+
+static const gchar *
+crop_cursor_name(CropDragMode mode)
+{
+  switch (mode) {
+  case CROP_DRAG_MOVE:
+    return "move";
+  case CROP_DRAG_LEFT:
+  case CROP_DRAG_RIGHT:
+    return "ew-resize";
+  case CROP_DRAG_TOP:
+  case CROP_DRAG_BOTTOM:
+    return "ns-resize";
+  case CROP_DRAG_TOP_LEFT:
+  case CROP_DRAG_BOTTOM_RIGHT:
+    return "nwse-resize";
+  case CROP_DRAG_TOP_RIGHT:
+  case CROP_DRAG_BOTTOM_LEFT:
+    return "nesw-resize";
+  case CROP_DRAG_NEW:
+    return "crosshair";
+  case CROP_DRAG_NONE:
+  default:
+    return NULL;
+  }
+}
+
+static void
+set_crop_cursor(LoslesWindow *self, CropDragMode mode)
+{
+  gtk_widget_set_cursor_from_name(GTK_WIDGET(self->crop_area),
+                                  crop_cursor_name(mode));
+}
+
+static void
+crop_set_bounds(LoslesWindow *self,
+                gdouble left,
+                gdouble top,
+                gdouble right,
+                gdouble bottom)
+{
+  if (!self->current_image)
+    return;
+
+  const guint image_width =
+    losles_image_get_display_width(self->current_image);
+  const guint image_height =
+    losles_image_get_display_height(self->current_image);
+  const guint integer_left =
+    (guint)(CLAMP(left, 0, image_width) + 0.5);
+  const guint integer_top =
+    (guint)(CLAMP(top, 0, image_height) + 0.5);
+  const guint integer_right =
+    (guint)(CLAMP(right, 0, image_width) + 0.5);
+  const guint integer_bottom =
+    (guint)(CLAMP(bottom, 0, image_height) + 0.5);
+
+  self->crop.x = MIN(integer_left, integer_right);
+  self->crop.y = MIN(integer_top, integer_bottom);
+  self->crop.width =
+    MAX(integer_left, integer_right) - self->crop.x;
+  self->crop.height =
+    MAX(integer_top, integer_bottom) - self->crop.y;
+  self->crop_valid =
+    self->crop.width >= CROP_MIN_SIZE &&
+    self->crop.height >= CROP_MIN_SIZE;
+  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button),
+                           self->crop_valid);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+}
+
+static void
+crop_update_from_pointer(LoslesWindow *self,
+                         gdouble image_x,
+                         gdouble image_y)
+{
+  if (!self->current_image || self->crop_drag_mode == CROP_DRAG_NONE)
+    return;
+
   const gdouble image_width =
     losles_image_get_display_width(self->current_image);
   const gdouble image_height =
     losles_image_get_display_height(self->current_image);
-  if (area_width <= 0 || area_height <= 0 ||
-      image_width <= 0 || image_height <= 0)
-    return FALSE;
+  gdouble left = self->crop_drag_initial.x;
+  gdouble top = self->crop_drag_initial.y;
+  gdouble right = left + self->crop_drag_initial.width;
+  gdouble bottom = top + self->crop_drag_initial.height;
 
-  const gdouble scale =
-    MIN(area_width / image_width, area_height / image_height);
-  const gdouble shown_width = image_width * scale;
-  const gdouble shown_height = image_height * scale;
-  const gdouble left = (area_width - shown_width) / 2.0;
-  const gdouble top = (area_height - shown_height) / 2.0;
-  const gboolean inside =
-    widget_x >= left && widget_y >= top &&
-    widget_x <= left + shown_width &&
-    widget_y <= top + shown_height;
-  *image_x =
-    CLAMP((widget_x - left) / scale, 0, image_width - 1);
-  *image_y =
-    CLAMP((widget_y - top) / scale, 0, image_height - 1);
-  return inside;
+  switch (self->crop_drag_mode) {
+  case CROP_DRAG_NEW:
+    left = MIN(self->crop_drag_origin_x, image_x);
+    top = MIN(self->crop_drag_origin_y, image_y);
+    right = MAX(self->crop_drag_origin_x, image_x);
+    bottom = MAX(self->crop_drag_origin_y, image_y);
+    break;
+  case CROP_DRAG_MOVE: {
+    const gdouble delta_x =
+      CLAMP(image_x - self->crop_drag_origin_x,
+            -left,
+            image_width - right);
+    const gdouble delta_y =
+      CLAMP(image_y - self->crop_drag_origin_y,
+            -top,
+            image_height - bottom);
+    left += delta_x;
+    right += delta_x;
+    top += delta_y;
+    bottom += delta_y;
+    break;
+  }
+  case CROP_DRAG_LEFT:
+  case CROP_DRAG_TOP_LEFT:
+  case CROP_DRAG_BOTTOM_LEFT:
+    left = CLAMP(image_x, 0, right - CROP_MIN_SIZE);
+    break;
+  case CROP_DRAG_RIGHT:
+  case CROP_DRAG_TOP_RIGHT:
+  case CROP_DRAG_BOTTOM_RIGHT:
+    right = CLAMP(image_x, left + CROP_MIN_SIZE, image_width);
+    break;
+  case CROP_DRAG_NONE:
+  case CROP_DRAG_TOP:
+  case CROP_DRAG_BOTTOM:
+    break;
+  }
+
+  switch (self->crop_drag_mode) {
+  case CROP_DRAG_TOP:
+  case CROP_DRAG_TOP_LEFT:
+  case CROP_DRAG_TOP_RIGHT:
+    top = CLAMP(image_y, 0, bottom - CROP_MIN_SIZE);
+    break;
+  case CROP_DRAG_BOTTOM:
+  case CROP_DRAG_BOTTOM_LEFT:
+  case CROP_DRAG_BOTTOM_RIGHT:
+    bottom = CLAMP(image_y, top + CROP_MIN_SIZE, image_height);
+    break;
+  case CROP_DRAG_NONE:
+  case CROP_DRAG_NEW:
+  case CROP_DRAG_MOVE:
+  case CROP_DRAG_LEFT:
+  case CROP_DRAG_RIGHT:
+    break;
+  }
+
+  crop_set_bounds(self, left, top, right, bottom);
 }
 
 static void
@@ -947,13 +1193,25 @@ crop_drag_begin(GtkGestureDrag *gesture,
   (void)gesture;
   gdouble image_x = 0;
   gdouble image_y = 0;
-  self->crop_drag_started_inside =
+  const gboolean inside_image =
     widget_to_image(self, start_x, start_y, &image_x, &image_y);
-  self->crop_drag_x = image_x;
-  self->crop_drag_y = image_y;
-  self->crop_valid = FALSE;
-  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button), FALSE);
-  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  const CropDragMode mode = crop_hit_test(self, start_x, start_y);
+  if (!inside_image && mode == CROP_DRAG_NONE) {
+    self->crop_drag_mode = CROP_DRAG_NONE;
+    return;
+  }
+
+  self->crop_drag_mode = mode;
+  self->crop_drag_origin_x = image_x;
+  self->crop_drag_origin_y = image_y;
+  self->crop_drag_initial = self->crop;
+  if (self->crop_drag_mode == CROP_DRAG_NEW) {
+    self->crop_drag_initial =
+      (LoslesCrop){.x = (guint)(image_x + 0.5),
+                   .y = (guint)(image_y + 0.5)};
+    crop_set_bounds(self, image_x, image_y, image_x, image_y);
+  }
+  set_crop_cursor(self, self->crop_drag_mode);
 }
 
 static void
@@ -962,7 +1220,7 @@ crop_drag_update(GtkGestureDrag *gesture,
                  gdouble offset_y,
                  LoslesWindow *self)
 {
-  if (!self->crop_drag_started_inside || !self->current_image)
+  if (self->crop_drag_mode == CROP_DRAG_NONE || !self->current_image)
     return;
 
   gdouble start_widget_x = 0;
@@ -977,19 +1235,53 @@ crop_drag_update(GtkGestureDrag *gesture,
                   start_widget_y + offset_y,
                   &image_x,
                   &image_y);
+  crop_update_from_pointer(self, image_x, image_y);
+}
 
-  const gdouble left = MIN(self->crop_drag_x, image_x);
-  const gdouble top = MIN(self->crop_drag_y, image_y);
-  const gdouble right = MAX(self->crop_drag_x, image_x);
-  const gdouble bottom = MAX(self->crop_drag_y, image_y);
-  self->crop.x = (guint)left;
-  self->crop.y = (guint)top;
-  self->crop.width = MAX(1, (guint)(right - left + 1));
-  self->crop.height = MAX(1, (guint)(bottom - top + 1));
-  self->crop_valid = self->crop.width > 1 && self->crop.height > 1;
-  gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button),
-                           self->crop_valid);
-  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+static void
+crop_drag_end(GtkGestureDrag *gesture,
+              gdouble offset_x,
+              gdouble offset_y,
+              LoslesWindow *self)
+{
+  gdouble start_widget_x = 0;
+  gdouble start_widget_y = 0;
+  gtk_gesture_drag_get_start_point(gesture,
+                                   &start_widget_x,
+                                   &start_widget_y);
+  gdouble image_x = 0;
+  gdouble image_y = 0;
+  widget_to_image(self,
+                  start_widget_x + offset_x,
+                  start_widget_y + offset_y,
+                  &image_x,
+                  &image_y);
+  crop_update_from_pointer(self, image_x, image_y);
+  self->crop_drag_mode = CROP_DRAG_NONE;
+  set_crop_cursor(self,
+                  crop_hit_test(self,
+                                start_widget_x + offset_x,
+                                start_widget_y + offset_y));
+}
+
+static void
+crop_motion(GtkEventControllerMotion *controller,
+            gdouble x,
+            gdouble y,
+            LoslesWindow *self)
+{
+  (void)controller;
+  if (self->crop_drag_mode == CROP_DRAG_NONE)
+    set_crop_cursor(self, crop_hit_test(self, x, y));
+}
+
+static void
+crop_pointer_left(GtkEventControllerMotion *controller,
+                  LoslesWindow *self)
+{
+  (void)controller;
+  if (self->crop_drag_mode == CROP_DRAG_NONE)
+    set_crop_cursor(self, CROP_DRAG_NONE);
 }
 
 static void
@@ -1003,22 +1295,22 @@ crop_draw(GtkDrawingArea *area,
   if (!self->crop_valid || !self->current_image)
     return;
 
-  const gdouble image_width =
-    losles_image_get_display_width(self->current_image);
-  const gdouble image_height =
-    losles_image_get_display_height(self->current_image);
-  const gdouble scale =
-    MIN(width / image_width, height / image_height);
-  const gdouble shown_width = image_width * scale;
-  const gdouble shown_height = image_height * scale;
-  const gdouble image_left = (width - shown_width) / 2.0;
-  const gdouble image_top = (height - shown_height) / 2.0;
-  const gdouble left = image_left + self->crop.x * scale;
-  const gdouble top = image_top + self->crop.y * scale;
-  const gdouble crop_width = self->crop.width * scale;
-  const gdouble crop_height = self->crop.height * scale;
+  CropGeometry geometry = {0};
+  if (!crop_geometry(self, width, height, &geometry))
+    return;
 
-  cairo_rectangle(cr, image_left, image_top, shown_width, shown_height);
+  const gdouble left =
+    geometry.left + self->crop.x * geometry.scale;
+  const gdouble top =
+    geometry.top + self->crop.y * geometry.scale;
+  const gdouble crop_width = self->crop.width * geometry.scale;
+  const gdouble crop_height = self->crop.height * geometry.scale;
+
+  cairo_rectangle(cr,
+                  geometry.left,
+                  geometry.top,
+                  geometry.shown_width,
+                  geometry.shown_height);
   cairo_rectangle(cr, left, top, crop_width, crop_height);
   cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
   cairo_set_source_rgba(cr, 0, 0, 0, 0.48);
@@ -1032,6 +1324,34 @@ crop_draw(GtkDrawingArea *area,
   cairo_set_source_rgba(cr, 1, 1, 1, 0.95);
   cairo_set_line_width(cr, 1);
   cairo_stroke(cr);
+
+  const gdouble handle_x[] = {
+    left,
+    left + crop_width / 2.0,
+    left + crop_width,
+  };
+  const gdouble handle_y[] = {
+    top,
+    top + crop_height / 2.0,
+    top + crop_height,
+  };
+  const gdouble handle_offset = CROP_HANDLE_SIZE / 2.0;
+  for (guint row = 0; row < G_N_ELEMENTS(handle_y); row++) {
+    for (guint column = 0; column < G_N_ELEMENTS(handle_x); column++) {
+      if (row == 1 && column == 1)
+        continue;
+      cairo_rectangle(cr,
+                      handle_x[column] - handle_offset,
+                      handle_y[row] - handle_offset,
+                      CROP_HANDLE_SIZE,
+                      CROP_HANDLE_SIZE);
+      cairo_set_source_rgb(cr, 0, 0, 0);
+      cairo_fill_preserve(cr);
+      cairo_set_source_rgb(cr, 1, 1, 1);
+      cairo_set_line_width(cr, 1);
+      cairo_stroke(cr);
+    }
+  }
 }
 
 static void
@@ -1078,6 +1398,8 @@ edit_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   g_autoptr(GFile) destination = g_object_ref(job->destination);
   g_autoptr(GError) error = NULL;
 
+  self->edit_in_progress = FALSE;
+  update_controls(self);
   gtk_spinner_stop(self->spinner);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
   if (!g_task_propagate_boolean(task, &error)) {
@@ -1095,6 +1417,9 @@ start_edit(LoslesWindow *self,
            LoslesRotation rotation,
            const LoslesCrop *crop)
 {
+  if (self->edit_in_progress || !self->current_image)
+    return;
+
   EditJob *job = g_new0(EditJob, 1);
   job->image = g_object_ref(self->current_image);
   job->destination = g_object_ref(destination);
@@ -1103,93 +1428,18 @@ start_edit(LoslesWindow *self,
   if (crop)
     job->crop = *crop;
 
+  self->edit_in_progress = TRUE;
+  update_controls(self);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
   gtk_spinner_start(self->spinner);
   set_status(self, kind == EDIT_ROTATE
-                     ? "Writing losslessly rotated JPEG…"
-                     : "Writing losslessly cropped JPEG…");
+                     ? "Rotating losslessly in place…"
+                     : "Cropping losslessly; moving the original to Trash…");
 
   GTask *task = g_task_new(self, NULL, edit_done, NULL);
   g_task_set_task_data(task, job, (GDestroyNotify)edit_job_free);
   g_task_run_in_thread(task, edit_worker);
   g_object_unref(task);
-}
-
-static void
-save_chosen(GObject *source_object,
-            GAsyncResult *result,
-            gpointer user_data)
-{
-  SaveRequest *request = user_data;
-  g_autoptr(GError) error = NULL;
-  g_autoptr(GFile) destination =
-    gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source_object),
-                                result,
-                                &error);
-  if (!destination) {
-    if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED))
-      show_error(request->window, "Could not choose a destination", error);
-    save_request_free(request);
-    return;
-  }
-
-  start_edit(request->window,
-             destination,
-             request->kind,
-             request->rotation,
-             request->kind == EDIT_CROP ? &request->crop : NULL);
-  save_request_free(request);
-}
-
-static gchar *
-suggested_filename(GFile *source, const gchar *suffix)
-{
-  g_autofree gchar *basename = g_file_get_basename(source);
-  const gchar *dot = basename ? strrchr(basename, '.') : NULL;
-  if (!dot || dot == basename)
-    return g_strdup_printf("%s-%s", basename ? basename : "image", suffix);
-  return g_strdup_printf("%.*s-%s%s",
-                         (gint)(dot - basename),
-                         basename,
-                         suffix,
-                         dot);
-}
-
-static void
-prompt_save(LoslesWindow *self,
-            EditKind kind,
-            LoslesRotation rotation,
-            const LoslesCrop *crop)
-{
-  if (!self->current_image)
-    return;
-
-  SaveRequest *request = g_new0(SaveRequest, 1);
-  request->window = g_object_ref(self);
-  request->kind = kind;
-  request->rotation = rotation;
-  if (crop)
-    request->crop = *crop;
-
-  GtkFileDialog *dialog = gtk_file_dialog_new();
-  gtk_file_dialog_set_title(dialog,
-                            kind == EDIT_ROTATE
-                              ? "Save Rotated Image"
-                              : "Save Cropped Image");
-  g_autofree gchar *name =
-    suggested_filename(losles_image_get_file(self->current_image),
-                       kind == EDIT_ROTATE ? "rotated" : "cropped");
-  gtk_file_dialog_set_initial_name(dialog, name);
-  g_autoptr(GFile) parent =
-    g_file_get_parent(losles_image_get_file(self->current_image));
-  if (parent)
-    gtk_file_dialog_set_initial_folder(dialog, parent);
-  gtk_file_dialog_save(dialog,
-                       GTK_WINDOW(self),
-                       NULL,
-                       save_chosen,
-                       request);
-  g_object_unref(dialog);
 }
 
 static void
@@ -1199,7 +1449,13 @@ rotate_clicked(GtkButton *button, LoslesWindow *self)
     button == self->rotate_left_button
       ? LOSLES_ROTATE_LEFT
       : LOSLES_ROTATE_RIGHT;
-  prompt_save(self, EDIT_ROTATE, direction, NULL);
+  if (!self->current_image || self->edit_in_progress)
+    return;
+  start_edit(self,
+             losles_image_get_file(self->current_image),
+             EDIT_ROTATE,
+             direction,
+             NULL);
 }
 
 static void
@@ -1208,8 +1464,10 @@ crop_toggled(GtkToggleButton *button, LoslesWindow *self)
   const gboolean active = gtk_toggle_button_get_active(button);
   gtk_widget_set_visible(GTK_WIDGET(self->crop_area), active);
   gtk_widget_set_visible(GTK_WIDGET(self->apply_crop_button), active);
+  self->crop_drag_mode = CROP_DRAG_NONE;
   self->crop_valid = FALSE;
   gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button), FALSE);
+  set_crop_cursor(self, active ? CROP_DRAG_NEW : CROP_DRAG_NONE);
   gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
 }
 
@@ -1217,7 +1475,9 @@ static void
 apply_crop_clicked(GtkButton *button, LoslesWindow *self)
 {
   (void)button;
-  if (!self->current_image || !self->crop_valid)
+  if (self->edit_in_progress ||
+      !self->current_image ||
+      !self->crop_valid)
     return;
 
   LoslesFormat *format =
@@ -1234,8 +1494,11 @@ apply_crop_clicked(GtkButton *button, LoslesWindow *self)
   }
   self->crop = adjusted;
   gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
-  set_status(self, "Selection aligned to JPEG lossless block boundaries");
-  prompt_save(self, EDIT_CROP, LOSLES_ROTATE_LEFT, &adjusted);
+  start_edit(self,
+             losles_image_get_file(self->current_image),
+             EDIT_CROP,
+             LOSLES_ROTATE_LEFT,
+             &adjusted);
 }
 
 static void
@@ -1260,6 +1523,9 @@ open_chosen(GObject *source_object,
 static void
 open_dialog(LoslesWindow *self)
 {
+  if (self->edit_in_progress)
+    return;
+
   GtkFileDialog *dialog = gtk_file_dialog_new();
   gtk_file_dialog_set_title(dialog, "Open Image");
   gtk_file_dialog_open(dialog,
@@ -1298,6 +1564,86 @@ action_next(GSimpleAction *action,
   (void)action;
   (void)parameter;
   next_image(LOSLES_WINDOW(user_data));
+}
+
+static void
+info_toggled(GtkToggleButton *button, LoslesWindow *self)
+{
+  gtk_widget_set_visible(GTK_WIDGET(self->status),
+                         gtk_toggle_button_get_active(button));
+}
+
+static void
+action_toggle_info(GSimpleAction *action,
+                   GVariant *parameter,
+                   gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  gtk_toggle_button_set_active(
+    self->info_button,
+    !gtk_toggle_button_get_active(self->info_button));
+}
+
+static void
+toggle_fullscreen(LoslesWindow *self)
+{
+  if (gtk_window_is_fullscreen(GTK_WINDOW(self)))
+    gtk_window_unfullscreen(GTK_WINDOW(self));
+  else
+    gtk_window_fullscreen(GTK_WINDOW(self));
+}
+
+static void
+action_toggle_fullscreen(GSimpleAction *action,
+                         GVariant *parameter,
+                         gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  toggle_fullscreen(LOSLES_WINDOW(user_data));
+}
+
+static void
+action_escape(GSimpleAction *action,
+              GVariant *parameter,
+              gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  if (gtk_toggle_button_get_active(self->crop_button))
+    gtk_toggle_button_set_active(self->crop_button, FALSE);
+  if (gtk_window_is_fullscreen(GTK_WINDOW(self)))
+    gtk_window_unfullscreen(GTK_WINDOW(self));
+}
+
+static void
+picture_pressed(GtkGestureClick *gesture,
+                gint n_press,
+                gdouble x,
+                gdouble y,
+                LoslesWindow *self)
+{
+  (void)x;
+  (void)y;
+  if (n_press != 2)
+    return;
+
+  gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  toggle_fullscreen(self);
+}
+
+static void
+fullscreen_changed(GObject *object,
+                   GParamSpec *parameter,
+                   LoslesWindow *self)
+{
+  (void)object;
+  (void)parameter;
+  gtk_widget_set_visible(GTK_WIDGET(self->header_bar),
+                         !gtk_window_is_fullscreen(GTK_WINDOW(self)));
 }
 
 static void
@@ -1345,7 +1691,8 @@ color_target_changed(LoslesColorManager *manager, LoslesWindow *self)
 static void
 update_controls(LoslesWindow *self)
 {
-  const gboolean has_image = self->current_image != NULL;
+  const gboolean idle = !self->edit_in_progress;
+  const gboolean has_image = self->current_image != NULL && idle;
   gboolean rotation = FALSE;
   gboolean crop = FALSE;
   if (has_image) {
@@ -1356,10 +1703,11 @@ update_controls(LoslesWindow *self)
            losles_image_get_orientation(self->current_image) == 1;
   }
 
+  gtk_widget_set_sensitive(GTK_WIDGET(self->open_button), idle);
   gtk_widget_set_sensitive(GTK_WIDGET(self->previous_button),
-                           self->files && self->current_index > 0);
+                           idle && self->files && self->current_index > 0);
   gtk_widget_set_sensitive(GTK_WIDGET(self->next_button),
-                           self->files &&
+                           idle && self->files &&
                              self->current_index + 1 < self->files->len);
   gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_left_button), rotation);
   gtk_widget_set_sensitive(GTK_WIDGET(self->rotate_right_button), rotation);
@@ -1440,14 +1788,37 @@ losles_window_init(LoslesWindow *self)
 
   gtk_window_set_default_size(GTK_WINDOW(self), 960, 700);
   gtk_window_set_title(GTK_WINDOW(self), "losles");
+  gtk_widget_add_css_class(GTK_WIDGET(self), "losles-window");
 
-  GtkWidget *header = gtk_header_bar_new();
-  gtk_window_set_titlebar(GTK_WINDOW(self), header);
+  GtkCssProvider *css_provider = gtk_css_provider_new();
+  gtk_css_provider_load_from_string(
+    css_provider,
+    "window.losles-window, .losles-canvas {"
+    "  background-color: #000000;"
+    "}"
+    "label.losles-information {"
+    "  color: #ffffff;"
+    "  background-color: #000000;"
+    "  padding: 4px 8px;"
+    "  border-radius: 0;"
+    "  box-shadow: none;"
+    "}");
+  gtk_style_context_add_provider_for_display(
+    gtk_widget_get_display(GTK_WIDGET(self)),
+    GTK_STYLE_PROVIDER(css_provider),
+    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+  g_object_unref(css_provider);
 
-  GtkWidget *open_button =
-    icon_button("document-open-symbolic", "Open image (Ctrl+O)");
-  gtk_header_bar_pack_start(GTK_HEADER_BAR(header), open_button);
-  g_signal_connect_swapped(open_button,
+  self->header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
+  gtk_window_set_titlebar(GTK_WINDOW(self),
+                          GTK_WIDGET(self->header_bar));
+
+  self->open_button =
+    GTK_BUTTON(icon_button("document-open-symbolic",
+                           "Open image (Ctrl+O)"));
+  gtk_header_bar_pack_start(self->header_bar,
+                            GTK_WIDGET(self->open_button));
+  g_signal_connect_swapped(self->open_button,
                            "clicked",
                            G_CALLBACK(open_dialog),
                            self);
@@ -1456,9 +1827,9 @@ losles_window_init(LoslesWindow *self)
     GTK_BUTTON(icon_button("go-previous-symbolic", "Previous image (Left)"));
   self->next_button =
     GTK_BUTTON(icon_button("go-next-symbolic", "Next image (Right)"));
-  gtk_header_bar_pack_start(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_start(self->header_bar,
                             GTK_WIDGET(self->previous_button));
-  gtk_header_bar_pack_start(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_start(self->header_bar,
                             GTK_WIDGET(self->next_button));
   g_signal_connect_swapped(self->previous_button,
                            "clicked",
@@ -1475,9 +1846,9 @@ losles_window_init(LoslesWindow *self)
   self->rotate_right_button =
     GTK_BUTTON(icon_button("object-rotate-right-symbolic",
                            "Lossless rotate right"));
-  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->rotate_right_button));
-  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->rotate_left_button));
   g_signal_connect(self->rotate_left_button,
                    "clicked",
@@ -1488,14 +1859,28 @@ losles_window_init(LoslesWindow *self)
                    G_CALLBACK(rotate_clicked),
                    self);
 
+  self->info_button =
+    GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
+  gtk_button_set_icon_name(GTK_BUTTON(self->info_button),
+                           "dialog-information-symbolic");
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->info_button),
+                              "Show image information (I)");
+  gtk_widget_add_css_class(GTK_WIDGET(self->info_button), "flat");
+  gtk_header_bar_pack_end(self->header_bar,
+                          GTK_WIDGET(self->info_button));
+  g_signal_connect(self->info_button,
+                   "toggled",
+                   G_CALLBACK(info_toggled),
+                   self);
+
   self->crop_button =
     GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
   gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
-                           "edit-cut-symbolic");
+                           "crop-symbolic");
   gtk_widget_set_tooltip_text(GTK_WIDGET(self->crop_button),
-                              "Lossless JPEG crop");
+                              "Lossless JPEG crop (original goes to Trash)");
   gtk_widget_add_css_class(GTK_WIDGET(self->crop_button), "flat");
-  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->crop_button));
   g_signal_connect(self->crop_button,
                    "toggled",
@@ -1504,19 +1889,18 @@ losles_window_init(LoslesWindow *self)
 
   self->apply_crop_button =
     GTK_BUTTON(gtk_button_new_with_label("Crop"));
-  gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+  gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->apply_crop_button));
   g_signal_connect(self->apply_crop_button,
                    "clicked",
                    G_CALLBACK(apply_crop_clicked),
                    self);
 
-  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  gtk_window_set_child(GTK_WINDOW(self), box);
   GtkWidget *overlay = gtk_overlay_new();
   gtk_widget_set_hexpand(overlay, TRUE);
   gtk_widget_set_vexpand(overlay, TRUE);
-  gtk_box_append(GTK_BOX(box), overlay);
+  gtk_widget_add_css_class(overlay, "losles-canvas");
+  gtk_window_set_child(GTK_WINDOW(self), overlay);
 
   self->picture = GTK_PICTURE(gtk_picture_new());
   gtk_picture_set_content_fit(self->picture, GTK_CONTENT_FIT_CONTAIN);
@@ -1524,6 +1908,15 @@ losles_window_init(LoslesWindow *self)
   gtk_widget_set_hexpand(GTK_WIDGET(self->picture), TRUE);
   gtk_widget_set_vexpand(GTK_WIDGET(self->picture), TRUE);
   gtk_overlay_set_child(GTK_OVERLAY(overlay), GTK_WIDGET(self->picture));
+
+  GtkGesture *click = gtk_gesture_click_new();
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click),
+                                GDK_BUTTON_PRIMARY);
+  gtk_widget_add_controller(overlay, GTK_EVENT_CONTROLLER(click));
+  g_signal_connect(click,
+                   "pressed",
+                   G_CALLBACK(picture_pressed),
+                   self);
 
   self->crop_area = GTK_DRAWING_AREA(gtk_drawing_area_new());
   gtk_widget_set_hexpand(GTK_WIDGET(self->crop_area), TRUE);
@@ -1545,6 +1938,20 @@ losles_window_init(LoslesWindow *self)
                    "drag-update",
                    G_CALLBACK(crop_drag_update),
                    self);
+  g_signal_connect(drag,
+                   "drag-end",
+                   G_CALLBACK(crop_drag_end),
+                   self);
+  GtkEventController *motion = gtk_event_controller_motion_new();
+  gtk_widget_add_controller(GTK_WIDGET(self->crop_area), motion);
+  g_signal_connect(motion,
+                   "motion",
+                   G_CALLBACK(crop_motion),
+                   self);
+  g_signal_connect(motion,
+                   "leave",
+                   G_CALLBACK(crop_pointer_left),
+                   self);
 
   self->spinner = GTK_SPINNER(gtk_spinner_new());
   gtk_widget_set_halign(GTK_WIDGET(self->spinner), GTK_ALIGN_CENTER);
@@ -1556,21 +1963,28 @@ losles_window_init(LoslesWindow *self)
   self->status = GTK_LABEL(gtk_label_new(
     "Open a JPEG or PNG image"));
   gtk_label_set_ellipsize(self->status, PANGO_ELLIPSIZE_MIDDLE);
+  gtk_label_set_max_width_chars(self->status, 80);
   gtk_label_set_xalign(self->status, 0);
-  gtk_widget_set_margin_start(GTK_WIDGET(self->status), 10);
-  gtk_widget_set_margin_end(GTK_WIDGET(self->status), 10);
-  gtk_widget_set_margin_top(GTK_WIDGET(self->status), 5);
-  gtk_widget_set_margin_bottom(GTK_WIDGET(self->status), 5);
-  gtk_box_append(GTK_BOX(box), GTK_WIDGET(self->status));
+  gtk_widget_set_halign(GTK_WIDGET(self->status), GTK_ALIGN_START);
+  gtk_widget_set_valign(GTK_WIDGET(self->status), GTK_ALIGN_END);
+  gtk_widget_set_can_target(GTK_WIDGET(self->status), FALSE);
+  gtk_widget_add_css_class(GTK_WIDGET(self->status),
+                           "losles-information");
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay),
+                          GTK_WIDGET(self->status));
 
   gtk_widget_set_visible(GTK_WIDGET(self->crop_area), FALSE);
   gtk_widget_set_visible(GTK_WIDGET(self->apply_crop_button), FALSE);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+  gtk_widget_set_visible(GTK_WIDGET(self->status), FALSE);
 
   static const GActionEntry actions[] = {
     {.name = "open", .activate = action_open},
     {.name = "previous", .activate = action_previous},
     {.name = "next", .activate = action_next},
+    {.name = "toggle-info", .activate = action_toggle_info},
+    {.name = "toggle-fullscreen", .activate = action_toggle_fullscreen},
+    {.name = "escape", .activate = action_escape},
   };
   g_action_map_add_action_entries(G_ACTION_MAP(self),
                                   actions,
@@ -1580,6 +1994,10 @@ losles_window_init(LoslesWindow *self)
   g_signal_connect(self,
                    "map",
                    G_CALLBACK(window_mapped),
+                   self);
+  g_signal_connect(self,
+                   "notify::fullscreened",
+                   G_CALLBACK(fullscreen_changed),
                    self);
   g_signal_connect(self->color_manager,
                    "target-changed",
@@ -1602,6 +2020,9 @@ losles_window_open_file(LoslesWindow *self, GFile *file)
 {
   g_return_if_fail(LOSLES_IS_WINDOW(self));
   g_return_if_fail(G_IS_FILE(file));
+
+  if (self->edit_in_progress)
+    return;
 
   self->generation++;
   if (self->load_cancellable)

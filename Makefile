@@ -24,7 +24,7 @@ applicationsdir ?= $(datadir)/applications
 metainfodir ?= $(datadir)/metainfo
 localedir ?= $(datadir)/locale
 
-PACKAGES := gtk4 lcms2 libjpeg libpng colord
+PACKAGES := gtk4 lcms2 libjpeg libturbojpeg libpng colord
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
 PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(PACKAGES) 2>/dev/null)
 

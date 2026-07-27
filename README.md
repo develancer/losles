@@ -20,8 +20,9 @@ libpng decode pixels, and colord supplies the selected monitor profile.
 - Wide-gamut RGB display profiles. Output values are encoded directly in the
   monitor profile's RGB space; the image is not collapsed to sRGB first.
 - Correct display of all eight EXIF orientation values.
-- Lossless JPEG rotation and MCU-aligned cropping via Ubuntu's `jpegtran`,
-  while copying ICC, EXIF, and other markers.
+- Lossless JPEG rotation and MCU-aligned cropping through libturbojpeg, while
+  preserving JPEG marker metadata including ICC, EXIF, XMP, IPTC, comments,
+  and unknown APP markers.
 - Fast previous/next navigation. Losles decodes and color-converts up to two
   images on either side in the background. Decoded sources and
   display-profile textures have separate 512 MiB cache limits, with at most
@@ -33,7 +34,7 @@ libpng decode pixels, and colord supplies the selected monitor profile.
 Images without an embedded profile are treated as sRGB. Grayscale PNG files
 without a profile use a D65 gamma-2.2 gray profile. If no selected monitor ICC
 profile can be found, losles uses an explicit sRGB display fallback and says
-so in the status bar.
+so in the information overlay.
 
 ## Ubuntu 24.04 build
 
@@ -43,7 +44,7 @@ All dependencies are in the standard Ubuntu repositories:
 sudo apt install \
   build-essential pkg-config \
   libgtk-4-dev liblcms2-dev libcolord-dev \
-  libjpeg-dev libpng-dev libjpeg-turbo-progs
+  libjpeg-dev libturbojpeg0-dev libpng-dev
 
 make
 make test
@@ -72,19 +73,52 @@ Run `make help` for the available targets and overrides.
 
 ## Lossless editing semantics
 
-Rotation and crop always use **Save As**; the source is never overwritten
-implicitly. JPEG transforms are performed on DCT coefficients by `jpegtran`,
-not by decoding and re-encoding pixels.
+Rotation and crop are applied in place as soon as their action button is
+clicked. Rotation first creates the transformed JPEG and then overwrites the
+source path; it does not create a backup in the system Trash.
+
+Crop first creates the transformed JPEG and a safety backup, then moves the
+exact original file into the system Trash and installs the cropped file at the
+original path. If the original cannot be moved to Trash, it is left unchanged
+and the crop fails.
+
+JPEG transforms operate on DCT coefficients through libturbojpeg, not by
+decoding and re-encoding pixels. JPEG marker metadata is copied without
+selectively rewriting or discarding fields. Rotation retains the original EXIF
+orientation tag and applies only the requested coefficient rotation, so a
+right rotation followed by a left rotation is byte-identical for the supported
+perfect-transform path.
 
 JPEG crop coordinates must start on an MCU boundary. Losles expands a drawn
-selection outward to the nearest legal boundaries and shows the adjusted
-rectangle before saving. A rotation is refused when a mathematically perfect
-transform is impossible; losles does not silently trim edge pixels.
+selection outward to the nearest legal boundaries before applying it. A
+transform is refused when a mathematically perfect result is impossible;
+losles does not silently trim edge pixels.
+
+Metadata fields whose meaning depends on image dimensions, such as an embedded
+thumbnail or EXIF pixel dimensions, are retained unchanged rather than
+discarded or regenerated. They can therefore describe the pre-edit image after
+a crop.
 
 PNG editing is intentionally disabled in this first version. Although PNG
 recompression is pixel-lossless, preserving 16-bit samples and all relevant
 ancillary metadata needs a dedicated writer. Calling an 8-bit export
 "lossless" would be misleading.
+
+## Interface
+
+Image and color-profile information is shown on an opaque black overlay
+anchored directly to the bottom-left corner of the picture, so it does not
+consume layout space. It is hidden by default and can be toggled with the
+information button or the `I` key. The image canvas is always pure black,
+independently of the desktop color scheme and in fullscreen.
+
+Double-click the picture or press `Alt+Enter` to enter or leave fullscreen.
+`Escape` leaves fullscreen and also cancels crop mode. The header bar is
+hidden while fullscreen is active.
+
+In crop mode, drag over the image to create a selection. Drag inside an
+existing selection to move it, or drag any of its four edges or eight visible
+edge/corner handles to resize it.
 
 ## Color-management model on Ubuntu 24.04
 
@@ -126,7 +160,7 @@ src/
     losles-png-format.c       PNG decode
 tests/
   test-jpeg-metadata.c
-  test-formats.c              ICC/render and jpegtran integration
+  test-formats.c              ICC/render, TurboJPEG, and Trash integration
 ```
 
 Current deliberate limits are RGB/grayscale JPEG and PNG viewing, JPEG-only

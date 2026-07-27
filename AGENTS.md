@@ -43,7 +43,13 @@ them:
   protocol or a newer GTK surface-color API.
 - An operation advertised as lossless must not decode and re-encode lossy
   image data. Never silently trim image edges to make a transform possible.
-- Editing uses Save As. Do not overwrite the source implicitly.
+- Rotation and crop are intentionally in place. Rotation prepares the
+  transformed file and directly overwrites the source without creating a
+  Trash backup. Crop prepares the transformed file, moves the exact original
+  into the system Trash, then installs the cropped file at its original path.
+- JPEG marker metadata must be retained. Do not discard EXIF, XMP, IPTC, ICC,
+  COM, or unrecognized APP markers. Do not normalize EXIF orientation when
+  coefficient rotation can retain it.
 - Image formats stay behind the `LoslesFormat` module interface so adding a
   decoder/editor does not require format-specific logic in the window or color
   manager.
@@ -59,7 +65,7 @@ them:
 - PNG ICC: `iCCP`.
 - Orientation: all eight JPEG EXIF orientation values are displayed.
 - Editing: coefficient-level JPEG rotation and MCU-aligned JPEG crop through
-  `jpegtran`.
+  libturbojpeg.
 - Display color: selected/default colord profile for the window's current
   monitor, with a built-in sRGB output fallback.
 - Navigation: the opened file plus supported regular files in its parent
@@ -81,11 +87,11 @@ Compile/link dependencies:
 - LittleCMS 2 (`lcms2 >= 2.14`);
 - colord (`colord >= 1.4.6`);
 - libjpeg, normally libjpeg-turbo on Ubuntu;
+- TurboJPEG, the public lossless-transform API from libjpeg-turbo;
 - libpng (`libpng >= 1.6`).
 
 Runtime integration:
 
-- `jpegtran` from `libjpeg-turbo-progs` is required only for editing;
 - a running colord service and a display device/profile association are needed
   for monitor-specific output; viewing still works with the built-in sRGB
   target when lookup fails;
@@ -97,7 +103,7 @@ Install the Ubuntu dependencies with:
 sudo apt install \
   build-essential pkg-config \
   libgtk-4-dev liblcms2-dev libcolord-dev \
-  libjpeg-dev libpng-dev libjpeg-turbo-progs
+  libjpeg-dev libturbojpeg0-dev libpng-dev
 ```
 
 Normal build, test, and run:
@@ -173,14 +179,14 @@ color manager logs connector names, lookup failures, and the selected profile.
 │       ├── losles-format-registry.[ch]
 │       │                         Module registration and format dispatch
 │       ├── losles-jpeg-format.[ch]
-│       │                         JPEG decoder, ICC extraction, jpegtran writer
+│       │                         JPEG decode, ICC, TurboJPEG, Trash transaction
 │       ├── losles-jpeg-metadata.[ch]
 │       │                         Minimal EXIF orientation reader/writer
 │       └── losles-png-format.[ch]
 │                                 PNG decoder and iCCP extraction
 └── tests/
     ├── test-jpeg-metadata.c     Endian/orientation parser tests
-    └── test-formats.c           Decode, ICC render, invalid data, jpegtran
+    └── test-formats.c           Decode, ICC, transform, Trash, invalid data
 ```
 
 The `io.github.losles.Losles` name is the current application ID and therefore
@@ -208,12 +214,12 @@ GFile
 The editing pipeline is:
 
 ```text
-LoslesImage + requested transform + Save As destination
-  -> format-specific lossless operation in a worker
-  -> jpegtran writes a temporary file in the destination directory
-  -> metadata orientation adjustment when required
-  -> GFile move with overwrite semantics
-  -> destination reopened and its directory rescanned
+LoslesImage + requested transform
+  -> format-specific TurboJPEG operation in a worker
+  -> transformed temporary file with JPEG marker metadata retained
+  -> rotation: overwrite original path, without a Trash entry
+  -> crop: safety backup, original to Trash, replacement at original path
+  -> result reopened and its directory rescanned
 ```
 
 `LoslesImage` stores decoded pixels in encoded-file orientation, the embedded
@@ -278,26 +284,46 @@ to the output device.
 - Fancy chroma upsampling is enabled.
 - MCU size is derived from sampling factors and retained for crop alignment.
 
-JPEG edits invoke the Ubuntu `jpegtran` executable with `-copy all` and
-`-perfect`. The output first goes to a `.losles-XXXXXX` temporary file in the
-destination directory. It replaces the chosen destination only after a
-successful operation.
+JPEG edits call TurboJPEG's public `tjTransform()` API in the worker thread.
+The transform uses `TJXOPT_PERFECT` and does not set `TJXOPT_COPYNONE`, so
+TurboJPEG copies extra markers including ICC and EXIF. Output first goes to a
+`.losles-output-XXXXXX` temporary file in the destination directory.
 
-Rotation combines the image's current non-mirrored EXIF orientation with the
-requested visual left/right rotation, materializes the result in coefficients,
-and resets an existing orientation tag to `1`. Orientations `2`, `4`, `5`, and
-`7` render correctly but rotation writing refuses them. `-perfect` means a
-rotation that would require trimming incomplete edge blocks fails.
+Rotation applies only the requested visual left/right coefficient rotation and
+retains the existing non-mirrored EXIF orientation tag. Rotations commute with
+orientations `1`, `3`, `6`, and `8`, so this produces the requested display
+rotation without rewriting metadata. Orientations `2`, `4`, `5`, and `7`
+render correctly but rotation writing refuses them. `TJXOPT_PERFECT` means a
+rotation that would require trimming incomplete edge blocks fails. A supported
+right rotation followed by a left rotation must reproduce the complete encoded
+file byte for byte; keep the regression test for this invariant.
+
+The UI passes the source itself as the destination for both editing actions.
+In-place editing requires a regular local file. Rotation completes the
+transform before touching the source, then installs it with overwrite
+semantics. Rotation intentionally creates no Trash entry or persistent backup;
+failure before replacement leaves the source unchanged.
+
+Crop additionally requires a functioning GIO Trash implementation. It creates
+a same-directory hard-link safety backup (falling back to a
+metadata-preserving copy), moves the exact original with `g_file_trash()`, and
+then moves the cropped file into the original path. Cancellation is
+deliberately ignored during this final crop commit phase. If installation
+fails after trashing, Losles tries to restore the safety backup; the error
+identifies the backup path if automatic restoration also fails. Never replace
+the crop sequence with unlinking or direct truncation.
 
 Crop is enabled only for orientation `1`. A drawn rectangle is expanded
-outward to MCU boundaries and clipped to image edges before Save As. This can
-produce a larger rectangle than the user's exact selection. Do not change it
-to lossy pixel cropping or silently discard edge pixels.
+outward to MCU boundaries and clipped to image edges before the in-place edit.
+This can produce a larger rectangle than the user's exact selection. Do not
+change it to lossy pixel cropping or silently discard edge pixels.
 
-`-copy all` preserves JPEG markers, including ICC and EXIF, but Losles only
-rewrites the IFD0 orientation value. It does not comprehensively update other
-EXIF dimension fields, embedded thumbnails, or maker-specific metadata after
-a rotation/crop. Treat that as a known metadata limitation.
+TurboJPEG preserves JPEG COM and APP markers. Losles does not selectively
+rewrite them, so ICC, EXIF (including orientation), XMP, IPTC, comments,
+maker-specific metadata, and unknown APP markers remain. This means semantic
+dimension fields and embedded thumbnails are retained but are not regenerated
+after a crop; they can describe the pre-crop image. Treat that as a known
+metadata-consistency limitation, not permission to drop those fields.
 
 ### PNG module details
 
@@ -413,16 +439,36 @@ profile identity must become part of the key.
 ## UI behavior and coordinate assumptions
 
 The UI is built directly in `losles-window.c`; there is no `.ui` resource.
-It consists of a header bar, a contained `GtkPicture`, a crop drawing overlay,
-a spinner, and a status line.
+It consists of a header bar and one `GtkOverlay` containing a contained
+`GtkPicture`, crop drawing layer, spinner, and bottom-left information OSD.
+The information OSD is hidden by default and does not participate in the
+content layout. Its widget has no external margin: its opaque `#000000`
+background begins at the exact bottom-left corner, with only internal text
+padding. Both the window content and canvas have application-priority CSS
+forcing a pure-black background regardless of the system light/dark
+preference, including in fullscreen. Keep those explicit CSS classes if the
+widget hierarchy changes; relying on theme defaults violates the intended
+photo-viewing background.
 
 Current actions and shortcuts:
 
 - Open: `Ctrl+O`;
 - Previous image: `Left`;
 - Next image: `Right`;
-- lossless rotate left/right: header-bar buttons;
-- lossless crop: toggle, drag selection, then Crop/Save As.
+- toggle the information OSD: information header button or `I`;
+- enter/leave fullscreen: double-click the picture or `Alt+Enter`;
+- leave fullscreen and/or cancel active crop mode: `Escape`;
+- lossless rotate left/right in place: header-bar buttons; the transformed
+  file overwrites the source without creating a Trash entry;
+- lossless crop in place: toggle, drag a new selection, move it from its
+  interior, or resize it from any edge/corner, then Crop; the original goes to
+  Trash before the cropped replacement is installed.
+
+Fullscreen hides the header bar and its controls. Keep
+`notify::fullscreened` as the source of truth so the header is restored even
+when the window manager changes fullscreen state outside the application
+action. The double-click gesture is attached to the content overlay so it
+continues to work over the picture and crop layer.
 
 The crop overlay maps between the contained picture rectangle and display
 pixel coordinates. Crop is disabled unless EXIF orientation is `1`, so those
@@ -430,9 +476,21 @@ coordinates currently equal encoded JPEG coordinates. If oriented cropping
 is implemented, a real display-to-source coordinate transform is required;
 simply enabling the button will crop the wrong area for orientations 2–8.
 
-The status line is part of the color-management contract: it reports whether
-the source used embedded ICC or an assumption and identifies the selected
-display target/fallback.
+Crop interaction is a small state machine (`CropDragMode`). Hit testing is
+performed in widget coordinates with a fixed screen-space tolerance so narrow
+images and different zoom scales remain usable. The actual rectangle is kept
+in display/source pixel coordinates. A drag can create a selection, move the
+whole selection while clamping it inside the image, or resize any edge or
+corner while enforcing a two-pixel minimum. The eight black-and-white handles
+and directional pointer cursors communicate the active affordance. If crop
+zooming or free rotation is added, update both hit testing and pointer-to-image
+mapping together; never infer source coordinates directly from the window.
+
+The information OSD is part of the color-management contract: it reports
+whether the source used embedded ICC or an assumption and identifies the
+selected display target/fallback. Updating its text while hidden is
+intentional; toggling it on must reveal the current state rather than a stale
+snapshot.
 
 ## Application and installed metadata
 
@@ -460,10 +518,13 @@ orientation. `test-formats` creates fixtures at runtime and checks:
 - PNG alpha preservation;
 - grayscale JPEG/profile handling;
 - coefficient JPEG rotation and crop plus ICC preservation;
+- in-place rotation overwrite with no system-Trash entry;
+- in-place crop replacement and isolated system-Trash preservation;
+- preservation of EXIF, XMP, IPTC, ICC, COM, and unknown APP marker metadata;
+- byte-identical right-then-left rotation, including a non-default EXIF
+  orientation;
+- rejection of unsafe in-place rotation through symbolic links;
 - invalid JPEG/PNG rejection.
-
-The jpegtran integration test skips when `jpegtran` is absent. A skipped test
-does not validate editing.
 
 For ordinary C changes, at minimum run:
 
@@ -476,10 +537,11 @@ threading changes. Add regression tests for new formats, malformed metadata,
 overflow boundaries, orientation mappings, and editing guarantees.
 
 Automated tests do not validate real colord discovery, movement between
-physical monitors, actual wide-gamut appearance, GTK interaction, directory
-navigation timing, or Save As dialogs. Changes in those areas need a manual
-Ubuntu 24.04 graphical-session check in addition to unit tests. Never claim
-display-color correctness based only on an sRGB-to-sRGB unit test.
+physical monitors, actual wide-gamut appearance, GTK interaction (including
+overlay placement, shortcuts, gestures, and fullscreen), or directory
+navigation timing. Changes in those areas need a manual Ubuntu 24.04
+graphical-session check in addition to unit tests. Never claim display-color
+correctness based only on an sRGB-to-sRGB unit test.
 
 ## Coding conventions and sensitive areas
 
@@ -496,8 +558,9 @@ display-color correctness based only on an sRGB-to-sRGB unit test.
 - Preserve alpha through color conversion.
 - Treat encoded content and metadata as hostile input.
 - Keep temporary editing output in the destination directory and remove it on
-  every failure path.
-- Do not weaken `jpegtran -perfect` merely to make more rotations succeed.
+  every failure path, except for a safety backup explicitly retained after an
+  unrecoverable replacement failure.
+- Do not weaken `TJXOPT_PERFECT` merely to make more rotations succeed.
 - Do not label an 8-bit decode/re-encode path as lossless.
 
 The Makefile carries `-Wno-pedantic` because GTK 4.14's public
@@ -519,11 +582,11 @@ the supported GTK baseline no longer needs it.
   the visible sRGB fallback rather than guessing.
 - CMYK/YCCK JPEGs fail explicitly.
 - Invalid embedded profiles are ignored in favor of the documented source
-  fallback; this is reported as an assumed profile in the status line.
+  fallback; this is reported as an assumed profile in the information OSD.
 - PNG 16-bit samples and non-iCCP color chunks are not preserved in the view
   pipeline.
-- JPEG marker copying is broad, but metadata rewriting is intentionally
-  minimal.
+- JPEG marker metadata is retained byte-for-byte, but dimension-dependent
+  metadata is not regenerated after a crop.
 - Viewing may use any `GFile` that GIO can load, but lossless JPEG editing
   requires local filesystem paths.
 - There is no file watching, thumbnail view, recursive scanning, recent-files

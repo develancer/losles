@@ -61,6 +61,16 @@ losles_application_init(LoslesApplication *self)
   gtk_application_set_accels_for_action(GTK_APPLICATION(self),
                                         "win.next",
                                         (const gchar *[]){"Right", NULL});
+  gtk_application_set_accels_for_action(GTK_APPLICATION(self),
+                                        "win.toggle-info",
+                                        (const gchar *[]){"i", NULL});
+  gtk_application_set_accels_for_action(
+    GTK_APPLICATION(self),
+    "win.toggle-fullscreen",
+    (const gchar *[]){"<Alt>Return", "<Alt>KP_Enter", NULL});
+  gtk_application_set_accels_for_action(GTK_APPLICATION(self),
+                                        "win.escape",
+                                        (const gchar *[]){"Escape", NULL});
 }
 
 LoslesApplication *
