@@ -612,7 +612,14 @@ picture overlay, so the whole window is a drop zone. It requests
 `GFile`; format validation remains the registry's job. Its `accept` and `drop`
 handlers both reject while Crop mode or another serialized operation is
 active. Keep both checks: the early rejection gives correct drag feedback,
-while the drop-time check protects against state changes during a drag.
+while the drop-time check protects against state changes during a drag. An
+accepted drop captures the current event timestamp and queues
+`focus_after_file_drop()` at idle priority. Deferring until the DnD session
+has completed lets it present the window, request toplevel keyboard focus
+with the user-interaction timestamp, and focus the focusable `zoom_view`
+inside GTK. Keep the request's strong window reference and destroy notifier;
+calling only the generic synchronous open/present path can leave keyboard
+focus in Nautilus.
 
 Delete is an explicit destructive action with recoverability through the
 system Trash. It runs in a worker and uses `g_file_trash()`; never replace it

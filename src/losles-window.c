@@ -93,6 +93,11 @@ typedef struct {
   GError *scan_error;
 } DeleteResult;
 
+typedef struct {
+  LoslesWindow *window;
+  guint32 timestamp;
+} DropFocusRequest;
+
 struct _LoslesWindow {
   GtkApplicationWindow parent_instance;
 
@@ -232,6 +237,13 @@ delete_result_free(DeleteResult *result)
   g_clear_pointer(&result->files, g_ptr_array_unref);
   g_clear_error(&result->scan_error);
   g_free(result);
+}
+
+static void
+drop_focus_request_free(DropFocusRequest *request)
+{
+  g_clear_object(&request->window);
+  g_free(request);
 }
 
 static GFile *
@@ -2345,13 +2357,28 @@ file_drop_accept(GtkDropTarget *target,
 }
 
 static gboolean
+focus_after_file_drop(gpointer user_data)
+{
+  DropFocusRequest *request = user_data;
+  LoslesWindow *self = request->window;
+
+  gtk_widget_grab_focus(GTK_WIDGET(self->zoom_view));
+  gtk_window_present(GTK_WINDOW(self));
+
+  GtkNative *native = gtk_widget_get_native(GTK_WIDGET(self));
+  GdkSurface *surface = native ? gtk_native_get_surface(native) : NULL;
+  if (GDK_IS_TOPLEVEL(surface))
+    gdk_toplevel_focus(GDK_TOPLEVEL(surface), request->timestamp);
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
 file_dropped(GtkDropTarget *target,
              const GValue *value,
              gdouble x,
              gdouble y,
              LoslesWindow *self)
 {
-  (void)target;
   (void)x;
   (void)y;
   if (self->operation_in_progress ||
@@ -2368,8 +2395,18 @@ file_dropped(GtkDropTarget *target,
     return FALSE;
 
   GFile *file = G_FILE(files->data);
+  GdkEvent *event =
+    gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(target));
+  DropFocusRequest *focus_request = g_new0(DropFocusRequest, 1);
+  focus_request->window = g_object_ref(self);
+  focus_request->timestamp =
+    event ? gdk_event_get_time(event) : GDK_CURRENT_TIME;
   losles_window_open_file(self, file);
   g_slist_free(files);
+  g_idle_add_full(G_PRIORITY_DEFAULT_IDLE,
+                  focus_after_file_drop,
+                  focus_request,
+                  (GDestroyNotify)drop_focus_request_free);
   return TRUE;
 }
 
@@ -2716,6 +2753,7 @@ losles_window_init(LoslesWindow *self)
   gtk_widget_set_vexpand(GTK_WIDGET(self->zoom_view), TRUE);
   gtk_widget_set_halign(GTK_WIDGET(self->zoom_view), GTK_ALIGN_FILL);
   gtk_widget_set_valign(GTK_WIDGET(self->zoom_view), GTK_ALIGN_FILL);
+  gtk_widget_set_focusable(GTK_WIDGET(self->zoom_view), TRUE);
   gtk_widget_set_overflow(GTK_WIDGET(self->zoom_view),
                           GTK_OVERFLOW_HIDDEN);
   gtk_overlay_add_overlay(GTK_OVERLAY(overlay),

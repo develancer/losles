@@ -167,7 +167,9 @@ image, it clears the browsing session and displays “No picture opened.”
 
 An image file can also be opened by dragging its file icon from Nautilus onto
 the Losles window. A multi-file drop opens the first file. File drops are
-rejected while Crop mode or another file operation is active.
+rejected while Crop mode or another file operation is active. After an
+accepted drop, Losles takes keyboard focus so its navigation and other
+shortcuts work immediately.
 
 ## Color-management model on Ubuntu 24.04
 
