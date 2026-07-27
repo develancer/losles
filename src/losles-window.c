@@ -2025,6 +2025,46 @@ action_escape(GSimpleAction *action,
     gtk_toggle_button_set_active(self->crop_button, FALSE);
 }
 
+static gboolean
+file_drop_accept(GtkDropTarget *target,
+                 GdkDrop *drop,
+                 LoslesWindow *self)
+{
+  (void)target;
+  (void)drop;
+  return !self->operation_in_progress &&
+         !gtk_toggle_button_get_active(self->crop_button);
+}
+
+static gboolean
+file_dropped(GtkDropTarget *target,
+             const GValue *value,
+             gdouble x,
+             gdouble y,
+             LoslesWindow *self)
+{
+  (void)target;
+  (void)x;
+  (void)y;
+  if (self->operation_in_progress ||
+      gtk_toggle_button_get_active(self->crop_button) ||
+      !G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST))
+    return FALSE;
+
+  GdkFileList *file_list = g_value_get_boxed(value);
+  if (!file_list)
+    return FALSE;
+
+  GSList *files = gdk_file_list_get_files(file_list);
+  if (!files)
+    return FALSE;
+
+  GFile *file = G_FILE(files->data);
+  losles_window_open_file(self, file);
+  g_slist_free(files);
+  return TRUE;
+}
+
 static void
 picture_pressed(GtkGestureClick *gesture,
                 gint n_press,
@@ -2438,6 +2478,19 @@ losles_window_init(LoslesWindow *self)
                                   actions,
                                   G_N_ELEMENTS(actions),
                                   self);
+
+  GtkDropTarget *file_drop_target =
+    gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
+  g_signal_connect(file_drop_target,
+                   "accept",
+                   G_CALLBACK(file_drop_accept),
+                   self);
+  g_signal_connect(file_drop_target,
+                   "drop",
+                   G_CALLBACK(file_dropped),
+                   self);
+  gtk_widget_add_controller(GTK_WIDGET(self),
+                            GTK_EVENT_CONTROLLER(file_drop_target));
 
   g_signal_connect(self,
                    "map",

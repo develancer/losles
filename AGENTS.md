@@ -482,6 +482,8 @@ Current actions and shortcuts:
 - apply a valid crop selection: Crop header button or `Enter`;
 - cancel active crop mode, without leaving fullscreen: `Escape`;
 - move the current image to Trash and advance: `Delete`;
+- open a dropped file: drag a Nautilus-style `GdkFileList` anywhere onto the
+  window; the first file enters the normal open/directory-scan pipeline;
 - lossless rotate left/right in place: header-bar buttons; the transformed
   file overwrites the source without creating a Trash entry;
 - normalize orientation: a header-bar `dialog-warning-symbolic` icon button,
@@ -543,6 +545,14 @@ same dynamic tooltip as the button. GTK's default widget picking excludes an
 insensitive button, so the wrapper is what makes the disabled-state “No
 rotation is stored in EXIF” tooltip discoverable. Keep the wrapper and button
 tooltip properties synchronized if this control changes.
+
+The file drop target is attached to the `LoslesWindow`, rather than only the
+picture overlay, so the whole window is a drop zone. It requests
+`GDK_TYPE_FILE_LIST` with copy semantics and opens only the first dropped
+`GFile`; format validation remains the registry's job. Its `accept` and `drop`
+handlers both reject while Crop mode or another serialized operation is
+active. Keep both checks: the early rejection gives correct drag feedback,
+while the drop-time check protects against state changes during a drag.
 
 Delete is an explicit destructive action with recoverability through the
 system Trash. It runs in a worker and uses `g_file_trash()`; never replace it

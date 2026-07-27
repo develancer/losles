@@ -147,6 +147,10 @@ Press `Delete` to move the current image to the system Trash. Losles then
 opens the next image in directory order when one exists. If there is no next
 image, it clears the browsing session and displays “No picture opened.”
 
+An image file can also be opened by dragging its file icon from Nautilus onto
+the Losles window. A multi-file drop opens the first file. File drops are
+rejected while Crop mode or another file operation is active.
+
 ## Color-management model on Ubuntu 24.04
 
 Losles does not depend on Mutter's newer color-management protocol. GTK 4.14
