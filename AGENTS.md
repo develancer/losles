@@ -313,10 +313,12 @@ fails after trashing, Losles tries to restore the safety backup; the error
 identifies the backup path if automatic restoration also fails. Never replace
 the crop sequence with unlinking or direct truncation.
 
-Crop is enabled only for orientation `1`. A drawn rectangle is expanded
-outward to MCU boundaries and clipped to image edges before the in-place edit.
-This can produce a larger rectangle than the user's exact selection. Do not
-change it to lossy pixel cropping or silently discard edge pixels.
+Crop is enabled only for orientation `1`. A requested rectangle is expanded
+outward to MCU boundaries and clipped to image edges. The window calls the
+format module's `adjust_crop` method during interaction, not just when the edit
+starts, so the visible rectangle already shows that expansion. Do not bypass
+the format method in the UI, change the operation to lossy pixel cropping, or
+silently discard edge pixels.
 
 TurboJPEG preserves JPEG COM and APP markers. Losles does not selectively
 rewrite them, so ICC, EXIF (including orientation), XMP, IPTC, comments,
@@ -457,7 +459,10 @@ Current actions and shortcuts:
 - Next image: `Right`;
 - toggle the information OSD: information header button or `I`;
 - enter/leave fullscreen: double-click the picture or `Alt+Enter`;
-- leave fullscreen and/or cancel active crop mode: `Escape`;
+- enter/leave crop mode: crop header button or `C`;
+- apply a valid crop selection: Crop header button or `Enter`;
+- cancel active crop mode, without leaving fullscreen: `Escape`;
+- move the current image to Trash and advance: `Delete`;
 - lossless rotate left/right in place: header-bar buttons; the transformed
   file overwrites the source without creating a Trash entry;
 - lossless crop in place: toggle, drag a new selection, move it from its
@@ -468,7 +473,11 @@ Fullscreen hides the header bar and its controls. Keep
 `notify::fullscreened` as the source of truth so the header is restored even
 when the window manager changes fullscreen state outside the application
 action. The double-click gesture is attached to the content overlay so it
-continues to work over the picture and crop layer.
+continues to work over the picture and crop layer. Crop and apply-crop are
+window actions rather than visibility-dependent button handling, so `C` and
+`Enter` continue to work while the header is hidden. `Escape` deliberately
+does nothing when crop mode is inactive; fullscreen is left only by
+double-click or `Alt+Enter`.
 
 The crop overlay maps between the contained picture rectangle and display
 pixel coordinates. Crop is disabled unless EXIF orientation is `1`, so those
@@ -482,15 +491,45 @@ images and different zoom scales remain usable. The actual rectangle is kept
 in display/source pixel coordinates. A drag can create a selection, move the
 whole selection while clamping it inside the image, or resize any edge or
 corner while enforcing a two-pixel minimum. The eight black-and-white handles
-and directional pointer cursors communicate the active affordance. If crop
-zooming or free rotation is added, update both hit testing and pointer-to-image
-mapping together; never infer source coordinates directly from the window.
+and directional pointer cursors communicate the active affordance.
+
+Every new or resized rectangle is immediately passed through
+`losles_format_adjust_crop()`, making the overlay identical to the rectangle
+used by the writer. Moves use a one-pixel probe through the same method to find
+the enclosing legal cell, choose its nearest boundary, and accept only a
+rectangle for which adjustment is idempotent. This preserves selection size
+during moves. A selection that includes a partial MCU block at the image's
+right or bottom edge may consequently be pinned on that axis until the edge is
+resized to a movable block-aligned size. Keep the application layer
+format-agnostic: future formats must express their crop constraints through
+`adjust_crop`, rather than adding format-name checks here.
+
+If crop zooming or free rotation is added, update both hit testing and
+pointer-to-image mapping together; never infer source coordinates directly
+from the window.
 
 The information OSD is part of the color-management contract: it reports
 whether the source used embedded ICC or an assumption and identifies the
 selected display target/fallback. Updating its text while hidden is
 intentional; toggling it on must reveal the current state rather than a stale
 snapshot.
+
+Delete is an explicit destructive action with recoverability through the
+system Trash. It runs in a worker and uses `g_file_trash()`; never replace it
+with unlinking. After Trash succeeds, the same worker rescans the directory.
+The completion callback prefers the successor known before deletion, falling
+back to the first supported filename collating after the deleted filename.
+This matters when the original directory scan had not finished before the
+user pressed Delete. If there is no successor—or if the post-Trash rescan
+fails—the window enters a real empty browsing state rather than navigating
+backward.
+
+Successful deletion increments both load and render generations and cancels
+inflight work before installing the fresh file list. Completed neighbor
+caches are retained so the successor can still display quickly; only entries
+for the deleted URI are removed. Stale callbacks must continue checking their
+generation before touching these tables. `operation_in_progress` serializes
+rotation, crop, deletion, navigation, and opening.
 
 ## Application and installed metadata
 

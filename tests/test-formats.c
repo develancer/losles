@@ -513,6 +513,31 @@ test_lossless_jpeg_operations(void)
   g_assert_cmpuint(adjusted.width, ==, 8);
   g_assert_cmpuint(adjusted.height, ==, 8);
 
+  LoslesCrop readjusted = {0};
+  g_assert_true(losles_format_adjust_crop(format,
+                                          plain,
+                                          &adjusted,
+                                          &readjusted,
+                                          &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(readjusted.x, ==, adjusted.x);
+  g_assert_cmpuint(readjusted.y, ==, adjusted.y);
+  g_assert_cmpuint(readjusted.width, ==, adjusted.width);
+  g_assert_cmpuint(readjusted.height, ==, adjusted.height);
+
+  LoslesCrop point = {.x = 12, .y = 5, .width = 1, .height = 1};
+  LoslesCrop point_cell = {0};
+  g_assert_true(losles_format_adjust_crop(format,
+                                          plain,
+                                          &point,
+                                          &point_cell,
+                                          &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(point_cell.x, ==, 8);
+  g_assert_cmpuint(point_cell.y, ==, 0);
+  g_assert_cmpuint(point_cell.width, ==, 8);
+  g_assert_cmpuint(point_cell.height, ==, 8);
+
   g_autoptr(GFile) cropped_file = g_file_new_for_path(cropped_path);
   g_assert_true(losles_format_crop_lossless(format,
                                             plain,

@@ -62,6 +62,16 @@ losles_application_init(LoslesApplication *self)
                                         "win.next",
                                         (const gchar *[]){"Right", NULL});
   gtk_application_set_accels_for_action(GTK_APPLICATION(self),
+                                        "win.toggle-crop",
+                                        (const gchar *[]){"c", NULL});
+  gtk_application_set_accels_for_action(
+    GTK_APPLICATION(self),
+    "win.apply-crop",
+    (const gchar *[]){"Return", "KP_Enter", NULL});
+  gtk_application_set_accels_for_action(GTK_APPLICATION(self),
+                                        "win.delete",
+                                        (const gchar *[]){"Delete", NULL});
+  gtk_application_set_accels_for_action(GTK_APPLICATION(self),
                                         "win.toggle-info",
                                         (const gchar *[]){"i", NULL});
   gtk_application_set_accels_for_action(

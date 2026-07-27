@@ -79,6 +79,17 @@ typedef struct {
   LoslesCrop crop;
 } EditJob;
 
+typedef struct {
+  GFile *file;
+  GFile *directory;
+  GFile *preferred_next;
+} DeleteJob;
+
+typedef struct {
+  GPtrArray *files;
+  GError *scan_error;
+} DeleteResult;
+
 struct _LoslesWindow {
   GtkApplicationWindow parent_instance;
 
@@ -119,7 +130,7 @@ struct _LoslesWindow {
   GCancellable *render_cancellable;
 
   gboolean monitor_signals_connected;
-  gboolean edit_in_progress;
+  gboolean operation_in_progress;
   CropDragMode crop_drag_mode;
   gdouble crop_drag_origin_x;
   gdouble crop_drag_origin_y;
@@ -181,6 +192,23 @@ edit_job_free(EditJob *job)
   g_clear_object(&job->image);
   g_clear_object(&job->destination);
   g_free(job);
+}
+
+static void
+delete_job_free(DeleteJob *job)
+{
+  g_clear_object(&job->file);
+  g_clear_object(&job->directory);
+  g_clear_object(&job->preferred_next);
+  g_free(job);
+}
+
+static void
+delete_result_free(DeleteResult *result)
+{
+  g_clear_pointer(&result->files, g_ptr_array_unref);
+  g_clear_error(&result->scan_error);
+  g_free(result);
 }
 
 static GFile *
@@ -537,6 +565,48 @@ compare_files(gconstpointer a, gconstpointer b)
   return g_utf8_collate(name_a ? name_a : "", name_b ? name_b : "");
 }
 
+static GPtrArray *
+scan_supported_files(GFile *directory,
+                     GCancellable *cancellable,
+                     GError **error)
+{
+  g_autoptr(GFileEnumerator) enumerator =
+    g_file_enumerate_children(directory,
+                              G_FILE_ATTRIBUTE_STANDARD_NAME ","
+                              G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                              G_FILE_QUERY_INFO_NONE,
+                              cancellable,
+                              error);
+  if (!enumerator)
+    return NULL;
+
+  GPtrArray *files =
+    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  while (TRUE) {
+    g_autoptr(GFileInfo) info =
+      g_file_enumerator_next_file(enumerator, cancellable, error);
+    if (!info)
+      break;
+    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR)
+      continue;
+
+    GFile *child =
+      g_file_get_child(directory, g_file_info_get_name(info));
+    if (losles_format_registry_supports_file(child))
+      g_ptr_array_add(files, child);
+    else
+      g_object_unref(child);
+  }
+
+  if (error && *error) {
+    g_ptr_array_unref(files);
+    return NULL;
+  }
+
+  g_ptr_array_sort(files, compare_files);
+  return files;
+}
+
 static void
 scan_worker(GTask *task,
             gpointer source_object,
@@ -546,44 +616,44 @@ scan_worker(GTask *task,
   (void)source_object;
   ScanJob *job = task_data;
   g_autoptr(GError) error = NULL;
-  g_autoptr(GFileEnumerator) enumerator =
-    g_file_enumerate_children(job->directory,
-                              G_FILE_ATTRIBUTE_STANDARD_NAME ","
-                              G_FILE_ATTRIBUTE_STANDARD_TYPE,
-                              G_FILE_QUERY_INFO_NONE,
-                              cancellable,
-                              &error);
-  if (!enumerator) {
-    g_task_return_error(task, g_steal_pointer(&error));
-    return;
-  }
-
   GPtrArray *files =
-    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
-  while (TRUE) {
-    g_autoptr(GFileInfo) info =
-      g_file_enumerator_next_file(enumerator, cancellable, &error);
-    if (!info)
-      break;
-    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR)
-      continue;
-
-    GFile *child =
-      g_file_get_child(job->directory, g_file_info_get_name(info));
-    if (losles_format_registry_supports_file(child))
-      g_ptr_array_add(files, child);
-    else
-      g_object_unref(child);
+    scan_supported_files(job->directory,
+                         cancellable,
+                         &error);
+  if (!files) {
+    g_task_return_error(task, g_steal_pointer(&error));
+    return;
   }
+  g_task_return_pointer(task, files, (GDestroyNotify)g_ptr_array_unref);
+}
 
-  if (error) {
-    g_ptr_array_unref(files);
+static void
+delete_worker(GTask *task,
+              gpointer source_object,
+              gpointer task_data,
+              GCancellable *cancellable)
+{
+  (void)source_object;
+  DeleteJob *job = task_data;
+  g_autoptr(GError) error = NULL;
+  if (!g_file_trash(job->file, cancellable, &error)) {
     g_task_return_error(task, g_steal_pointer(&error));
     return;
   }
 
-  g_ptr_array_sort(files, compare_files);
-  g_task_return_pointer(task, files, (GDestroyNotify)g_ptr_array_unref);
+  DeleteResult *result = g_new0(DeleteResult, 1);
+  if (job->directory) {
+    result->files =
+      scan_supported_files(job->directory,
+                           cancellable,
+                           &result->scan_error);
+  } else {
+    result->files =
+      g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  }
+  g_task_return_pointer(task,
+                        result,
+                        (GDestroyNotify)delete_result_free);
 }
 
 static void
@@ -883,6 +953,69 @@ invalidate_render_cache(LoslesWindow *self)
 }
 
 static void
+reset_content_pipeline(LoslesWindow *self)
+{
+  self->generation++;
+  if (self->load_cancellable)
+    g_cancellable_cancel(self->load_cancellable);
+  g_clear_object(&self->load_cancellable);
+  self->load_cancellable = g_cancellable_new();
+  g_hash_table_remove_all(self->inflight);
+  g_hash_table_remove_all(self->failed);
+  g_hash_table_remove_all(self->cache);
+  self->cache_size = 0;
+  invalidate_render_cache(self);
+}
+
+static void
+advance_pipeline_after_delete(LoslesWindow *self, GFile *deleted_file)
+{
+  g_autofree gchar *uri = file_uri(deleted_file);
+
+  self->generation++;
+  if (self->load_cancellable)
+    g_cancellable_cancel(self->load_cancellable);
+  g_clear_object(&self->load_cancellable);
+  self->load_cancellable = g_cancellable_new();
+  g_hash_table_remove_all(self->inflight);
+  g_hash_table_remove_all(self->failed);
+
+  LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (cached)
+    self->cache_size -= losles_image_get_memory_size(cached);
+  g_hash_table_remove(self->cache, uri);
+
+  if (self->render_cancellable)
+    g_cancellable_cancel(self->render_cancellable);
+  g_clear_object(&self->render_cancellable);
+  self->render_cancellable = g_cancellable_new();
+  self->render_generation++;
+  g_hash_table_remove_all(self->render_inflight);
+  g_hash_table_remove_all(self->render_blocked);
+
+  RenderCacheEntry *rendered =
+    g_hash_table_lookup(self->render_cache, uri);
+  if (rendered)
+    self->render_cache_size -= rendered->size;
+  g_hash_table_remove(self->render_cache, uri);
+}
+
+static void
+show_no_picture(LoslesWindow *self)
+{
+  g_clear_pointer(&self->files, g_ptr_array_unref);
+  self->files =
+    g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
+  self->current_index = 0;
+  clear_current_image(self);
+  gtk_spinner_stop(self->spinner);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+  gtk_window_set_title(GTK_WINDOW(self), "losles");
+  set_status(self, "No picture opened");
+  update_controls(self);
+}
+
+static void
 show_index(LoslesWindow *self, guint index)
 {
   if (!self->files || index >= self->files->len)
@@ -905,14 +1038,14 @@ show_index(LoslesWindow *self, guint index)
 static void
 previous_image(LoslesWindow *self)
 {
-  if (!self->edit_in_progress && self->current_index > 0)
+  if (!self->operation_in_progress && self->current_index > 0)
     show_index(self, self->current_index - 1);
 }
 
 static void
 next_image(LoslesWindow *self)
 {
-  if (!self->edit_in_progress &&
+  if (!self->operation_in_progress &&
       self->files &&
       self->current_index + 1 < self->files->len)
     show_index(self, self->current_index + 1);
@@ -1070,6 +1203,102 @@ set_crop_cursor(LoslesWindow *self, CropDragMode mode)
                                   crop_cursor_name(mode));
 }
 
+static gboolean
+crop_is_perfect(LoslesWindow *self, const LoslesCrop *crop)
+{
+  LoslesFormat *format =
+    LOSLES_FORMAT(losles_image_get_format(self->current_image));
+  LoslesCrop adjusted = {0};
+  return losles_format_adjust_crop(format,
+                                   self->current_image,
+                                   crop,
+                                   &adjusted,
+                                   NULL) &&
+         adjusted.x == crop->x &&
+         adjusted.y == crop->y &&
+         adjusted.width == crop->width &&
+         adjusted.height == crop->height;
+}
+
+static guint
+nearest_crop_boundary(gdouble position,
+                      guint lower,
+                      guint upper,
+                      guint maximum,
+                      guint fallback)
+{
+  const gboolean lower_valid = lower <= maximum;
+  const gboolean upper_valid = upper <= maximum;
+  if (!lower_valid && !upper_valid)
+    return fallback;
+  if (!lower_valid)
+    return upper;
+  if (!upper_valid)
+    return lower;
+  return ABS(position - lower) <= ABS(upper - position) ? lower : upper;
+}
+
+static LoslesCrop
+crop_snap_move(LoslesWindow *self,
+               gdouble desired_left,
+               gdouble desired_top)
+{
+  const LoslesCrop initial = self->crop_drag_initial;
+  const guint image_width =
+    losles_image_get_display_width(self->current_image);
+  const guint image_height =
+    losles_image_get_display_height(self->current_image);
+  const guint maximum_x = image_width - initial.width;
+  const guint maximum_y = image_height - initial.height;
+
+  LoslesFormat *format =
+    LOSLES_FORMAT(losles_image_get_format(self->current_image));
+  LoslesCrop point = {
+    .x = MIN((guint)(desired_left + 0.5), image_width - 1),
+    .y = MIN((guint)(desired_top + 0.5), image_height - 1),
+    .width = 1,
+    .height = 1,
+  };
+  LoslesCrop cell = {0};
+  if (!losles_format_adjust_crop(format,
+                                 self->current_image,
+                                 &point,
+                                 &cell,
+                                 NULL))
+    return initial;
+
+  const guint candidate_x =
+    nearest_crop_boundary(desired_left,
+                          cell.x,
+                          cell.x + cell.width,
+                          maximum_x,
+                          initial.x);
+  const guint candidate_y =
+    nearest_crop_boundary(desired_top,
+                          cell.y,
+                          cell.y + cell.height,
+                          maximum_y,
+                          initial.y);
+
+  LoslesCrop snapped = initial;
+  LoslesCrop candidate = initial;
+  candidate.x = candidate_x;
+  candidate.y = candidate_y;
+  if (crop_is_perfect(self, &candidate))
+    return candidate;
+
+  candidate = initial;
+  candidate.x = candidate_x;
+  if (crop_is_perfect(self, &candidate))
+    snapped.x = candidate_x;
+
+  candidate = snapped;
+  candidate.y = candidate_y;
+  if (crop_is_perfect(self, &candidate))
+    snapped.y = candidate_y;
+  return snapped;
+}
+
 static void
 crop_set_bounds(LoslesWindow *self,
                 gdouble left,
@@ -1093,15 +1322,33 @@ crop_set_bounds(LoslesWindow *self,
   const guint integer_bottom =
     (guint)(CLAMP(bottom, 0, image_height) + 0.5);
 
-  self->crop.x = MIN(integer_left, integer_right);
-  self->crop.y = MIN(integer_top, integer_bottom);
-  self->crop.width =
-    MAX(integer_left, integer_right) - self->crop.x;
-  self->crop.height =
-    MAX(integer_top, integer_bottom) - self->crop.y;
-  self->crop_valid =
-    self->crop.width >= CROP_MIN_SIZE &&
-    self->crop.height >= CROP_MIN_SIZE;
+  LoslesCrop requested = {
+    .x = MIN(integer_left, integer_right),
+    .y = MIN(integer_top, integer_bottom),
+  };
+  requested.width =
+    MAX(integer_left, integer_right) - requested.x;
+  requested.height =
+    MAX(integer_top, integer_bottom) - requested.y;
+
+  self->crop = requested;
+  self->crop_valid = FALSE;
+  if (requested.width >= CROP_MIN_SIZE &&
+      requested.height >= CROP_MIN_SIZE) {
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(self->current_image));
+    LoslesCrop adjusted = {0};
+    if (losles_format_adjust_crop(format,
+                                  self->current_image,
+                                  &requested,
+                                  &adjusted,
+                                  NULL)) {
+      self->crop = adjusted;
+      self->crop_valid =
+        adjusted.width >= CROP_MIN_SIZE &&
+        adjusted.height >= CROP_MIN_SIZE;
+    }
+  }
   gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button),
                            self->crop_valid);
   gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
@@ -1132,19 +1379,19 @@ crop_update_from_pointer(LoslesWindow *self,
     bottom = MAX(self->crop_drag_origin_y, image_y);
     break;
   case CROP_DRAG_MOVE: {
-    const gdouble delta_x =
-      CLAMP(image_x - self->crop_drag_origin_x,
-            -left,
-            image_width - right);
-    const gdouble delta_y =
-      CLAMP(image_y - self->crop_drag_origin_y,
-            -top,
-            image_height - bottom);
-    left += delta_x;
-    right += delta_x;
-    top += delta_y;
-    bottom += delta_y;
-    break;
+    const gdouble desired_left =
+      CLAMP(left + image_x - self->crop_drag_origin_x,
+            0,
+            image_width - self->crop_drag_initial.width);
+    const gdouble desired_top =
+      CLAMP(top + image_y - self->crop_drag_origin_y,
+            0,
+            image_height - self->crop_drag_initial.height);
+    self->crop = crop_snap_move(self, desired_left, desired_top);
+    self->crop_valid = TRUE;
+    gtk_widget_set_sensitive(GTK_WIDGET(self->apply_crop_button), TRUE);
+    gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+    return;
   }
   case CROP_DRAG_LEFT:
   case CROP_DRAG_TOP_LEFT:
@@ -1398,7 +1645,7 @@ edit_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   g_autoptr(GFile) destination = g_object_ref(job->destination);
   g_autoptr(GError) error = NULL;
 
-  self->edit_in_progress = FALSE;
+  self->operation_in_progress = FALSE;
   update_controls(self);
   gtk_spinner_stop(self->spinner);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
@@ -1417,7 +1664,7 @@ start_edit(LoslesWindow *self,
            LoslesRotation rotation,
            const LoslesCrop *crop)
 {
-  if (self->edit_in_progress || !self->current_image)
+  if (self->operation_in_progress || !self->current_image)
     return;
 
   EditJob *job = g_new0(EditJob, 1);
@@ -1428,7 +1675,7 @@ start_edit(LoslesWindow *self,
   if (crop)
     job->crop = *crop;
 
-  self->edit_in_progress = TRUE;
+  self->operation_in_progress = TRUE;
   update_controls(self);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
   gtk_spinner_start(self->spinner);
@@ -1449,7 +1696,7 @@ rotate_clicked(GtkButton *button, LoslesWindow *self)
     button == self->rotate_left_button
       ? LOSLES_ROTATE_LEFT
       : LOSLES_ROTATE_RIGHT;
-  if (!self->current_image || self->edit_in_progress)
+  if (!self->current_image || self->operation_in_progress)
     return;
   start_edit(self,
              losles_image_get_file(self->current_image),
@@ -1475,7 +1722,7 @@ static void
 apply_crop_clicked(GtkButton *button, LoslesWindow *self)
 {
   (void)button;
-  if (self->edit_in_progress ||
+  if (self->operation_in_progress ||
       !self->current_image ||
       !self->crop_valid)
     return;
@@ -1501,6 +1748,102 @@ apply_crop_clicked(GtkButton *button, LoslesWindow *self)
              &adjusted);
 }
 
+static gint
+find_deleted_file_successor(DeleteJob *job, GPtrArray *files)
+{
+  if (!files || files->len == 0)
+    return -1;
+
+  if (job->preferred_next) {
+    const gint preferred_index =
+      find_file_index(files, job->preferred_next);
+    if (preferred_index >= 0)
+      return preferred_index;
+  }
+
+  g_autofree gchar *deleted_name = g_file_get_basename(job->file);
+  for (guint i = 0; deleted_name && i < files->len; i++) {
+    GFile *candidate = g_ptr_array_index(files, i);
+    g_autofree gchar *candidate_name =
+      g_file_get_basename(candidate);
+    if (candidate_name &&
+        g_utf8_collate(candidate_name, deleted_name) > 0)
+      return (gint)i;
+  }
+  return -1;
+}
+
+static void
+delete_done(GObject *source_object,
+            GAsyncResult *result,
+            gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  DeleteJob *job = g_task_get_task_data(task);
+  g_autoptr(GError) error = NULL;
+  DeleteResult *delete_result =
+    g_task_propagate_pointer(task, &error);
+
+  self->operation_in_progress = FALSE;
+  gtk_spinner_stop(self->spinner);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+  if (!delete_result) {
+    update_controls(self);
+    show_error(self, "Could not move the image to Trash", error);
+    return;
+  }
+
+  if (delete_result->scan_error) {
+    g_debug("The image was trashed, but its directory could not be "
+            "rescanned: %s",
+            delete_result->scan_error->message);
+  }
+
+  const gint next_index =
+    find_deleted_file_successor(job, delete_result->files);
+  if (next_index < 0) {
+    reset_content_pipeline(self);
+    show_no_picture(self);
+  } else {
+    advance_pipeline_after_delete(self, job->file);
+    g_clear_pointer(&self->files, g_ptr_array_unref);
+    self->files = g_steal_pointer(&delete_result->files);
+    self->current_index = (guint)next_index;
+    show_index(self, self->current_index);
+  }
+  delete_result_free(delete_result);
+}
+
+static void
+delete_current_image(LoslesWindow *self)
+{
+  GFile *file = current_file(self);
+  if (self->operation_in_progress || !self->current_image || !file)
+    return;
+
+  DeleteJob *job = g_new0(DeleteJob, 1);
+  job->file = g_object_ref(file);
+  job->directory = g_file_get_parent(file);
+  if (self->current_index + 1 < self->files->len) {
+    job->preferred_next =
+      g_object_ref(g_ptr_array_index(self->files,
+                                     self->current_index + 1));
+  }
+
+  self->operation_in_progress = TRUE;
+  update_controls(self);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+  gtk_spinner_start(self->spinner);
+  set_status(self, "Moving image to Trash…");
+
+  GTask *task = g_task_new(self, NULL, delete_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)delete_job_free);
+  g_task_run_in_thread(task, delete_worker);
+  g_object_unref(task);
+}
+
 static void
 open_chosen(GObject *source_object,
             GAsyncResult *result,
@@ -1523,7 +1866,7 @@ open_chosen(GObject *source_object,
 static void
 open_dialog(LoslesWindow *self)
 {
-  if (self->edit_in_progress)
+  if (self->operation_in_progress)
     return;
 
   GtkFileDialog *dialog = gtk_file_dialog_new();
@@ -1564,6 +1907,44 @@ action_next(GSimpleAction *action,
   (void)action;
   (void)parameter;
   next_image(LOSLES_WINDOW(user_data));
+}
+
+static void
+action_toggle_crop(GSimpleAction *action,
+                   GVariant *parameter,
+                   gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  if (!self->operation_in_progress &&
+      gtk_widget_get_sensitive(GTK_WIDGET(self->crop_button))) {
+    gtk_toggle_button_set_active(
+      self->crop_button,
+      !gtk_toggle_button_get_active(self->crop_button));
+  }
+}
+
+static void
+action_apply_crop(GSimpleAction *action,
+                  GVariant *parameter,
+                  gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  if (gtk_toggle_button_get_active(self->crop_button))
+    apply_crop_clicked(NULL, self);
+}
+
+static void
+action_delete(GSimpleAction *action,
+              GVariant *parameter,
+              gpointer user_data)
+{
+  (void)action;
+  (void)parameter;
+  delete_current_image(LOSLES_WINDOW(user_data));
 }
 
 static void
@@ -1615,8 +1996,6 @@ action_escape(GSimpleAction *action,
   LoslesWindow *self = LOSLES_WINDOW(user_data);
   if (gtk_toggle_button_get_active(self->crop_button))
     gtk_toggle_button_set_active(self->crop_button, FALSE);
-  if (gtk_window_is_fullscreen(GTK_WINDOW(self)))
-    gtk_window_unfullscreen(GTK_WINDOW(self));
 }
 
 static void
@@ -1691,7 +2070,7 @@ color_target_changed(LoslesColorManager *manager, LoslesWindow *self)
 static void
 update_controls(LoslesWindow *self)
 {
-  const gboolean idle = !self->edit_in_progress;
+  const gboolean idle = !self->operation_in_progress;
   const gboolean has_image = self->current_image != NULL && idle;
   gboolean rotation = FALSE;
   gboolean crop = FALSE;
@@ -1878,7 +2257,8 @@ losles_window_init(LoslesWindow *self)
   gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
                            "crop-symbolic");
   gtk_widget_set_tooltip_text(GTK_WIDGET(self->crop_button),
-                              "Lossless JPEG crop (original goes to Trash)");
+                              "Lossless JPEG crop "
+                              "(C; original goes to Trash)");
   gtk_widget_add_css_class(GTK_WIDGET(self->crop_button), "flat");
   gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->crop_button));
@@ -1889,6 +2269,8 @@ losles_window_init(LoslesWindow *self)
 
   self->apply_crop_button =
     GTK_BUTTON(gtk_button_new_with_label("Crop"));
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->apply_crop_button),
+                              "Apply lossless crop (Enter)");
   gtk_header_bar_pack_end(self->header_bar,
                           GTK_WIDGET(self->apply_crop_button));
   g_signal_connect(self->apply_crop_button,
@@ -1982,6 +2364,9 @@ losles_window_init(LoslesWindow *self)
     {.name = "open", .activate = action_open},
     {.name = "previous", .activate = action_previous},
     {.name = "next", .activate = action_next},
+    {.name = "toggle-crop", .activate = action_toggle_crop},
+    {.name = "apply-crop", .activate = action_apply_crop},
+    {.name = "delete", .activate = action_delete},
     {.name = "toggle-info", .activate = action_toggle_info},
     {.name = "toggle-fullscreen", .activate = action_toggle_fullscreen},
     {.name = "escape", .activate = action_escape},
@@ -2021,19 +2406,10 @@ losles_window_open_file(LoslesWindow *self, GFile *file)
   g_return_if_fail(LOSLES_IS_WINDOW(self));
   g_return_if_fail(G_IS_FILE(file));
 
-  if (self->edit_in_progress)
+  if (self->operation_in_progress)
     return;
 
-  self->generation++;
-  if (self->load_cancellable)
-    g_cancellable_cancel(self->load_cancellable);
-  g_clear_object(&self->load_cancellable);
-  self->load_cancellable = g_cancellable_new();
-  g_hash_table_remove_all(self->inflight);
-  g_hash_table_remove_all(self->failed);
-  g_hash_table_remove_all(self->cache);
-  self->cache_size = 0;
-  invalidate_render_cache(self);
+  reset_content_pipeline(self);
 
   g_clear_pointer(&self->files, g_ptr_array_unref);
   self->files =

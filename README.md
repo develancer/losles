@@ -89,10 +89,12 @@ orientation tag and applies only the requested coefficient rotation, so a
 right rotation followed by a left rotation is byte-identical for the supported
 perfect-transform path.
 
-JPEG crop coordinates must start on an MCU boundary. Losles expands a drawn
-selection outward to the nearest legal boundaries before applying it. A
-transform is refused when a mathematically perfect result is impossible;
-losles does not silently trim edge pixels.
+JPEG crop coordinates must start on an MCU boundary. While the rectangle is
+drawn, moved, or resized, Losles snaps it to the format module's nearest legal
+boundaries. The visible rectangle is therefore the rectangle that will be
+applied; clicking Crop does not perform a second hidden expansion. A transform
+is refused when a mathematically perfect result is impossible; losles does not
+silently trim edge pixels.
 
 Metadata fields whose meaning depends on image dimensions, such as an embedded
 thumbnail or EXIF pixel dimensions, are retained unchanged rather than
@@ -113,12 +115,19 @@ information button or the `I` key. The image canvas is always pure black,
 independently of the desktop color scheme and in fullscreen.
 
 Double-click the picture or press `Alt+Enter` to enter or leave fullscreen.
-`Escape` leaves fullscreen and also cancels crop mode. The header bar is
-hidden while fullscreen is active.
+The header bar is hidden while fullscreen is active. `Escape` does not leave
+fullscreen; it only cancels crop mode when crop mode is active.
 
-In crop mode, drag over the image to create a selection. Drag inside an
-existing selection to move it, or drag any of its four edges or eight visible
-edge/corner handles to resize it.
+Press `C` to enter or leave crop mode, including while fullscreen. In crop
+mode, drag over the image to create a selection. Drag inside an existing
+selection to move it, or drag any of its four edges or eight visible
+edge/corner handles to resize it. The handles move in lossless JPEG block
+increments, so the overlay always previews the exact crop result. Press
+`Enter` to apply a valid selection.
+
+Press `Delete` to move the current image to the system Trash. Losles then
+opens the next image in directory order when one exists. If there is no next
+image, it clears the browsing session and displays “No picture opened.”
 
 ## Color-management model on Ubuntu 24.04
 
