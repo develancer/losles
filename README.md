@@ -1,8 +1,8 @@
 # losles
 
 Losles is a small, color-managed photo viewer for Ubuntu 24.04 and later. It
-currently displays JPEG and PNG files and performs coefficient-level,
-lossless JPEG rotation and cropping.
+currently displays JPEG and PNG files and performs lossless rotation and
+cropping for JPEGs and common 8-bit PNG encodings.
 
 The application is deliberately written in C17. On Ubuntu this avoids a
 language runtime, an async executor, and format frameworks that would overlap
@@ -23,6 +23,10 @@ libpng decode pixels, and colord supplies the selected monitor profile.
 - Lossless JPEG rotation and MCU-aligned cropping through libturbojpeg, while
   preserving JPEG marker metadata including ICC, EXIF, XMP, IPTC, comments,
   and unknown APP markers.
+- Pixel-lossless rotation and exact-pixel cropping for static, non-interlaced,
+  8-bit grayscale, grayscale-alpha, RGB, and RGBA PNGs. Original ancillary
+  chunks, including `iCCP`, text, and physical-resolution data, are retained
+  byte-for-byte.
 - Explicit lossless EXIF-orientation normalization: the displayed orientation
   is baked into JPEG coefficients and the existing orientation tag is set to
   `1`.
@@ -77,10 +81,10 @@ Run `make help` for the available targets and overrides.
 ## Lossless editing semantics
 
 Rotation and crop are applied in place as soon as their action button is
-clicked. Rotation first creates the transformed JPEG and then overwrites the
+clicked. Rotation first creates the transformed image and then overwrites the
 source path; it does not create a backup in the system Trash.
 
-Crop first creates the transformed JPEG and a safety backup, then moves the
+Crop first creates the transformed image and a safety backup, then moves the
 exact original file into the system Trash and installs the cropped file at the
 original path. If the original cannot be moved to Trash, it is left unchanged
 and the crop fails.
@@ -109,15 +113,19 @@ is refused when a mathematically perfect result is impossible; losles does not
 silently trim edge pixels.
 
 Metadata fields whose meaning depends on image dimensions, such as an embedded
-thumbnail or EXIF pixel dimensions, are retained unchanged rather than
-discarded or regenerated. They can therefore describe the pre-edit image after
-a crop, a quarter-turn rotation, or orientation normalization. The JPEG's own
-encoded dimensions are updated correctly.
+thumbnail, EXIF pixel dimensions, or PNG metadata, are retained unchanged
+rather than discarded or regenerated. They can therefore describe the
+pre-edit image after a crop, a quarter-turn rotation, or orientation
+normalization. The image format's own encoded dimensions are updated
+correctly.
 
-PNG editing is intentionally disabled in this first version. Although PNG
-recompression is pixel-lossless, preserving 16-bit samples and all relevant
-ancillary metadata needs a dedicated writer. Calling an 8-bit export
-"lossless" would be misleading.
+PNG transforms decode and recompress the original samples without changing
+their values. The original `IHDR` and `IDAT` chunks are replaced as required;
+every other original chunk is copied unchanged and in order. Editing is
+enabled only for static, non-interlaced, 8-bit grayscale, grayscale-alpha,
+RGB, and RGBA PNG files. Palette PNGs, sub-8-bit grayscale, 16-bit samples,
+Adam7 interlacing, and animated PNG chunks remain view-only: Rotate and Crop
+stay disabled rather than converting those files to a simpler representation.
 
 ## Interface
 
@@ -134,9 +142,10 @@ fullscreen; it only cancels crop mode when crop mode is active.
 Press `C` to enter or leave crop mode, including while fullscreen. In crop
 mode, drag over the image to create a selection. Drag inside an existing
 selection to move it, or drag any of its four edges or eight visible
-edge/corner handles to resize it. The handles move in lossless JPEG block
-increments, so the overlay always previews the exact crop result. Press
-`Enter` to apply a valid selection.
+edge/corner handles to resize it. JPEG selections move in legal MCU-block
+increments, while supported PNGs use exact pixels, so the overlay always
+previews the crop that will be written. Press `Enter` to apply a valid
+selection.
 
 Use the warning-icon orientation control when it is enabled to bake a
 non-default EXIF orientation into the JPEG coefficients and set the tag to
@@ -188,12 +197,13 @@ src/
     losles-format.c           module interface
     losles-format-registry.c  format selection
     losles-jpeg-format.c      JPEG decode and lossless writer
-    losles-png-format.c       PNG decode
+    losles-png-format.c       PNG decode, capability checks, and lossless writer
 tests/
   test-jpeg-metadata.c
-  test-formats.c              ICC/render, TurboJPEG, and Trash integration
+  test-formats.c              ICC/render, JPEG/PNG edits, and Trash integration
 ```
 
-Current deliberate limits are RGB/grayscale JPEG and PNG viewing, JPEG-only
-editing, 8-bit display buffers, SDR ICC profiles, and local files for
-editing. CMYK JPEG display is not implemented yet.
+Current deliberate limits are RGB/grayscale JPEG and PNG viewing, editing of
+JPEG plus the common PNG subset described above, 8-bit display buffers, SDR
+ICC profiles, and local files for editing. CMYK JPEG display is not
+implemented yet.

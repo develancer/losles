@@ -28,6 +28,7 @@ static const guint8 test_unknown_marker[] = {
 static const guint8 test_comment_marker[] = {
   "losles-comment-sentinel"
 };
+static const gchar test_png_text[] = "losles-png-metadata-sentinel";
 
 static void
 remove_tree(const gchar *path)
@@ -187,6 +188,49 @@ read_jpeg_marker_metadata(const gchar *path)
       g_byte_array_append(metadata, bytes + offset, marker_size);
     }
     offset += marker_size;
+  }
+
+  return g_byte_array_free_to_bytes(metadata);
+}
+
+static guint32
+read_test_be32(const guint8 *data)
+{
+  return ((guint32)data[0] << 24) |
+         ((guint32)data[1] << 16) |
+         ((guint32)data[2] << 8) |
+         data[3];
+}
+
+static GBytes *
+read_png_metadata_chunks(const gchar *path)
+{
+  g_autofree gchar *contents = NULL;
+  gsize size = 0;
+  g_autoptr(GError) error = NULL;
+  g_assert_true(g_file_get_contents(path, &contents, &size, &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(size, >=, 8);
+
+  const guint8 *data = (const guint8 *)contents;
+  GByteArray *metadata = g_byte_array_new();
+  gsize offset = 8;
+  while (offset < size) {
+    g_assert_cmpuint(size - offset, >=, 12);
+    const guint32 data_size = read_test_be32(data + offset);
+    const guint64 chunk_size = (guint64)data_size + 12;
+    g_assert_cmpuint(chunk_size, <=, size - offset);
+
+    const guint8 *type = data + offset + 4;
+    if (memcmp(type, "IHDR", 4) != 0 &&
+        memcmp(type, "IDAT", 4) != 0 &&
+        memcmp(type, "IEND", 4) != 0) {
+      g_byte_array_append(metadata, data + offset, chunk_size);
+    }
+
+    offset += chunk_size;
+    if (memcmp(type, "IEND", 4) == 0)
+      break;
   }
 
   return g_byte_array_free_to_bytes(metadata);
@@ -386,6 +430,13 @@ write_test_png(const gchar *path, GBytes *profile)
                PNG_COMPRESSION_TYPE_BASE,
                profile_data,
                profile_size);
+  png_text text = {
+    .compression = PNG_TEXT_COMPRESSION_NONE,
+    .key = "Comment",
+    .text = (gchar *)test_png_text,
+  };
+  png_set_text(png, info, &text, 1);
+  png_set_pHYs(png, info, 3780, 3780, PNG_RESOLUTION_METER);
   png_write_info(png, info);
 
   guint8 pixels[] = {
@@ -393,6 +444,97 @@ write_test_png(const gchar *path, GBytes *profile)
     255, 255, 255, 64, 128, 128, 128, 32, 0, 0, 0, 0,
   };
   png_bytep rows[] = {pixels, pixels + 12};
+  png_write_image(png, rows);
+  png_write_end(png, NULL);
+  png_destroy_write_struct(&png, &info);
+  fclose(output);
+}
+
+static void
+write_test_png_variant(const gchar *path,
+                       gint bit_depth,
+                       gint color_type,
+                       gint interlace_type,
+                       gboolean animated_marker)
+{
+  FILE *output = g_fopen(path, "wb");
+  g_assert_nonnull(output);
+
+  png_structp png =
+    png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  g_assert_nonnull(png);
+  png_infop info = png_create_info_struct(png);
+  g_assert_nonnull(info);
+  g_assert_cmpint(setjmp(png_jmpbuf(png)), ==, 0);
+
+  png_init_io(png, output);
+  png_set_IHDR(png,
+               info,
+               4,
+               3,
+               bit_depth,
+               color_type,
+               interlace_type,
+               PNG_COMPRESSION_TYPE_BASE,
+               PNG_FILTER_TYPE_BASE);
+
+  if (color_type == PNG_COLOR_TYPE_PALETTE) {
+    png_color palette[] = {
+      {.red = 255, .green = 0, .blue = 0},
+      {.red = 0, .green = 255, .blue = 0},
+      {.red = 0, .green = 0, .blue = 255},
+      {.red = 255, .green = 255, .blue = 255},
+    };
+    png_set_PLTE(png, info, palette, G_N_ELEMENTS(palette));
+  }
+
+  guint8 animation_control[] = {
+    0, 0, 0, 1,
+    0, 0, 0, 0,
+  };
+  png_write_info(png, info);
+  if (animated_marker) {
+    static const png_byte chunk_name[] = "acTL";
+    png_write_chunk(png,
+                    chunk_name,
+                    animation_control,
+                    sizeof(animation_control));
+  }
+
+  guint components;
+  switch (color_type) {
+  case PNG_COLOR_TYPE_GRAY:
+  case PNG_COLOR_TYPE_PALETTE:
+    components = 1;
+    break;
+  case PNG_COLOR_TYPE_GRAY_ALPHA:
+    components = 2;
+    break;
+  case PNG_COLOR_TYPE_RGB:
+    components = 3;
+    break;
+  case PNG_COLOR_TYPE_RGB_ALPHA:
+    components = 4;
+    break;
+  default:
+    g_assert_not_reached();
+  }
+
+  const guint row_bytes =
+    bit_depth < 8
+      ? (4u * (guint)bit_depth + 7u) / 8u
+      : 4 * components * (bit_depth / 8);
+  guint8 pixels[3 * 4 * 4 * 2] = {0};
+  png_bytep rows[3];
+  for (guint y = 0; y < 3; y++) {
+    rows[y] = pixels + y * row_bytes;
+    for (guint x = 0; x < row_bytes; x++) {
+      rows[y][x] =
+        color_type == PNG_COLOR_TYPE_PALETTE
+          ? (guint8)((x + y) % 4)
+          : (guint8)(17 + y * 53 + x * 29);
+    }
+  }
   png_write_image(png, rows);
   png_write_end(png, NULL);
   png_destroy_write_struct(&png, &info);
@@ -501,6 +643,250 @@ test_embedded_profiles_and_render(void)
   g_assert_cmpint(g_remove(jpeg_path), ==, 0);
   g_assert_cmpint(g_remove(png_path), ==, 0);
   g_assert_cmpint(g_remove(gray_jpeg_path), ==, 0);
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
+test_png_edit_capabilities(void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-png-capabilities-XXXXXX", &error);
+  g_assert_no_error(error);
+
+  struct {
+    const gchar *name;
+    gint bit_depth;
+    gint color_type;
+    gint interlace_type;
+    gboolean animated;
+    gboolean editable;
+  } cases[] = {
+    {"gray8.png", 8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE, FALSE, TRUE},
+    {"gray-alpha8.png",
+     8,
+     PNG_COLOR_TYPE_GRAY_ALPHA,
+     PNG_INTERLACE_NONE,
+     FALSE,
+     TRUE},
+    {"rgb8.png", 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, FALSE, TRUE},
+    {"rgba8.png",
+     8,
+     PNG_COLOR_TYPE_RGB_ALPHA,
+     PNG_INTERLACE_NONE,
+     FALSE,
+     TRUE},
+    {"palette8.png",
+     8,
+     PNG_COLOR_TYPE_PALETTE,
+     PNG_INTERLACE_NONE,
+     FALSE,
+     FALSE},
+    {"gray4.png", 4, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE, FALSE, FALSE},
+    {"rgb16.png", 16, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, FALSE, FALSE},
+    {"interlaced-rgb8.png",
+     8,
+     PNG_COLOR_TYPE_RGB,
+     PNG_INTERLACE_ADAM7,
+     FALSE,
+     FALSE},
+    {"animated-rgba8.png",
+     8,
+     PNG_COLOR_TYPE_RGB_ALPHA,
+     PNG_INTERLACE_NONE,
+     TRUE,
+     FALSE},
+  };
+
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+  for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+    g_autofree gchar *path =
+      g_build_filename(directory, cases[i].name, NULL);
+    write_test_png_variant(path,
+                           cases[i].bit_depth,
+                           cases[i].color_type,
+                           cases[i].interlace_type,
+                           cases[i].animated);
+    g_autoptr(LoslesImage) image = load_path(registry, path);
+    g_assert_cmpint(losles_image_supports_lossless_rotation(image),
+                    ==,
+                    cases[i].editable);
+    g_assert_cmpint(losles_image_supports_lossless_crop(image),
+                    ==,
+                    cases[i].editable);
+
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(image));
+    g_assert_true(losles_format_supports_lossless_rotation(format));
+    g_assert_true(losles_format_supports_lossless_crop(format));
+    if (cases[i].editable) {
+      g_autofree gchar *rotated_name =
+        g_strdup_printf("rotated-%s", cases[i].name);
+      g_autofree gchar *rotated_path =
+        g_build_filename(directory, rotated_name, NULL);
+      g_autoptr(GFile) rotated_file =
+        g_file_new_for_path(rotated_path);
+      g_assert_true(losles_format_rotate_lossless(format,
+                                                  image,
+                                                  rotated_file,
+                                                  LOSLES_ROTATE_RIGHT,
+                                                  NULL,
+                                                  &error));
+      g_assert_no_error(error);
+      g_autoptr(LoslesImage) rotated =
+        load_path(registry, rotated_path);
+      g_assert_cmpuint(losles_image_get_width(rotated), ==, 3);
+      g_assert_cmpuint(losles_image_get_height(rotated), ==, 4);
+      g_assert_cmpint(g_remove(rotated_path), ==, 0);
+    } else {
+      g_autoptr(GFile) source_file = g_file_new_for_path(path);
+      g_assert_false(losles_format_rotate_lossless(format,
+                                                   image,
+                                                   source_file,
+                                                   LOSLES_ROTATE_RIGHT,
+                                                   NULL,
+                                                   &error));
+      g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
+      g_clear_error(&error);
+    }
+    g_assert_cmpint(g_remove(path), ==, 0);
+  }
+
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
+test_lossless_png_operations(void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-png-operations-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_autofree gchar *png_path =
+    g_build_filename(directory, "png-in-place.png", NULL);
+  g_autoptr(GBytes) profile = make_srgb_profile();
+  write_test_png(png_path, profile);
+
+  g_autoptr(GBytes) original_metadata =
+    read_png_metadata_chunks(png_path);
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+  g_autoptr(LoslesImage) original = load_path(registry, png_path);
+  g_assert_true(losles_image_supports_lossless_rotation(original));
+  g_assert_true(losles_image_supports_lossless_crop(original));
+  LoslesFormat *format =
+    LOSLES_FORMAT(losles_image_get_format(original));
+  g_autoptr(GFile) file = g_file_new_for_path(png_path);
+
+  g_assert_true(losles_format_rotate_lossless(format,
+                                              original,
+                                              file,
+                                              LOSLES_ROTATE_RIGHT,
+                                              NULL,
+                                              &error));
+  g_assert_no_error(error);
+
+  g_autofree gchar *trashed_path =
+    g_build_filename(test_data_home,
+                     "Trash",
+                     "files",
+                     "png-in-place.png",
+                     NULL);
+  g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+
+  g_autoptr(LoslesImage) rotated = load_path(registry, png_path);
+  g_assert_cmpuint(losles_image_get_width(rotated), ==, 2);
+  g_assert_cmpuint(losles_image_get_height(rotated), ==, 3);
+  g_assert_true(g_bytes_equal(losles_image_get_icc_profile(rotated),
+                              profile));
+  const guint8 expected_rotated[] = {
+    255, 255, 255, 64, 255, 0, 0, 255,
+    128, 128, 128, 32, 0, 255, 0, 192,
+    0, 0, 0, 0, 0, 0, 255, 128,
+  };
+  gsize rotated_pixels_size = 0;
+  const guint8 *rotated_pixels =
+    g_bytes_get_data(losles_image_get_pixels(rotated),
+                     &rotated_pixels_size);
+  g_assert_cmpmem(rotated_pixels,
+                  rotated_pixels_size,
+                  expected_rotated,
+                  sizeof(expected_rotated));
+  g_autoptr(GBytes) rotated_metadata =
+    read_png_metadata_chunks(png_path);
+  g_assert_true(g_bytes_equal(rotated_metadata, original_metadata));
+
+  g_autofree gchar *rotated_contents = NULL;
+  gsize rotated_size = 0;
+  g_assert_true(g_file_get_contents(png_path,
+                                    &rotated_contents,
+                                    &rotated_size,
+                                    &error));
+  g_assert_no_error(error);
+
+  LoslesCrop requested = {.x = 0, .y = 1, .width = 2, .height = 2};
+  LoslesCrop adjusted = {0};
+  format = LOSLES_FORMAT(losles_image_get_format(rotated));
+  g_assert_true(losles_format_adjust_crop(format,
+                                          rotated,
+                                          &requested,
+                                          &adjusted,
+                                          &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(adjusted.x, ==, requested.x);
+  g_assert_cmpuint(adjusted.y, ==, requested.y);
+  g_assert_cmpuint(adjusted.width, ==, requested.width);
+  g_assert_cmpuint(adjusted.height, ==, requested.height);
+  g_assert_true(losles_format_crop_lossless(format,
+                                            rotated,
+                                            file,
+                                            &adjusted,
+                                            NULL,
+                                            &error));
+  g_assert_no_error(error);
+
+  g_autoptr(LoslesImage) cropped = load_path(registry, png_path);
+  g_assert_cmpuint(losles_image_get_width(cropped), ==, 2);
+  g_assert_cmpuint(losles_image_get_height(cropped), ==, 2);
+  const guint8 expected_cropped[] = {
+    128, 128, 128, 32, 0, 255, 0, 192,
+    0, 0, 0, 0, 0, 0, 255, 128,
+  };
+  gsize cropped_pixels_size = 0;
+  const guint8 *cropped_pixels =
+    g_bytes_get_data(losles_image_get_pixels(cropped),
+                     &cropped_pixels_size);
+  g_assert_cmpmem(cropped_pixels,
+                  cropped_pixels_size,
+                  expected_cropped,
+                  sizeof(expected_cropped));
+  g_autoptr(GBytes) cropped_metadata =
+    read_png_metadata_chunks(png_path);
+  g_assert_true(g_bytes_equal(cropped_metadata, original_metadata));
+
+  g_assert_true(g_file_test(trashed_path, G_FILE_TEST_IS_REGULAR));
+  g_autofree gchar *trashed_contents = NULL;
+  gsize trashed_size = 0;
+  g_assert_true(g_file_get_contents(trashed_path,
+                                    &trashed_contents,
+                                    &trashed_size,
+                                    &error));
+  g_assert_no_error(error);
+  g_assert_cmpmem(trashed_contents,
+                  trashed_size,
+                  rotated_contents,
+                  rotated_size);
+
+  g_autofree gchar *trash_info_path =
+    g_build_filename(test_data_home,
+                     "Trash",
+                     "info",
+                     "png-in-place.png.trashinfo",
+                     NULL);
+  g_assert_cmpint(g_remove(png_path), ==, 0);
+  g_assert_cmpint(g_remove(trashed_path), ==, 0);
+  g_assert_cmpint(g_remove(trash_info_path), ==, 0);
   g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
@@ -1199,6 +1585,10 @@ main(int argc, char **argv)
   g_test_init(&argc, &argv, NULL);
   g_test_add_func("/formats/embedded-profiles-and-render",
                   test_embedded_profiles_and_render);
+  g_test_add_func("/formats/png-edit-capabilities",
+                  test_png_edit_capabilities);
+  g_test_add_func("/formats/lossless-png-operations",
+                  test_lossless_png_operations);
   g_test_add_func("/formats/lossless-jpeg-operations",
                   test_lossless_jpeg_operations);
   g_test_add_func("/formats/in-place-rotation-overwrites-source",

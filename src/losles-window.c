@@ -2145,12 +2145,15 @@ update_controls(LoslesWindow *self)
   if (has_image) {
     LoslesFormat *format =
       LOSLES_FORMAT(losles_image_get_format(self->current_image));
-    rotation = losles_format_supports_lossless_rotation(format);
+    rotation = losles_format_supports_lossless_rotation(format) &&
+               losles_image_supports_lossless_rotation(
+                 self->current_image);
     normalize_orientation =
       losles_format_supports_lossless_orientation_normalization(format) &&
       losles_image_has_exif_orientation(self->current_image) &&
       losles_image_get_orientation(self->current_image) != 1;
     crop = losles_format_supports_lossless_crop(format) &&
+           losles_image_supports_lossless_crop(self->current_image) &&
            losles_image_get_orientation(self->current_image) == 1;
   }
 
@@ -2360,7 +2363,7 @@ losles_window_init(LoslesWindow *self)
   gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
                            "crop-symbolic");
   gtk_widget_set_tooltip_text(GTK_WIDGET(self->crop_button),
-                              "Lossless JPEG crop "
+                              "Lossless crop "
                               "(C; original goes to Trash)");
   gtk_widget_add_css_class(GTK_WIDGET(self->crop_button), "flat");
   gtk_header_bar_pack_end(self->header_bar,

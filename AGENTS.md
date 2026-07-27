@@ -51,6 +51,10 @@ them:
   COM, or unrecognized APP markers. Ordinary rotation retains EXIF
   orientation. Only the explicit Normalize action may bake it into the
   coefficients and set the existing orientation tag to `1`.
+- Editable PNGs must retain every original chunk other than the necessarily
+  regenerated `IHDR` and `IDAT` chunks byte-for-byte and in order. Never
+  reduce sample precision or silently convert a view-only PNG into the
+  editable subset.
 - Image formats stay behind the `LoslesFormat` module interface so adding a
   decoder/editor does not require format-specific logic in the window or color
   manager.
@@ -66,14 +70,16 @@ them:
 - PNG ICC: `iCCP`.
 - Orientation: all eight JPEG EXIF orientation values are displayed.
 - Editing: coefficient-level JPEG rotation, EXIF-orientation normalization,
-  and MCU-aligned JPEG crop through libturbojpeg.
+  and MCU-aligned JPEG crop through libturbojpeg; pixel-lossless rotation and
+  exact-pixel crop for static, non-interlaced, direct-color 8-bit PNGs.
 - Display color: selected/default colord profile for the window's current
   monitor, with a built-in sRGB output fallback.
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
 
-Important current exclusions include CMYK/YCCK JPEG display, PNG editing,
-16-bit display buffers, HDR, animations, and zoom/pan controls.
+Important current exclusions include CMYK/YCCK JPEG display, editing of
+palette/sub-8-bit/16-bit/interlaced/animated PNGs, 16-bit display buffers,
+HDR, animations, and zoom/pan controls.
 
 ## Toolchain and dependencies
 
@@ -183,7 +189,7 @@ color manager logs connector names, lookup failures, and the selected profile.
 │       ├── losles-jpeg-metadata.[ch]
 │       │                         Minimal EXIF orientation reader/writer
 │       └── losles-png-format.[ch]
-│                                 PNG decoder and iCCP extraction
+│                                 PNG decode, iCCP, capability checks, editing
 └── tests/
     ├── test-jpeg-metadata.c     Endian/orientation parser tests
     └── test-formats.c           Decode, ICC, transform, Trash, invalid data
@@ -215,8 +221,9 @@ The editing pipeline is:
 
 ```text
 LoslesImage + requested transform
-  -> format-specific TurboJPEG operation in a worker
-  -> transformed temporary file with JPEG marker metadata retained
+  -> format-specific JPEG coefficient transform or PNG sample transform
+     in a worker
+  -> transformed temporary file with format metadata retained
   -> rotation: overwrite original path, without a Trash entry
   -> orientation normalization: rewrite the existing tag to 1, then overwrite
      the original path without a Trash entry
@@ -226,10 +233,11 @@ LoslesImage + requested transform
 
 `LoslesImage` stores decoded pixels in encoded-file orientation, the embedded
 ICC bytes, effective EXIF orientation, whether a valid EXIF orientation tag
-was actually present, JPEG MCU dimensions, a format label, and a strong
-reference to the format object which created it. Keep it format-neutral. The
-presence flag is necessary because absent orientation and a stored value of
-`1` have the same effective rendering but different UI semantics.
+was actually present, per-image rotation/crop capability flags, JPEG MCU
+dimensions, a format label, and a strong reference to the format object which
+created it. Keep it format-neutral. The presence flag is necessary because
+absent orientation and a stored value of `1` have the same effective rendering
+but different UI semantics.
 
 `LoslesRenderedImage` stores pixels after color conversion and orientation.
 Its output is RGB8 or RGBA8 even when the source is gray. It also records the
@@ -254,6 +262,12 @@ different: it uses filename suffixes only. A supported extension can therefore
 appear in navigation and later fail magic/decode validation; a valid image
 with an unknown extension can be opened directly but is not discovered as a
 neighbor.
+
+Format-interface capability queries describe whether a module implements an
+operation at all. `LoslesImage` separately carries whether the particular
+encoded file is eligible. `losles-window.c` requires both before enabling
+Rotate or Crop. Keep per-file encoding checks in the format module; do not add
+PNG or JPEG name checks to the window.
 
 When adding a format:
 
@@ -357,9 +371,31 @@ fields.
 - PNG `sRGB`, `gAMA`, and `cHRM` chunks are not synthesized into a source
   profile. Without `iCCP`, RGB is assumed sRGB and gray is assumed D65
   gamma 2.2 by the color manager.
-- Editing callbacks intentionally return unsupported. Pixel-lossless PNG
-  recompression is not enough until sample depth and relevant ancillary
-  metadata can be preserved deliberately.
+- Rotation and crop are enabled only when the encoded source is static,
+  non-interlaced, bit depth 8, and one of grayscale, grayscale-alpha, RGB, or
+  RGBA. Palette color, grayscale depths 1/2/4, depth 16, Adam7 interlacing,
+  and files containing `acTL`, `fcTL`, or `fdAT` stay view-only.
+- The capability is recorded on `LoslesImage` during load and is revalidated
+  against the current file immediately before an edit, because the file can
+  change on disk while open.
+- Editing decodes the original samples without the viewer's palette,
+  precision, or transparency expansions. It rotates or subsets 1–4 byte
+  pixels, then libpng recompresses the unchanged 8-bit sample values.
+- The container writer replaces only `IHDR` and all `IDAT` chunks. It copies
+  every other original chunk, its CRC, its relative position, and any bytes
+  trailing `IEND` unchanged. This deliberately retains `iCCP`, `eXIf`, text,
+  `pHYs`, and unknown ancillary metadata. Dimension-dependent metadata is not
+  regenerated and can therefore describe the pre-edit image.
+- PNG crop has no block-alignment constraint; `adjust_crop` clips the requested
+  right/bottom edges to the image and otherwise preserves exact pixel
+  coordinates.
+- Rotation uses the same overwrite/no-Trash policy as JPEG. In-place crop uses
+  the same exact-original-to-Trash and safety-backup policy.
+
+JPEG and PNG currently have format-local implementations of the temporary
+file/install transaction. Their safety behavior must remain equivalent:
+changes to regular-file/symlink checks, permissions, cancellation, Trash,
+backup, restore, or cleanup logic need review and tests for both modules.
 
 ## ICC and display-color model
 
@@ -507,9 +543,10 @@ double-click or `Alt+Enter`.
 
 The crop overlay maps between the contained picture rectangle and display
 pixel coordinates. Crop is disabled unless EXIF orientation is `1`, so those
-coordinates currently equal encoded JPEG coordinates. If oriented cropping
-is implemented, a real display-to-source coordinate transform is required;
-simply enabling the button will crop the wrong area for orientations 2–8.
+coordinates currently equal encoded JPEG or PNG coordinates. If oriented
+cropping is implemented, a real display-to-source coordinate transform is
+required; simply enabling the button will crop the wrong area for
+orientations 2–8.
 
 Crop interaction is a small state machine (`CropDragMode`). Hit testing is
 performed in widget coordinates with a fixed screen-space tolerance so narrow
@@ -597,6 +634,11 @@ fixtures at runtime and checks:
 - JPEG EXIF orientation dimensions;
 - PNG alpha preservation;
 - grayscale JPEG/profile handling;
+- PNG edit capability gating across direct-color 8-bit, palette, low-bit,
+  16-bit, interlaced, and animated fixtures;
+- PNG rotation/crop pixel results and byte-preservation of ancillary chunks;
+- PNG rotation with no Trash entry and PNG crop with the exact original in
+  Trash;
 - coefficient JPEG rotation and crop plus ICC preservation;
 - in-place rotation overwrite with no system-Trash entry;
 - in-place crop replacement and isolated system-Trash preservation;
@@ -646,7 +688,10 @@ correctness based only on an sRGB-to-sRGB unit test.
   every failure path, except for a safety backup explicitly retained after an
   unrecoverable replacement failure.
 - Do not weaken `TJXOPT_PERFECT` merely to make more rotations succeed.
-- Do not label an 8-bit decode/re-encode path as lossless.
+- Do not label a transform that reduces the source sample depth, changes
+  sample values, or discards metadata as lossless. Recompressing PNG samples
+  at their original precision is pixel-lossless; lossy JPEG pixels must never
+  be decoded and re-encoded for an advertised lossless edit.
 
 The Makefile carries `-Wno-pedantic` because GTK 4.14's public
 `gdkdmabufformats.h` contains an extra top-level semicolon. It otherwise
@@ -670,10 +715,13 @@ the supported GTK baseline no longer needs it.
   fallback; this is reported as an assumed profile in the information OSD.
 - PNG 16-bit samples and non-iCCP color chunks are not preserved in the view
   pipeline.
+- PNG editing intentionally excludes palette, sub-8-bit, 16-bit, Adam7, and
+  animated files. PNG recompression is pixel-lossless but is not expected to
+  reproduce identical `IDAT` bytes.
 - JPEG marker metadata is retained byte-for-byte except for the intentional
   orientation-tag rewrite during normalization, but dimension-dependent
   metadata is not regenerated after coefficient edits.
-- Viewing may use any `GFile` that GIO can load, but lossless JPEG editing
+- Viewing may use any `GFile` that GIO can load, but lossless JPEG/PNG editing
   requires local filesystem paths.
 - There is no file watching, thumbnail view, recursive scanning, recent-files
   list, settings persistence, or plugin loading at runtime.
