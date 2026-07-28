@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file is the technical handoff for AI agents working on Losles. It applies
+This file is the technical handoff for AI agents working on losles. It applies
 to the entire repository. Read it together with `README.md` before changing
 the project.
 
@@ -26,7 +26,7 @@ this root file rather than silently contradicting it.
 
 ## Product intent and non-negotiable properties
 
-Losles is a small, responsive, color-managed photo viewer aimed at Ubuntu
+losles is a small, responsive, color-managed photo viewer aimed at Ubuntu
 24.04 and later. The current release is `0.1.0`, the code is MIT-licensed, and
 the implementation is deliberately C17 with GTK 4 rather than a
 runtime-heavy application stack.
@@ -124,10 +124,10 @@ make test
 
 The Makefile uses `pkg-config`, generates header dependency files, and keeps
 all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
-`applicationsdir`, `metainfodir`, `localedir`, `DESTDIR`, `BUILD_DIR`,
-`CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE` overrides. Use a distinct
-`BUILD_DIR` after changing compiler/sanitizer modes because Make does not
-record command-line flag changes:
+`applicationsdir`, `metainfodir`, `icondir`, `localedir`, `DESTDIR`,
+`BUILD_DIR`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE` overrides. Use a
+distinct `BUILD_DIR` after changing compiler/sanitizer modes because Make does
+not record command-line flag changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -171,10 +171,13 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
 ├── data/
-│   ├── io.github.losles.Losles.desktop
-│   └── io.github.losles.Losles.metainfo.xml
+│   ├── icons/hicolor/512x512/apps/
+│   │   └── io.github.develancer.Losles.png
+│   ├── io.github.develancer.Losles.desktop
+│   └── io.github.develancer.Losles.metainfo.xml
 ├── src/
 │   ├── main.c                   Locale setup and GApplication entry point
+│   ├── losles-config.h          App ID, name, version, repository placeholder
 │   ├── losles-application.[ch]  Single-window app, open handling, shortcuts
 │   ├── losles-window.[ch]       UI, directory scan, jobs, caches, editing flow
 │   ├── losles-image.[ch]        Immutable decoded-source model
@@ -197,12 +200,13 @@ color manager logs connector names, lookup failures, and the selected profile.
     └── test-formats.c           Decode, ICC, transform, Trash, invalid data
 ```
 
-The `io.github.losles.Losles` name is the current application ID and therefore
+The `io.github.develancer.Losles` name is the current application ID and therefore
 appears in C, the desktop filename/content, and AppStream metadata. It is
-provisional naming, not evidence of an existing GitHub organization. If the
-ID changes, update all references together and rename both installed metadata
-files. The desktop entry currently uses the system's generic
-`image-x-generic` icon; there is no checked-in custom icon.
+derived from the upstream GitHub account. If the ID changes, update all
+references together and rename both installed metadata files and the icon.
+The application icon is a checked-in 512×512 PNG named after this ID in the
+standard hicolor `apps` directory. The desktop entry uses the same unqualified
+icon name so GNOME can resolve the installed asset.
 
 ## End-to-end architecture
 
@@ -342,7 +346,7 @@ a same-directory hard-link safety backup (falling back to a
 metadata-preserving copy), moves the exact original with `g_file_trash()`, and
 then moves the cropped file into the original path. Cancellation is
 deliberately ignored during this final crop commit phase. If installation
-fails after trashing, Losles tries to restore the safety backup; the error
+fails after trashing, losles tries to restore the safety backup; the error
 identifies the backup path if automatic restoration also fails. Never replace
 the crop sequence with unlinking or direct truncation.
 
@@ -354,7 +358,7 @@ the format method in the UI, change the operation to lossy pixel cropping, or
 silently discard edge pixels.
 
 TurboJPEG preserves JPEG COM and APP markers. Except for the explicit
-orientation-value rewrite during normalization, Losles does not selectively
+orientation-value rewrite during normalization, losles does not selectively
 rewrite them, so ICC, EXIF, XMP, IPTC, comments, maker-specific metadata, and
 unknown APP markers remain. This means semantic dimension fields and embedded
 thumbnails are retained but are not regenerated after a crop, quarter-turn
@@ -401,7 +405,7 @@ backup, restore, or cleanup logic need review and tests for both modules.
 
 ## ICC and display-color model
 
-Ubuntu 24.04's GTK 4.14 cannot attach an ICC colorspace to a surface. Losles
+Ubuntu 24.04's GTK 4.14 cannot attach an ICC colorspace to a surface. losles
 therefore uses application-managed display conversion:
 
 1. Find the `GdkMonitor` containing the window surface.
@@ -414,7 +418,7 @@ therefore uses application-managed display conversion:
 
 This avoids a Mutter-specific protocol and is the intentional Ubuntu 24.04 SDR
 path. VCGT calibration curves remain the desktop color service's job and must
-not be applied again in Losles.
+not be applied again in losles.
 
 The LittleCMS transform uses perceptual intent, black-point compensation, and
 alpha copying. Orientation is applied while transformed rows are copied into
@@ -535,7 +539,13 @@ Current actions and shortcuts:
   `1`, and overwrites without creating a Trash entry;
 - lossless crop in place: toggle, drag a new selection, move it from its
   interior, or resize it from any edge/corner, then Crop; the original goes to
-  Trash before the cropped replacement is installed.
+  Trash before the cropped replacement is installed;
+- About: a header-bar `dialog-question-symbolic` button opens a modal GTK
+  About dialog with the application icon, version, copyright holder, MIT
+  license, and source-repository link. Creator and license text deliberately
+  lives in the main comments/copyright fields; do not set GTK's `authors` or
+  `license-type` properties unless separate Credits/License pages are wanted
+  again.
 
 Fullscreen hides the header bar and its controls. Keep
 `notify::fullscreened` as the source of truth so the header is restored even
@@ -646,13 +656,26 @@ the application.
 
 Files in `data/` are installed desktop integration, not runtime source:
 
-- `.desktop` makes Losles appear in launchers and associates JPEG/PNG MIME
+- `.desktop` makes losles appear in launchers and associates JPEG/PNG MIME
   types;
-- `.metainfo.xml` supplies AppStream/software-center metadata.
+- `.metainfo.xml` supplies AppStream/software-center metadata;
+- `icons/hicolor/512x512/apps/io.github.develancer.Losles.png` is installed
+  under the matching hicolor theme path.
 
-There is currently no icon installation, GResource bundle, translation
-catalog, settings schema, or preferences storage. `LOCALEDIR` is defined for
-the C target but currently unused; strings are hard-coded English.
+`src/losles-config.h` is the canonical C-side location for the application
+ID, display name, version, and repository URL. Keep the repository URL there
+and in AppStream metadata synchronized.
+
+The Makefile embeds both source-tree and installed icon paths. The former
+lets a directly run `build/losles` load its own toplevel and About-dialog icon
+before installation; the latter keeps an installed binary independent of the
+source tree. On platforms that ignore per-toplevel icons (notably some
+Wayland paths), GNOME associates the window through the matching
+`GtkApplication`/desktop ID and finds the installed hicolor icon.
+
+There is currently no GResource bundle, translation catalog, settings schema,
+or preferences storage. `LOCALEDIR` is defined for the C target but currently
+unused; strings are hard-coded English.
 
 ## Tests and verification expectations
 

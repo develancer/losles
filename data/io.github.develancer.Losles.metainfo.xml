@@ -1,24 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.losles.Losles</id>
-  <name>Losles</name>
+  <id>io.github.develancer.Losles</id>
+  <name>losles</name>
   <summary>Color-managed lossless photo viewer</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <description>
     <p>
-      Losles is a lightweight photo viewer with embedded and display ICC
-      profile support and lossless JPEG crop and rotation.
+      losles is a lightweight photo viewer with embedded and display ICC
+      profile support and lossless crop and rotation.
     </p>
   </description>
-  <launchable type="desktop-id">io.github.losles.Losles.desktop</launchable>
+  <launchable type="desktop-id">io.github.develancer.Losles.desktop</launchable>
+  <url type="homepage">https://github.com/develancer/losles</url>
   <provides>
     <binary>losles</binary>
     <mediatype>image/jpeg</mediatype>
     <mediatype>image/png</mediatype>
   </provides>
-  <developer id="io.github.losles">
-    <name>losles contributors</name>
+  <developer id="io.github.develancer">
+    <name>Piotr T. Różański</name>
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>

@@ -3,6 +3,7 @@
 #include "formats/losles-format-registry.h"
 #include "formats/losles-format.h"
 #include "losles-color-manager.h"
+#include "losles-config.h"
 #include "losles-image.h"
 #include "losles-rendered-image.h"
 
@@ -120,6 +121,8 @@ struct _LoslesWindow {
   GtkToggleButton *info_button;
   GtkToggleButton *crop_button;
   GtkButton *apply_crop_button;
+  GtkWindow *about_dialog;
+  GdkTexture *application_icon;
 
   GPtrArray *files;
   guint current_index;
@@ -2455,6 +2458,12 @@ window_mapped(GtkWidget *widget, LoslesWindow *self)
   if (!self->monitor_signals_connected) {
     GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(self));
     if (surface) {
+      if (self->application_icon && GDK_IS_TOPLEVEL(surface)) {
+        GList *icons =
+          g_list_prepend(NULL, self->application_icon);
+        gdk_toplevel_set_icon_list(GDK_TOPLEVEL(surface), icons);
+        g_list_free(icons);
+      }
       g_signal_connect_object(surface,
                               "enter-monitor",
                               G_CALLBACK(monitor_changed),
@@ -2538,6 +2547,70 @@ icon_button(const gchar *icon_name, const gchar *tooltip)
   return button;
 }
 
+static GdkTexture *
+load_application_icon(void)
+{
+  const gchar *paths[] = {
+    LOSLES_SOURCE_ICON_FILE,
+    LOSLES_INSTALLED_ICON_FILE,
+    NULL,
+  };
+
+  for (guint i = 0; paths[i]; i++) {
+    if (!paths[i][0] || !g_file_test(paths[i], G_FILE_TEST_IS_REGULAR))
+      continue;
+
+    g_autoptr(GError) error = NULL;
+    GdkTexture *texture =
+      gdk_texture_new_from_filename(paths[i], &error);
+    if (texture)
+      return texture;
+
+    g_warning("Could not load application icon %s: %s",
+              paths[i],
+              error->message);
+  }
+
+  return NULL;
+}
+
+static void
+show_about_dialog(LoslesWindow *self)
+{
+  if (self->about_dialog) {
+    gtk_window_present(self->about_dialog);
+    return;
+  }
+
+  GtkAboutDialog *about = GTK_ABOUT_DIALOG(gtk_about_dialog_new());
+  self->about_dialog = GTK_WINDOW(about);
+  g_object_add_weak_pointer(G_OBJECT(about),
+                            (gpointer *)&self->about_dialog);
+
+  gtk_window_set_transient_for(GTK_WINDOW(about), GTK_WINDOW(self));
+  gtk_window_set_modal(GTK_WINDOW(about), TRUE);
+  gtk_window_set_destroy_with_parent(GTK_WINDOW(about), TRUE);
+  gtk_about_dialog_set_program_name(about, LOSLES_APPLICATION_NAME);
+  gtk_about_dialog_set_version(about, LOSLES_VERSION);
+  gtk_about_dialog_set_comments(
+    about,
+    "A lightweight, color-managed photo viewer for lossless image "
+    "operations, licensed under the MIT License.");
+  gtk_about_dialog_set_copyright(
+    about,
+    "Copyright © 2026 Piotr T. Różański");
+  gtk_about_dialog_set_website(about, LOSLES_REPOSITORY_URL);
+  gtk_about_dialog_set_website_label(about, "Source repository");
+  if (self->application_icon)
+    gtk_about_dialog_set_logo(
+      about,
+      GDK_PAINTABLE(self->application_icon));
+  else
+    gtk_about_dialog_set_logo_icon_name(about, LOSLES_APPLICATION_ID);
+
+  gtk_window_present(GTK_WINDOW(about));
+}
+
 static void
 losles_window_dispose(GObject *object)
 {
@@ -2547,8 +2620,16 @@ losles_window_dispose(GObject *object)
     g_cancellable_cancel(self->load_cancellable);
   if (self->render_cancellable)
     g_cancellable_cancel(self->render_cancellable);
+  if (self->about_dialog) {
+    g_object_remove_weak_pointer(
+      G_OBJECT(self->about_dialog),
+      (gpointer *)&self->about_dialog);
+    gtk_window_destroy(self->about_dialog);
+    self->about_dialog = NULL;
+  }
   g_clear_object(&self->load_cancellable);
   g_clear_object(&self->render_cancellable);
+  g_clear_object(&self->application_icon);
   g_clear_object(&self->current_texture);
   g_clear_object(&self->current_image);
   g_clear_pointer(&self->files, g_ptr_array_unref);
@@ -2601,9 +2682,10 @@ losles_window_init(LoslesWindow *self)
   self->zoom_scale = 1.0;
   self->zoom_center_x = 0.5;
   self->zoom_center_y = 0.5;
+  self->application_icon = load_application_icon();
 
   gtk_window_set_default_size(GTK_WINDOW(self), 960, 700);
-  gtk_window_set_title(GTK_WINDOW(self), "losles");
+  gtk_window_set_title(GTK_WINDOW(self), LOSLES_APPLICATION_NAME);
   gtk_widget_add_css_class(GTK_WIDGET(self), "losles-window");
 
   GtkCssProvider *css_provider = gtk_css_provider_new();
@@ -2656,6 +2738,15 @@ losles_window_init(LoslesWindow *self)
                            G_CALLBACK(next_image),
                            self);
 
+  GtkButton *about_button =
+    GTK_BUTTON(icon_button("dialog-question-symbolic", "About losles"));
+  gtk_header_bar_pack_end(self->header_bar,
+                          GTK_WIDGET(about_button));
+  g_signal_connect_swapped(about_button,
+                           "clicked",
+                           G_CALLBACK(show_about_dialog),
+                           self);
+
   self->rotate_left_button =
     GTK_BUTTON(icon_button("object-rotate-left-symbolic",
                            "Lossless rotate left"));
@@ -2692,20 +2783,6 @@ losles_window_init(LoslesWindow *self)
                    G_CALLBACK(normalize_orientation_clicked),
                    self);
 
-  self->info_button =
-    GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
-  gtk_button_set_icon_name(GTK_BUTTON(self->info_button),
-                           "dialog-information-symbolic");
-  gtk_widget_set_tooltip_text(GTK_WIDGET(self->info_button),
-                              "Show image information (I)");
-  gtk_widget_add_css_class(GTK_WIDGET(self->info_button), "flat");
-  gtk_header_bar_pack_end(self->header_bar,
-                          GTK_WIDGET(self->info_button));
-  g_signal_connect(self->info_button,
-                   "toggled",
-                   G_CALLBACK(info_toggled),
-                   self);
-
   self->crop_button =
     GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
   gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
@@ -2719,6 +2796,20 @@ losles_window_init(LoslesWindow *self)
   g_signal_connect(self->crop_button,
                    "toggled",
                    G_CALLBACK(crop_toggled),
+                   self);
+
+  self->info_button =
+    GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
+  gtk_button_set_icon_name(GTK_BUTTON(self->info_button),
+                           "dialog-information-symbolic");
+  gtk_widget_set_tooltip_text(GTK_WIDGET(self->info_button),
+                              "Show image information (I)");
+  gtk_widget_add_css_class(GTK_WIDGET(self->info_button), "flat");
+  gtk_header_bar_pack_end(self->header_bar,
+                          GTK_WIDGET(self->info_button));
+  g_signal_connect(self->info_button,
+                   "toggled",
+                   G_CALLBACK(info_toggled),
                    self);
 
   self->apply_crop_button =

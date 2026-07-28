@@ -1,7 +1,7 @@
 # losles
 
-Losles is a small, color-managed photo viewer for Ubuntu 24.04 and later. It
-currently displays JPEG and PNG files and performs lossless rotation and
+**losles** is a small, color-managed photo viewer for Ubuntu 24.04 and later.
+It currently displays JPEG and PNG files and performs lossless rotation and
 cropping for JPEGs and common 8-bit PNG encodings.
 
 The application is deliberately written in C17. On Ubuntu this avoids a
@@ -9,6 +9,13 @@ language runtime, an async executor, and format frameworks that would overlap
 with functionality losles needs to control itself. GTK 4 supplies the native
 desktop integration, LittleCMS performs color conversion, libjpeg-turbo and
 libpng decode pixels, and colord supplies the selected monitor profile.
+
+## Why losles?
+
+Because every other photo viewer was missing something I considered a
+must-have, while providing a lot of clutter I did not need. This one focuses
+on ICC profile support, lossless operations, speed (pre-loading),
+and not much more.
 
 ## What works
 
@@ -30,7 +37,7 @@ libpng decode pixels, and colord supplies the selected monitor profile.
 - Explicit lossless EXIF-orientation normalization: the displayed orientation
   is baked into JPEG coefficients and the existing orientation tag is set to
   `1`.
-- Fast previous/next navigation. Losles decodes and color-converts up to two
+- Fast previous/next navigation. losles decodes and color-converts up to two
   images on either side in the background. Decoded sources and
   display-profile textures have separate 512 MiB cache limits, with at most
   two background decodes and two background color conversions at once.
@@ -93,7 +100,7 @@ JPEG transforms operate on DCT coefficients through libturbojpeg, not by
 decoding and re-encoding pixels. JPEG marker metadata is copied without
 selectively rewriting or discarding fields. Ordinary left/right rotation
 retains the original EXIF orientation tag. For mirrored EXIF orientations,
-Losles reverses the raw coefficient direction so that the result still rotates
+losles reverses the raw coefficient direction so that the result still rotates
 in the direction requested on screen. A right rotation followed by a left
 rotation is byte-identical for the supported perfect-transform path.
 
@@ -103,10 +110,10 @@ orientation to the coefficients and changes the existing tag to `1`, without
 changing the displayed image. Its tooltip explains whether a non-default
 orientation is present. Like ordinary rotation, normalization overwrites the
 source without creating a Trash backup. This explicit action is useful for
-software that ignores EXIF orientation and enables Losles cropping afterward.
+software that ignores EXIF orientation and enables losles cropping afterward.
 
 JPEG crop coordinates must start on an MCU boundary. While the rectangle is
-drawn, moved, or resized, Losles snaps it to the format module's nearest legal
+drawn, moved, or resized, losles snaps it to the format module's nearest legal
 boundaries. The visible rectangle is therefore the rectangle that will be
 applied; clicking Crop does not perform a second hidden expansion. A transform
 is refused when a mathematically perfect result is impossible; losles does not
@@ -161,19 +168,24 @@ non-default EXIF orientation into the JPEG coefficients and set the tag to
 `1`. The image keeps the same visual orientation, and the operation is
 coefficient-lossless.
 
-Press `Delete` to move the current image to the system Trash. Losles then
+Press `Delete` to move the current image to the system Trash. losles then
 opens the next image in directory order when one exists. If there is no next
 image, it clears the browsing session and displays “No picture opened.”
 
 An image file can also be opened by dragging its file icon from Nautilus onto
-the Losles window. A multi-file drop opens the first file. File drops are
+the losles window. A multi-file drop opens the first file. File drops are
 rejected while Crop mode or another file operation is active. After an
-accepted drop, Losles takes keyboard focus so its navigation and other
+accepted drop, losles takes keyboard focus so its navigation and other
 shortcuts work immediately.
+
+The question-mark About button in the header bar opens a single-page window
+with application, version, creator, license, and source-repository
+information, with a link to
+`https://github.com/develancer/losles`.
 
 ## Color-management model on Ubuntu 24.04
 
-Losles does not depend on Mutter's newer color-management protocol. GTK 4.14
+losles does not depend on Mutter's newer color-management protocol. GTK 4.14
 on Ubuntu 24.04 cannot attach an ICC colorspace to a surface, so losles uses
 the established application-managed path:
 
@@ -200,7 +212,13 @@ preconverting them; otherwise conversion could be applied twice.
 ## Source layout
 
 ```text
+data/
+  icons/hicolor/512x512/apps/
+    io.github.develancer.Losles.png  installed application icon
+  io.github.develancer.Losles.desktop
+  io.github.develancer.Losles.metainfo.xml
 src/
+  losles-config.h             application identity, version, and repository URL
   losles-window.c             UI, navigation, two-level cache, background jobs
   losles-color-manager.c      colord lookup and LittleCMS transforms
   losles-image.c              format-neutral decoded image

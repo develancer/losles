@@ -1,4 +1,4 @@
-# Losles GNU Make build.
+# losles GNU Make build.
 #
 # Common commands:
 #   make
@@ -22,7 +22,14 @@ bindir ?= $(prefix)/bin
 datadir ?= $(prefix)/share
 applicationsdir ?= $(datadir)/applications
 metainfodir ?= $(datadir)/metainfo
+icondir ?= $(datadir)/icons/hicolor/512x512/apps
 localedir ?= $(datadir)/locale
+
+APPLICATION_ID := io.github.develancer.Losles
+APPLICATION_ICON := \
+	data/icons/hicolor/512x512/apps/$(APPLICATION_ID).png
+DESKTOP_FILE := data/$(APPLICATION_ID).desktop
+METAINFO_FILE := data/$(APPLICATION_ID).metainfo.xml
 
 PACKAGES := gtk4 lcms2 libjpeg libturbojpeg libpng colord
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
@@ -33,6 +40,8 @@ override CFLAGS += -std=c17 -Wall -Wextra -Wformat=2 -Wno-pedantic
 override CPPFLAGS += \
 	-Isrc \
 	-DLOCALEDIR=\"$(localedir)\" \
+	-DLOSLES_SOURCE_ICON_FILE=\"$(abspath $(APPLICATION_ICON))\" \
+	-DLOSLES_INSTALLED_ICON_FILE=\"$(icondir)/$(APPLICATION_ID).png\" \
 	-DG_LOG_DOMAIN=\"losles\" \
 	-DG_LOG_USE_STRUCTURED=1
 
@@ -81,7 +90,7 @@ TEST_PROGRAMS := $(JPEG_METADATA_TEST) $(FORMAT_TEST)
 
 .PHONY: all check check-deps clean help install run test
 
-all: $(APP)
+all: $(APP) $(APPLICATION_ICON)
 
 check: test
 
@@ -113,17 +122,21 @@ test: $(TEST_PROGRAMS)
 run: $(APP)
 	$(APP) $(ARGS)
 
-install: $(APP)
+install: $(APP) $(APPLICATION_ICON)
 	$(INSTALL) -d "$(DESTDIR)$(bindir)"
 	$(INSTALL) -m 0755 "$(APP)" "$(DESTDIR)$(bindir)/losles"
 	$(INSTALL) -d "$(DESTDIR)$(applicationsdir)"
 	$(INSTALL) -m 0644 \
-		data/io.github.losles.Losles.desktop \
-		"$(DESTDIR)$(applicationsdir)/io.github.losles.Losles.desktop"
+		"$(DESKTOP_FILE)" \
+		"$(DESTDIR)$(applicationsdir)/$(APPLICATION_ID).desktop"
 	$(INSTALL) -d "$(DESTDIR)$(metainfodir)"
 	$(INSTALL) -m 0644 \
-		data/io.github.losles.Losles.metainfo.xml \
-		"$(DESTDIR)$(metainfodir)/io.github.losles.Losles.metainfo.xml"
+		"$(METAINFO_FILE)" \
+		"$(DESTDIR)$(metainfodir)/$(APPLICATION_ID).metainfo.xml"
+	$(INSTALL) -d "$(DESTDIR)$(icondir)"
+	$(INSTALL) -m 0644 \
+		"$(APPLICATION_ICON)" \
+		"$(DESTDIR)$(icondir)/$(APPLICATION_ID).png"
 
 clean:
 	@build_path="$(abspath $(BUILD_DIR))"; \
@@ -135,7 +148,7 @@ clean:
 	$(RM) -r -- "$$build_path"
 
 help:
-	@echo "Losles GNU Make targets:"
+	@echo "losles GNU Make targets:"
 	@echo "  all       Build $(APP) (default)"
 	@echo "  test      Build and run both test programs"
 	@echo "  check     Alias for test"

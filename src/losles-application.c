@@ -1,5 +1,6 @@
 #include "losles-application.h"
 
+#include "losles-config.h"
 #include "losles-window.h"
 
 struct _LoslesApplication {
@@ -88,7 +89,7 @@ losles_application_new(void)
 {
   return g_object_new(LOSLES_TYPE_APPLICATION,
                       "application-id",
-                      "io.github.losles.Losles",
+                      LOSLES_APPLICATION_ID,
                       "flags",
                       G_APPLICATION_HANDLES_OPEN,
                       NULL);
