@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="data/icons/hicolor/512x512/apps/io.github.develancer.Losles.png"
+       alt="losles icon"
+       width="160">
+</p>
+
 # losles
 
 **losles** is a small, color-managed photo viewer for Ubuntu 24.04 and later.
