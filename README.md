@@ -46,8 +46,8 @@ and not much more.
 - Fast previous/next navigation. losles decodes and color-converts up to five
   images on either side in the background, prioritizing nearby images and the
   current navigation direction. Decoded sources and display-profile textures
-  have separate 512 MiB cache limits, with at most two background decodes and
-  two background color conversions at once.
+  have separate cache limits of 10% of total system memory each, with at most
+  two background decodes and two background color conversions at once.
 - A format-module interface. JPEG and PNG are separate GObject
   implementations, so another decoder/editor does not need changes to the
   window or color pipeline.

@@ -1,5 +1,12 @@
 #include "losles-cache-policy.h"
 
+gsize
+losles_cache_policy_limit_for_memory(guint64 total_memory_bytes)
+{
+  const guint64 limit = total_memory_bytes / 10;
+  return limit > G_MAXSIZE ? G_MAXSIZE : (gsize)limit;
+}
+
 static gboolean
 visit_offset(guint current_index,
              guint n_items,

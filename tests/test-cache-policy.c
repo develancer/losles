@@ -2,6 +2,26 @@
 
 #include "losles-cache-policy.h"
 
+static void
+test_memory_limit(void)
+{
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(0), ==, 0);
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(9), ==, 0);
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(10), ==, 1);
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(1009), ==, 100);
+
+  const guint64 sixteen_gib =
+    G_GUINT64_CONSTANT(16) * 1024 * 1024 * 1024;
+  const guint64 expected = sixteen_gib / 10;
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(sixteen_gib),
+                   ==,
+                   MIN(expected, (guint64)G_MAXSIZE));
+
+  g_assert_cmpuint(losles_cache_policy_limit_for_memory(G_MAXUINT64),
+                   ==,
+                   MIN(G_MAXUINT64 / 10, (guint64)G_MAXSIZE));
+}
+
 static gboolean
 collect_index(guint index, gpointer user_data)
 {
@@ -271,6 +291,7 @@ int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, NULL);
+  g_test_add_func("/cache-policy/memory-limit", test_memory_limit);
   g_test_add_func("/cache-policy/preload-order", test_preload_order);
   g_test_add_func("/cache-policy/preload-boundaries",
                   test_preload_boundaries);

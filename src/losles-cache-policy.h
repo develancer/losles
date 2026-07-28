@@ -8,6 +8,12 @@ typedef gboolean (*LoslesCacheIndexFunc)(guint index, gpointer user_data);
 typedef gsize (*LoslesCacheIndexSizeFunc)(guint index, gpointer user_data);
 
 /*
+ * Return ten percent of total_memory_bytes, truncated to whole bytes and
+ * clamped to the addressable gsize range.
+ */
+gsize losles_cache_policy_limit_for_memory(guint64 total_memory_bytes);
+
+/*
  * Visit eligible neighbors nearest-first. At each distance, the side selected
  * by direction is visited first. Iteration stops when func returns FALSE.
  */

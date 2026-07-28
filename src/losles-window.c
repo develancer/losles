@@ -8,8 +8,10 @@
 #include "losles-image.h"
 #include "losles-rendered-image.h"
 
-#define SOURCE_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
-#define RENDER_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
+#include <errno.h>
+#include <sys/sysinfo.h>
+
+#define CACHE_LIMIT_FALLBACK ((gsize)512 * 1024 * 1024)
 #define PRELOAD_DISTANCE 5
 #define MAX_CONCURRENT_DECODES 2
 #define MAX_CONCURRENT_RENDERS 2
@@ -143,6 +145,7 @@ struct _LoslesWindow {
   GHashTable *decode_failed;
   GHashTable *decode_capacity_blocked;
   gsize cache_size;
+  gsize source_cache_limit;
   guint generation;
 
   GHashTable *render_cache;
@@ -150,6 +153,7 @@ struct _LoslesWindow {
   GHashTable *render_failed;
   GHashTable *render_capacity_blocked;
   gsize render_cache_size;
+  gsize render_cache_limit;
   guint render_generation;
   gint navigation_direction;
 
@@ -426,6 +430,40 @@ reset_zoom(LoslesWindow *self)
   apply_zoom_layout(self);
 }
 
+static gsize
+detect_cache_limit(void)
+{
+  struct sysinfo info = {0};
+  if (sysinfo(&info) != 0) {
+    g_warning("Could not determine total system memory: %s; "
+              "using a 512 MiB cache limit",
+              g_strerror(errno));
+    return CACHE_LIMIT_FALLBACK;
+  }
+
+  guint64 total_memory = info.totalram;
+  if (info.mem_unit > 0 &&
+      total_memory > G_MAXUINT64 / info.mem_unit)
+    total_memory = G_MAXUINT64;
+  else
+    total_memory *= info.mem_unit;
+
+  if (total_memory == 0) {
+    g_warning("The system reported zero bytes of memory; "
+              "using a 512 MiB cache limit");
+    return CACHE_LIMIT_FALLBACK;
+  }
+
+  const gsize limit =
+    losles_cache_policy_limit_for_memory(total_memory);
+  g_debug("Cache capacity is %" G_GSIZE_FORMAT
+          " bytes per cache (10%% of %" G_GUINT64_FORMAT
+          " bytes of system memory)",
+          limit,
+          total_memory);
+  return limit;
+}
+
 static void
 clear_current_image(LoslesWindow *self)
 {
@@ -457,7 +495,7 @@ cache_kind_state(LoslesWindow *self, CacheKind kind)
       .entries = self->cache,
       .capacity_blocked = self->decode_capacity_blocked,
       .size = &self->cache_size,
-      .limit = SOURCE_CACHE_LIMIT,
+      .limit = self->source_cache_limit,
     };
   }
 
@@ -465,7 +503,7 @@ cache_kind_state(LoslesWindow *self, CacheKind kind)
     .entries = self->render_cache,
     .capacity_blocked = self->render_capacity_blocked,
     .size = &self->render_cache_size,
-    .limit = RENDER_CACHE_LIMIT,
+    .limit = self->render_cache_limit,
   };
 }
 
@@ -2858,6 +2896,9 @@ losles_window_class_init(LoslesWindowClass *klass)
 static void
 losles_window_init(LoslesWindow *self)
 {
+  const gsize cache_limit = detect_cache_limit();
+  self->source_cache_limit = cache_limit;
+  self->render_cache_limit = cache_limit;
   self->registry = losles_format_registry_new();
   self->color_manager = losles_color_manager_new();
   self->files =

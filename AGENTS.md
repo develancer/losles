@@ -476,8 +476,16 @@ Directory/navigation behavior:
 
 Two independent caches are keyed by the file URI:
 
-- decoded `LoslesImage` cache: 512 MiB;
-- display-profile `LoslesRenderedImage`/texture cache: 512 MiB.
+- decoded `LoslesImage` cache: 10% of total system memory;
+- display-profile `LoslesRenderedImage`/texture cache: 10% of total system
+  memory.
+
+`losles_window_init()` reads Linux `sysinfo().totalram` once per window,
+including its `mem_unit` multiplier, and gives both caches the resulting
+independent 10% soft limit. Overflow is clamped to `G_MAXSIZE`. If the kernel
+query fails or reports zero memory, each cache falls back to 512 MiB.
+`losles_cache_policy_limit_for_memory()` owns the tested percentage and
+clamping arithmetic; keep operating-system discovery out of the policy helper.
 
 Each cache is eligible to retain the current image and up to five neighbors on
 either side, for at most eleven entries per cache before memory pressure is
@@ -505,8 +513,8 @@ always retries either kind of suppressed URI.
 The size limits account primarily for pixel `GBytes`. They do not fully model
 the transient whole encoded file, object/hash overhead, GTK texture resources,
 or possible graphics-driver copies. Actual process memory can therefore exceed
-1 GiB. A foreground image is allowed even if it exceeds a nominal cache limit;
-neighbors are pruned around it.
+20% of total system memory. A foreground image is allowed even if it exceeds a
+nominal cache limit; neighbors are pruned around it.
 
 Async correctness relies on these rules:
 
@@ -729,10 +737,10 @@ unused; strings are hard-coded English.
 
 ## Tests and verification expectations
 
-`test-cache-policy` checks boundary handling, direction-aware preload and
-eviction order, early callback termination, priority-preserving admission,
-non-destructive capacity rejection, out-of-window rejection, and the
-foreground soft limit.
+`test-cache-policy` checks the 10%-of-memory calculation and address-size
+clamping, boundary handling, direction-aware preload and eviction order,
+early callback termination, priority-preserving admission, non-destructive
+capacity rejection, out-of-window rejection, and the foreground soft limit.
 
 `test-jpeg-metadata` checks little-endian, big-endian, stored value `1`,
 absent EXIF orientation, and in-file tag rewriting. `test-formats` creates
@@ -811,8 +819,9 @@ the supported GTK baseline no longer needs it.
 - The registry temporarily holds the complete encoded file in memory in
   addition to the decoded result. Very large compressed images can cause a
   substantial peak.
-- The cache budgets are compile-time constants in `losles-window.c`; there is
-  no user preference or adaptive memory policy.
+- Cache budgets are based on total system memory measured when the window is
+  created; they do not adapt to changing memory pressure and there is no user
+  preference.
 - Display buffers are always 8-bit; wide-gamut ICC support does not imply
   high-bit-depth or HDR output.
 - The colord path depends on connector metadata matching
