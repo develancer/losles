@@ -229,8 +229,10 @@ non-default EXIF orientation into the JPEG coefficients and set the tag to
 coefficient-lossless.
 
 Press `Delete` to move the current image to the system Trash. losles then
-opens the next image in directory order when one exists. If there is no next
-image, it clears the browsing session and displays “No picture opened.”
+opens the next image in directory order when one exists. When the deleted
+image was last, it opens the preceding image, which is now last. It clears the
+browsing session and displays “No picture opened” only when the directory has
+no supported images left.
 
 An image file can also be opened by dragging its file icon from Nautilus onto
 the losles window. A multi-file drop opens the first file. File drops are
@@ -242,6 +244,13 @@ The question-mark About button in the header bar opens a single-page window
 with application, version, creator, license, and source-repository
 information, with a link to
 `https://github.com/develancer/losles`.
+
+When opening or navigating to another image, losles keeps the currently
+displayed image on screen with a large centered loading spinner until the new
+image has been decoded and color-converted. The initial load uses the black
+canvas because no previous image is available. If both the decoded image and
+its display-profile-converted texture are already cached, losles switches to
+it immediately without showing the spinner.
 
 ## Color-management model on Ubuntu 24.04
 

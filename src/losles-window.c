@@ -20,6 +20,7 @@
 #define CROP_MIN_SIZE 2.0
 #define ZOOM_STEP 1.25
 #define ZOOM_MAX 16.0
+#define LOADING_SPINNER_SIZE 64
 
 typedef struct {
   LoslesFormatRegistry *registry;
@@ -164,6 +165,8 @@ struct _LoslesWindow {
 
   gboolean monitor_signals_connected;
   gboolean operation_in_progress;
+  gboolean foreground_loading;
+  gboolean reset_zoom_on_next_display;
   gdouble zoom_scale;
   gdouble zoom_center_x;
   gdouble zoom_center_y;
@@ -467,6 +470,8 @@ detect_cache_limit(void)
 static void
 clear_current_image(LoslesWindow *self)
 {
+  self->foreground_loading = FALSE;
+  self->reset_zoom_on_next_display = FALSE;
   g_clear_object(&self->current_image);
   g_clear_object(&self->current_texture);
   gtk_picture_set_paintable(self->picture, NULL);
@@ -474,6 +479,26 @@ clear_current_image(LoslesWindow *self)
   self->crop_valid = FALSE;
   gtk_toggle_button_set_active(self->crop_button, FALSE);
   gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  update_controls(self);
+}
+
+static void
+prepare_for_image_load(LoslesWindow *self)
+{
+  /*
+   * The decoded source belongs to the newly selected file, while the texture
+   * may keep showing the previous file until the replacement is ready.
+   * Keeping those states separate avoids a black flash without permitting an
+   * edit to act on a file other than the one visible in the window.
+   */
+  self->foreground_loading = TRUE;
+  self->reset_zoom_on_next_display = TRUE;
+  g_clear_object(&self->current_image);
+  self->zoom_dragging = FALSE;
+  self->crop_valid = FALSE;
+  gtk_toggle_button_set_active(self->crop_button, FALSE);
+  gtk_widget_queue_draw(GTK_WIDGET(self->crop_area));
+  update_zoom_cursor(self);
   update_controls(self);
 }
 
@@ -820,6 +845,7 @@ load_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   if (!image) {
     g_hash_table_add(self->decode_failed, g_strdup(job->uri));
     if (is_current_file(self, job->file)) {
+      clear_current_image(self);
       gtk_spinner_stop(self->spinner);
       gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
       show_error(self, "Could not open the image", error);
@@ -835,13 +861,10 @@ load_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   const gboolean foreground = is_current_file(self, job->file);
   const gboolean cached =
     cache_image(self, job->uri, image, foreground);
-  if (foreground) {
-    gtk_spinner_stop(self->spinner);
-    gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+  if (foreground)
     set_current_image(self, image);
-  } else if (cached) {
+  else if (cached)
     start_render_for_image(self, image, FALSE);
-  }
   preload_neighbors(self);
 }
 
@@ -1134,7 +1157,12 @@ display_rendered_image(LoslesWindow *self,
       losles_rendered_image_create_texture(rendered);
   gtk_picture_set_paintable(self->picture,
                             GDK_PAINTABLE(self->current_texture));
-  apply_zoom_layout(self);
+  if (self->reset_zoom_on_next_display)
+    reset_zoom(self);
+  else
+    apply_zoom_layout(self);
+  self->reset_zoom_on_next_display = FALSE;
+  self->foreground_loading = FALSE;
 
   const LoslesPixelFormat source_format =
     losles_image_get_pixel_format(image);
@@ -1157,6 +1185,7 @@ display_rendered_image(LoslesWindow *self,
                       ? " (no display profile found)"
                       : "");
   set_status(self, status);
+  update_controls(self);
 }
 
 static void
@@ -1180,6 +1209,7 @@ render_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
     g_hash_table_add(self->render_failed, g_strdup(job->uri));
     if (foreground &&
         !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+      clear_current_image(self);
       gtk_spinner_stop(self->spinner);
       gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
       show_error(self, "Could not color-manage the image", error);
@@ -1232,9 +1262,11 @@ start_render_for_image(LoslesWindow *self,
 
   if (g_hash_table_contains(self->render_inflight, uri)) {
     if (foreground) {
+      self->foreground_loading = TRUE;
       gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
       gtk_spinner_start(self->spinner);
       set_status(self, "Finishing prefetched color conversion…");
+      update_controls(self);
     }
     return;
   }
@@ -1257,15 +1289,21 @@ start_render_for_image(LoslesWindow *self,
     losles_color_manager_get_target(self->color_manager,
                                     current_monitor(self));
   if (!target) {
-    if (foreground)
+    if (foreground) {
+      clear_current_image(self);
+      gtk_spinner_stop(self->spinner);
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
       set_status(self, "No usable display color profile");
+    }
     return;
   }
 
   if (foreground) {
+    self->foreground_loading = TRUE;
     gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
     gtk_spinner_start(self->spinner);
     set_status(self, "Converting to the active display profile…");
+    update_controls(self);
   }
 
   RenderJob *job = g_new0(RenderJob, 1);
@@ -1335,9 +1373,6 @@ invalidate_render_cache(LoslesWindow *self)
   g_hash_table_remove_all(self->render_capacity_blocked);
   g_hash_table_remove_all(self->render_cache);
   self->render_cache_size = 0;
-  g_clear_object(&self->current_texture);
-  gtk_picture_set_paintable(self->picture, NULL);
-  apply_zoom_layout(self);
 }
 
 static void
@@ -1426,11 +1461,24 @@ show_index(LoslesWindow *self, guint index)
 
   GFile *file = current_file(self);
   update_title(self, file);
-  clear_current_image(self);
-  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
-  gtk_spinner_start(self->spinner);
-  set_status(self, "Loading…");
-  start_load(self, file, TRUE);
+  prepare_for_image_load(self);
+  g_autofree gchar *uri = file_uri(file);
+  LoslesImage *cached_image =
+    g_hash_table_lookup(self->cache, uri);
+  RenderCacheEntry *cached_render =
+    g_hash_table_lookup(self->render_cache, uri);
+  if (cached_image && cached_render) {
+    g_set_object(&self->current_image, cached_image);
+    display_rendered_image(self,
+                           cached_image,
+                           cached_render->rendered,
+                           cached_render->texture);
+  } else {
+    gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+    gtk_spinner_start(self->spinner);
+    set_status(self, "Loading…");
+    start_load(self, file, TRUE);
+  }
   update_controls(self);
   preload_neighbors(self);
 }
@@ -2071,7 +2119,9 @@ start_edit(LoslesWindow *self,
            LoslesRotation rotation,
            const LoslesCrop *crop)
 {
-  if (self->operation_in_progress || !self->current_image)
+  if (self->operation_in_progress ||
+      self->foreground_loading ||
+      !self->current_image)
     return;
 
   EditJob *job = g_new0(EditJob, 1);
@@ -2107,7 +2157,9 @@ rotate_clicked(GtkButton *button, LoslesWindow *self)
     button == self->rotate_left_button
       ? LOSLES_ROTATE_LEFT
       : LOSLES_ROTATE_RIGHT;
-  if (!self->current_image || self->operation_in_progress)
+  if (!self->current_image ||
+      self->operation_in_progress ||
+      self->foreground_loading)
     return;
   start_edit(self,
              losles_image_get_file(self->current_image),
@@ -2120,7 +2172,9 @@ static void
 normalize_orientation_clicked(GtkButton *button, LoslesWindow *self)
 {
   (void)button;
-  if (!self->current_image || self->operation_in_progress)
+  if (!self->current_image ||
+      self->operation_in_progress ||
+      self->foreground_loading)
     return;
   start_edit(self,
              losles_image_get_file(self->current_image),
@@ -2149,6 +2203,7 @@ apply_crop_clicked(GtkButton *button, LoslesWindow *self)
 {
   (void)button;
   if (self->operation_in_progress ||
+      self->foreground_loading ||
       !self->current_image ||
       !self->crop_valid)
     return;
@@ -2175,7 +2230,7 @@ apply_crop_clicked(GtkButton *button, LoslesWindow *self)
 }
 
 static gint
-find_deleted_file_successor(DeleteJob *job, GPtrArray *files)
+find_file_after_delete(DeleteJob *job, GPtrArray *files)
 {
   if (!files || files->len == 0)
     return -1;
@@ -2196,7 +2251,12 @@ find_deleted_file_successor(DeleteJob *job, GPtrArray *files)
         g_utf8_collate(candidate_name, deleted_name) > 0)
       return (gint)i;
   }
-  return -1;
+
+  /*
+   * No later image remains, so the deleted image was last relative to the
+   * rescan. Continue with its predecessor, which is now the final entry.
+   */
+  return (gint)files->len - 1;
 }
 
 static void
@@ -2228,7 +2288,7 @@ delete_done(GObject *source_object,
   }
 
   const gint next_index =
-    find_deleted_file_successor(job, delete_result->files);
+    find_file_after_delete(job, delete_result->files);
   if (next_index < 0) {
     reset_content_pipeline(self);
     show_no_picture(self);
@@ -2246,7 +2306,10 @@ static void
 delete_current_image(LoslesWindow *self)
 {
   GFile *file = current_file(self);
-  if (self->operation_in_progress || !self->current_image || !file)
+  if (self->operation_in_progress ||
+      self->foreground_loading ||
+      !self->current_image ||
+      !file)
     return;
 
   DeleteJob *job = g_new0(DeleteJob, 1);
@@ -2731,7 +2794,8 @@ static void
 update_controls(LoslesWindow *self)
 {
   const gboolean idle = !self->operation_in_progress;
-  const gboolean has_image = self->current_image != NULL && idle;
+  const gboolean has_image =
+    self->current_image != NULL && idle && !self->foreground_loading;
   gboolean rotation = FALSE;
   gboolean normalize_orientation = FALSE;
   gboolean crop = FALSE;
@@ -2949,6 +3013,9 @@ losles_window_init(LoslesWindow *self)
     "  padding: 4px 8px;"
     "  border-radius: 0;"
     "  box-shadow: none;"
+    "}"
+    "spinner.losles-loading-spinner {"
+    "  color: #ffffff;"
     "}");
   gtk_style_context_add_provider_for_display(
     gtk_widget_get_display(GTK_WIDGET(self)),
@@ -3193,9 +3260,14 @@ losles_window_init(LoslesWindow *self)
                    self);
 
   self->spinner = GTK_SPINNER(gtk_spinner_new());
+  gtk_widget_set_size_request(GTK_WIDGET(self->spinner),
+                              LOADING_SPINNER_SIZE,
+                              LOADING_SPINNER_SIZE);
   gtk_widget_set_halign(GTK_WIDGET(self->spinner), GTK_ALIGN_CENTER);
   gtk_widget_set_valign(GTK_WIDGET(self->spinner), GTK_ALIGN_CENTER);
   gtk_widget_set_can_target(GTK_WIDGET(self->spinner), FALSE);
+  gtk_widget_add_css_class(GTK_WIDGET(self->spinner),
+                           "losles-loading-spinner");
   gtk_overlay_add_overlay(GTK_OVERLAY(overlay),
                           GTK_WIDGET(self->spinner));
 

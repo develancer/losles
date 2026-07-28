@@ -644,6 +644,24 @@ Current actions and shortcuts:
   `license-type` properties unless separate Credits/License pages are wanted
   again.
 
+The centered loading spinner has a fixed 64×64-pixel request and an explicit
+white application-priority color. On navigation, reload, or a new open
+request, the previous `current_texture` remains attached to `GtkPicture` while
+the selected file is decoded and color-converted. `current_image` is cleared
+until the new decode completes, `foreground_loading` keeps edit controls and
+destructive shortcuts disabled through rendering, and
+`reset_zoom_on_next_display` resets zoom only when the replacement texture is
+installed. Thus the old image and its current zoom remain visible under the
+spinner without allowing an operation to target a file other than the one
+shown. The first image still loads over the black canvas because there is no
+texture to retain. Foreground decode/render errors clear the retained display
+rather than leaving a stale image associated with the failed filename. Before
+starting the spinner, `show_index()` checks both the source and rendered caches
+for the selected URI. If both entries exist, it installs the cached image and
+texture synchronously and never enters the visible loading state. A partial
+cache hit still uses the spinner because a decode or display-profile
+conversion remains to be completed.
+
 Fullscreen hides the header bar and its controls. Keep
 `notify::fullscreened` as the source of truth so the header is restored even
 when the window manager changes fullscreen state outside the application
@@ -734,9 +752,9 @@ with unlinking. After Trash succeeds, the same worker rescans the directory.
 The completion callback prefers the successor known before deletion, falling
 back to the first supported filename collating after the deleted filename.
 This matters when the original directory scan had not finished before the
-user pressed Delete. If there is no successor—or if the post-Trash rescan
-fails—the window enters a real empty browsing state rather than navigating
-backward.
+user pressed Delete. If no later filename remains but the rescan is nonempty,
+it selects the final entry, which is the deleted last image's predecessor.
+Only an empty or failed post-Trash rescan enters the no-picture state.
 
 Successful deletion increments both load and render generations and cancels
 inflight work before installing the fresh file list. Completed neighbor
