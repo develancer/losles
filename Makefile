@@ -16,6 +16,15 @@ INSTALL ?= install
 
 BUILD_DIR ?= build
 SANITIZE ?=
+VERSION_SCRIPT := tools/version.sh
+
+ifeq ($(origin VERSION), undefined)
+VERSION := $(shell $(VERSION_SCRIPT))
+endif
+
+ifeq ($(strip $(VERSION)),)
+$(error Could not determine the losles version; set VERSION explicitly)
+endif
 
 prefix ?= /usr/local
 bindir ?= $(prefix)/bin
@@ -30,6 +39,7 @@ APPLICATION_ICON := \
 	data/icons/hicolor/512x512/apps/$(APPLICATION_ID).png
 DESKTOP_FILE := data/$(APPLICATION_ID).desktop
 METAINFO_FILE := data/$(APPLICATION_ID).metainfo.xml
+VERSION_HEADER := $(BUILD_DIR)/generated/losles-version.h
 
 PACKAGES := gtk4 lcms2 libjpeg libturbojpeg libpng colord
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
@@ -39,6 +49,7 @@ CFLAGS ?= -O2 -g
 override CFLAGS += -std=c17 -Wall -Wextra -Wformat=2 -Wno-pedantic
 override CPPFLAGS += \
 	-Isrc \
+	-I$(BUILD_DIR)/generated \
 	-DLOCALEDIR=\"$(localedir)\" \
 	-DLOSLES_SOURCE_ICON_FILE=\"$(abspath $(APPLICATION_ICON))\" \
 	-DLOSLES_INSTALLED_ICON_FILE=\"$(icondir)/$(APPLICATION_ID).png\" \
@@ -98,7 +109,7 @@ TEST_PROGRAMS := \
 	$(FORMAT_TEST) \
 	$(CACHE_POLICY_TEST)
 
-.PHONY: all check check-deps clean help install run test
+.PHONY: all check check-deps clean FORCE help install print-version run test
 
 all: $(APP) $(APPLICATION_ICON)
 
@@ -107,7 +118,21 @@ check: test
 check-deps:
 	@$(PKG_CONFIG) --print-errors --exists $(PACKAGES)
 
-$(ALL_OBJECTS): | check-deps
+$(ALL_OBJECTS): | check-deps $(VERSION_HEADER)
+
+$(VERSION_HEADER): FORCE $(VERSION_SCRIPT)
+	@mkdir -p $(dir $@)
+	@{ \
+	  printf '%s\n' '#pragma once' ''; \
+	  printf '#define LOSLES_VERSION "%s"\n' "$(VERSION)"; \
+	} > "$@.tmp"
+	@if ! cmp -s "$@.tmp" "$@" 2>/dev/null; then \
+	  mv "$@.tmp" "$@"; \
+	else \
+	  $(RM) "$@.tmp"; \
+	fi
+
+FORCE:
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -136,6 +161,9 @@ test: $(TEST_PROGRAMS)
 
 run: $(APP)
 	$(APP) $(ARGS)
+
+print-version:
+	@printf '%s\n' "$(VERSION)"
 
 install: $(APP) $(APPLICATION_ICON)
 	$(INSTALL) -d "$(DESTDIR)$(bindir)"
@@ -167,6 +195,8 @@ help:
 	@echo "  all       Build $(APP) (default)"
 	@echo "  test      Build and run all test programs"
 	@echo "  check     Alias for test"
+	@echo "  print-version"
+	@echo "            Print the version derived from Git"
 	@echo "  run       Run the viewer; pass a file with ARGS=/path/image.jpg"
 	@echo "  install   Install under prefix (default: $(prefix)); honors DESTDIR"
 	@echo "  clean     Remove BUILD_DIR (default: $(BUILD_DIR))"
@@ -175,6 +205,7 @@ help:
 	@echo "  BUILD_DIR=build-name"
 	@echo "  CFLAGS='-O0 -g3'"
 	@echo "  SANITIZE=address,undefined"
+	@echo "  VERSION=2026.07.1 (for builds without Git metadata)"
 	@echo "  prefix=/usr"
 
 -include $(DEPENDENCY_FILES)

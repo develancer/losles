@@ -92,6 +92,37 @@ make BUILD_DIR=build-asan \
 
 Run `make help` for the available targets and overrides.
 
+## Versioning and tagged builds
+
+losles uses calendar versions—and matching Git release tags—in the form
+`YYYY.MM.N`, where `N` starts at `1` and counts releases made in that month:
+
+```text
+2026.07.1
+2026.07.2
+2026.08.1
+```
+
+The build obtains its version from Git. An exact clean release tag produces
+`2026.07.1`; later commits produce a version such as
+`2026.07.1+3.g1a2b3c4d5e6f`, and a modified worktree adds `.dirty`. A checkout
+with no reachable release tag uses `0+untagged.g<commit>`. Use
+`make print-version` to see the value that will be compiled into the About
+window.
+
+Builds without Git metadata, such as distribution source packages, can
+provide the version explicitly:
+
+```sh
+make VERSION=2026.07.1
+```
+
+The GitHub Actions tagged-build workflow runs only for pushed tags matching
+the release-tag shape. It validates the month and release counter, compiles
+and tests on Ubuntu 24.04, stages an installation under `/usr`, and uploads
+that tree as a workflow artifact. AppStream release history is intentionally
+omitted: the Git tags are the project's canonical release record.
+
 ## Lossless editing semantics
 
 Rotation and crop are applied in place as soon as their action button is
@@ -224,8 +255,10 @@ data/
     io.github.develancer.Losles.png  installed application icon
   io.github.develancer.Losles.desktop
   io.github.develancer.Losles.metainfo.xml
+tools/
+  version.sh                  Git tag validation and build-version derivation
 src/
-  losles-config.h             application identity, version, and repository URL
+  losles-config.h             application identity and repository URL
   losles-window.c             UI, navigation, two-level cache, background jobs
   losles-cache-policy.c       cache ordering, admission, and eviction policy
   losles-color-manager.c      colord lookup and LittleCMS transforms

@@ -1,0 +1,63 @@
+name: Tagged build
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Ubuntu 24.04
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate and resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="$(./tools/version.sh --from-tag "$GITHUB_REF_NAME")"
+          build_version="$(make --no-print-directory print-version)"
+          if [[ "$build_version" != "$tag_version" ]]; then
+            echo "Build version '$build_version' does not match tag '$tag_version'." >&2
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            libcolord-dev \
+            libgtk-4-dev \
+            libjpeg-dev \
+            liblcms2-dev \
+            libpng-dev \
+            libturbojpeg0-dev \
+            pkg-config
+
+      - name: Compile
+        run: make -j2 prefix=/usr all
+
+      - name: Run tests
+        run: make -j2 prefix=/usr test
+
+      - name: Stage installation
+        run: make prefix=/usr DESTDIR="$PWD/build/stage" install
+
+      - name: Upload compiled installation tree
+        uses: actions/upload-artifact@v7
+        with:
+          name: losles-${{ steps.version.outputs.version }}-ubuntu-24.04-x86_64
+          path: build/stage/
+          if-no-files-found: error

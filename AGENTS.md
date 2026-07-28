@@ -27,9 +27,9 @@ this root file rather than silently contradicting it.
 ## Product intent and non-negotiable properties
 
 losles is a small, responsive, color-managed photo viewer aimed at Ubuntu
-24.04 and later. The current release is `0.1.0`, the code is MIT-licensed, and
-the implementation is deliberately C17 with GTK 4 rather than a
-runtime-heavy application stack.
+24.04 and later. Releases use `YYYY.MM.N` calendar versions, the code is
+MIT-licensed, and the implementation is deliberately C17 with GTK 4 rather
+than a runtime-heavy application stack.
 
 Preserve these product properties unless the project owner explicitly changes
 them:
@@ -125,9 +125,9 @@ make test
 The Makefile uses `pkg-config`, generates header dependency files, and keeps
 all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
 `applicationsdir`, `metainfodir`, `icondir`, `localedir`, `DESTDIR`,
-`BUILD_DIR`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE` overrides. Use a
-distinct `BUILD_DIR` after changing compiler/sanitizer modes because Make does
-not record command-line flag changes:
+`BUILD_DIR`, `VERSION`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE`
+overrides. Use a distinct `BUILD_DIR` after changing compiler/sanitizer modes
+because Make does not record command-line flag changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -156,6 +156,17 @@ committed. Installation uses the normal Make prefix, `/usr/local` by default:
 make install
 ```
 
+The build version is generated into
+`build/generated/losles-version.h` by `tools/version.sh`. Run
+`make print-version` to inspect it. Release tags must be exactly
+`YYYY.MM.N`: the year has four digits, the month is zero-padded from `01` to
+`12`, and the within-month release counter starts at `1`. A clean commit at
+such a tag gets that plain version. A later commit uses
+`YYYY.MM.N+<distance>.g<hash>`, with `.dirty` appended for tracked worktree
+changes. With no reachable release tag, the result is
+`0+untagged.g<hash>`; outside a Git checkout it is `0+unknown`. Distribution
+builds without `.git` must pass `VERSION=YYYY.MM.N` explicitly.
+
 For a non-privileged installation smoke test, use a temporary `DESTDIR`
 instead of installing into the live system.
 
@@ -170,6 +181,10 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── README.md                    User-facing capabilities and build guide
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
+├── .github/workflows/
+│   └── tagged-build.yml         Tag-only Ubuntu 24.04 build/test/artifact CI
+├── tools/
+│   └── version.sh               CalVer validation and Git version derivation
 ├── data/
 │   ├── icons/hicolor/512x512/apps/
 │   │   └── io.github.develancer.Losles.png
@@ -177,7 +192,7 @@ color manager logs connector names, lookup failures, and the selected profile.
 │   └── io.github.develancer.Losles.metainfo.xml
 ├── src/
 │   ├── main.c                   Locale setup and GApplication entry point
-│   ├── losles-config.h          App ID, name, version, repository URL
+│   ├── losles-config.h          App ID, name, generated version include, URL
 │   ├── losles-application.[ch]  Single-window app, open handling, shortcuts
 │   ├── losles-cache-policy.[ch] Cache ordering, admission, and eviction
 │   ├── losles-window.[ch]       UI, directory scan, jobs, caches, editing flow
@@ -686,8 +701,20 @@ Files in `data/` are installed desktop integration, not runtime source:
   under the matching hicolor theme path.
 
 `src/losles-config.h` is the canonical C-side location for the application
-ID, display name, version, and repository URL. Keep the repository URL there
-and in AppStream metadata synchronized.
+ID, display name, and repository URL. It includes the generated
+`losles-version.h` for the build version. Keep the repository URL in the
+config header and AppStream metadata synchronized.
+
+The GitHub Actions workflow is deliberately release-only: branch pushes and
+pull requests do not trigger it. GitHub's tag filter selects the
+`YYYY.MM.N` shape, and `tools/version.sh --from-tag` applies the stricter
+month and nonzero-counter validation before dependencies are installed. The
+workflow checks that Git-derived and triggering-tag versions agree, builds
+and tests on Ubuntu 24.04, stages `prefix=/usr`, and uploads the staged tree.
+Keep `fetch-depth: 0`, because development-version derivation needs tag
+history. The AppStream file intentionally has no `<releases>` list: Git tags
+are the canonical release history, while the installed metadata remains valid
+without duplicating that history.
 
 The Makefile embeds both source-tree and installed icon paths. The former
 lets a directly run `build/losles` load its own toplevel and About-dialog icon

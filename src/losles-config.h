@@ -1,8 +1,9 @@
 #pragma once
 
+#include "losles-version.h"
+
 #define LOSLES_APPLICATION_ID "io.github.develancer.Losles"
 #define LOSLES_APPLICATION_NAME "losles"
-#define LOSLES_VERSION "0.1.0"
 #define LOSLES_REPOSITORY_URL "https://github.com/develancer/losles"
 
 #ifndef LOSLES_SOURCE_ICON_FILE
