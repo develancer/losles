@@ -33,13 +33,17 @@ applicationsdir ?= $(datadir)/applications
 metainfodir ?= $(datadir)/metainfo
 icondir ?= $(datadir)/icons/hicolor/512x512/apps
 localedir ?= $(datadir)/locale
+mandir ?= $(datadir)/man
+man1dir ?= $(mandir)/man1
 
-APPLICATION_ID := io.github.develancer.Losles
+APPLICATION_ID := io.github.develancer.losles
 APPLICATION_ICON := \
 	data/icons/hicolor/512x512/apps/$(APPLICATION_ID).png
 DESKTOP_FILE := data/$(APPLICATION_ID).desktop
 METAINFO_FILE := data/$(APPLICATION_ID).metainfo.xml
+MANPAGE := data/losles.1
 VERSION_HEADER := $(BUILD_DIR)/generated/losles-version.h
+SOURCE_ICON_FILE ?= $(abspath $(APPLICATION_ICON))
 
 PACKAGES := gtk4 lcms2 libjpeg libturbojpeg libpng colord
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PACKAGES) 2>/dev/null)
@@ -51,7 +55,7 @@ override CPPFLAGS += \
 	-Isrc \
 	-I$(BUILD_DIR)/generated \
 	-DLOCALEDIR=\"$(localedir)\" \
-	-DLOSLES_SOURCE_ICON_FILE=\"$(abspath $(APPLICATION_ICON))\" \
+	-DLOSLES_SOURCE_ICON_FILE=\"$(SOURCE_ICON_FILE)\" \
 	-DLOSLES_INSTALLED_ICON_FILE=\"$(icondir)/$(APPLICATION_ID).png\" \
 	-DG_LOG_DOMAIN=\"losles\" \
 	-DG_LOG_USE_STRUCTURED=1
@@ -180,6 +184,8 @@ install: $(APP) $(APPLICATION_ICON)
 	$(INSTALL) -m 0644 \
 		"$(APPLICATION_ICON)" \
 		"$(DESTDIR)$(icondir)/$(APPLICATION_ID).png"
+	$(INSTALL) -d "$(DESTDIR)$(man1dir)"
+	$(INSTALL) -m 0644 "$(MANPAGE)" "$(DESTDIR)$(man1dir)/losles.1"
 
 clean:
 	@build_path="$(abspath $(BUILD_DIR))"; \

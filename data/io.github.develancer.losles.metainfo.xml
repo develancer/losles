@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Piotr T. Różański
+  SPDX-License-Identifier: CC0-1.0
+-->
 <component type="desktop-application">
-  <id>io.github.develancer.Losles</id>
+  <id>io.github.develancer.losles</id>
   <name>losles</name>
   <summary>Color-managed lossless photo viewer</summary>
   <metadata_license>CC0-1.0</metadata_license>
@@ -11,7 +15,7 @@
       profile support and lossless crop and rotation.
     </p>
   </description>
-  <launchable type="desktop-id">io.github.develancer.Losles.desktop</launchable>
+  <launchable type="desktop-id">io.github.develancer.losles.desktop</launchable>
   <url type="homepage">https://github.com/develancer/losles</url>
   <provides>
     <binary>losles</binary>

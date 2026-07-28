@@ -37,27 +37,81 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends \
+            appstream \
             build-essential \
+            debhelper \
+            desktop-file-utils \
+            devscripts \
+            dpkg-dev \
+            fakeroot \
             libcolord-dev \
             libgtk-4-dev \
             libjpeg-dev \
             liblcms2-dev \
             libpng-dev \
             libturbojpeg0-dev \
-            pkg-config
+            lintian \
+            pkgconf
 
       - name: Compile
-        run: make -j2 prefix=/usr all
+        run: make -j2 SOURCE_ICON_FILE= prefix=/usr all
 
       - name: Run tests
-        run: make -j2 prefix=/usr test
+        run: make -j2 SOURCE_ICON_FILE= prefix=/usr test
 
       - name: Stage installation
-        run: make prefix=/usr DESTDIR="$PWD/build/stage" install
+        run: make SOURCE_ICON_FILE= prefix=/usr DESTDIR="$PWD/build/stage" install
 
       - name: Upload compiled installation tree
         uses: actions/upload-artifact@v7
         with:
           name: losles-${{ steps.version.outputs.version }}-ubuntu-24.04-x86_64
           path: build/stage/
+          if-no-files-found: error
+
+      - name: Prepare GitHub package changelog
+        id: package_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="${{ steps.version.outputs.version }}-0losles1"
+          DEBFULLNAME="Piotr T. Różański" \
+          DEBEMAIL="piotr@develancer.pl" \
+            dch \
+              --no-conf \
+              --newversion "$package_version" \
+              --distribution UNRELEASED \
+              --force-distribution \
+              "Automated GitHub release build."
+          resolved_version="$(dpkg-parsechangelog --show-field Version)"
+          if [[ "$resolved_version" != "$package_version" ]]; then
+            echo "Generated package version '$resolved_version' does not match '$package_version'." >&2
+            exit 1
+          fi
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Debian package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB_BUILD_OPTIONS=parallel=2 dpkg-buildpackage -b -us -uc
+          package_version="${{ steps.package_version.outputs.version }}"
+          package_arch="$(dpkg --print-architecture)"
+          package_file="../losles_${package_version}_${package_arch}.deb"
+          test -f "$package_file"
+          install -D -m 0644 "$package_file" "dist/$(basename "$package_file")"
+          echo "path=dist/$(basename "$package_file")" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect Debian package
+        run: |
+          dpkg-deb --info "${{ steps.package.outputs.path }}"
+          dpkg-deb --contents "${{ steps.package.outputs.path }}"
+          lintian --fail-on error "${{ steps.package.outputs.path }}"
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: losles-${{ steps.version.outputs.version }}-ubuntu-24.04-amd64-deb
+          path: ${{ steps.package.outputs.path }}
           if-no-files-found: error

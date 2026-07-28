@@ -1,0 +1,62 @@
+.TH LOSLES 1 "July 2026" "losles" "User Commands"
+.SH NAME
+losles \- color-managed image viewer with lossless editing
+.SH SYNOPSIS
+.B losles
+.RI [ FILE ]
+.SH DESCRIPTION
+.B losles
+is a lightweight GTK image viewer for JPEG and PNG files.
+It converts an embedded image profile directly to the ICC profile selected
+for the active monitor and supports wide-gamut RGB display profiles.
+.PP
+Supported images can be rotated and cropped without changing their JPEG
+coefficients or PNG sample values.
+Rotation overwrites the original file.
+Crop moves the exact original to the system Trash before installing the
+cropped replacement.
+.SH KEYBOARD SHORTCUTS
+.TP
+.B Ctrl+O
+Open an image.
+.TP
+.B Left, Right
+Show the previous or next image.
+.TP
+.B I
+Toggle the image information overlay.
+.TP
+.B C
+Enter or leave crop mode.
+.TP
+.B Enter
+Apply the current crop selection.
+.TP
+.B Escape
+Leave crop mode, or reset a zoomed image to its fitted size.
+.TP
+.B Alt+Enter
+Enter or leave fullscreen mode.
+.TP
+.B Delete
+Move the current image to the system Trash.
+.SH ENVIRONMENT
+.TP
+.B G_MESSAGES_DEBUG=losles
+Enable diagnostic messages about monitor and colord profile selection.
+.SH FILES
+.TP
+.I /usr/share/applications/io.github.develancer.losles.desktop
+Desktop launcher and image MIME associations.
+.TP
+.I /usr/share/metainfo/io.github.develancer.losles.metainfo.xml
+AppStream software-catalogue metadata.
+.SH BUGS
+Report bugs at
+.UR https://github.com/develancer/losles/issues
+.UE .
+.SH AUTHOR
+Piotr T. Różański
+.SH COPYRIGHT
+Copyright \(co 2026 Piotr T. Różański.
+Licensed under the MIT License.

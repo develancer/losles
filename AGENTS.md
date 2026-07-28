@@ -125,9 +125,10 @@ make test
 The Makefile uses `pkg-config`, generates header dependency files, and keeps
 all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
 `applicationsdir`, `metainfodir`, `icondir`, `localedir`, `DESTDIR`,
-`BUILD_DIR`, `VERSION`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, and `SANITIZE`
-overrides. Use a distinct `BUILD_DIR` after changing compiler/sanitizer modes
-because Make does not record command-line flag changes:
+`mandir`, `man1dir`, `BUILD_DIR`, `VERSION`, `CFLAGS`, `LDFLAGS`, `LDLIBS`,
+`SOURCE_ICON_FILE`, and `SANITIZE` overrides. Use a distinct `BUILD_DIR`
+after changing compiler/sanitizer modes because Make does not record
+command-line flag changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -167,8 +168,49 @@ changes. With no reachable release tag, the result is
 `0+untagged.g<hash>`; outside a Git checkout it is `0+unknown`. Distribution
 builds without `.git` must pass `VERSION=YYYY.MM.N` explicitly.
 
+The checked-in Debian changelog deliberately stays at the neutral
+`0~unreleased-1` packaging-work version until an actual Debian upload is
+prepared. The tag workflow uses `dch` only in its private runner checkout to
+replace that top entry with `YYYY.MM.N-0losles1`. Do not require upstream
+release tags to update the committed Debian changelog. The `-0losles1`
+revision sorts before Debian's eventual `-1`, so an archive package upgrades
+the convenience GitHub build.
+
 For a non-privileged installation smoke test, use a temporary `DESTDIR`
 instead of installing into the live system.
+
+For a local Ubuntu binary-package check after installing the
+`debian/control` build dependencies:
+
+```sh
+dpkg-checkbuilddeps
+DEB_BUILD_OPTIONS=parallel=2 dpkg-buildpackage -b -us -uc
+lintian --display-info --pedantic ../losles_0~unreleased-1_amd64.changes
+```
+
+With the committed placeholder changelog, that command creates a local
+`0~unreleased-1` package. The binary package, build information, and changes
+file are written one directory above the source tree by
+`dpkg-buildpackage`. Debian-generated files inside `debian/` are ignored by
+`debian/.gitignore`; do not commit them. Until an ITP bug exists, Lintian is
+expected to report only `initial-upload-closes-no-bugs`.
+
+For the first real Debian upload, use `dch` to replace the placeholder with
+`YYYY.MM.N-1`, add `(Closes: #ITP_NUMBER)`, and finalize the entry for
+`unstable`. Subsequent Debian-only revisions use `-2`, `-3`, and so on. These
+archive changes are intentionally independent of the temporary GitHub
+`-0losles1` entry.
+
+```sh
+DEBFULLNAME="Piotr T. Różański" \
+DEBEMAIL="piotr@develancer.pl" \
+  dch --newversion YYYY.MM.N-1 \
+    "Initial release. (Closes: #ITP_NUMBER)"
+
+DEBFULLNAME="Piotr T. Różański" \
+DEBEMAIL="piotr@develancer.pl" \
+  dch --release --distribution unstable
+```
 
 Set `G_MESSAGES_DEBUG=losles` when diagnosing monitor/colord selection. The
 color manager logs connector names, lookup failures, and the selected profile.
@@ -182,14 +224,23 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
 ├── .github/workflows/
-│   └── tagged-build.yml         Tag-only Ubuntu 24.04 build/test/artifact CI
+│   └── tagged-build.yml         Tag-only build/test/tree-and-DEB artifact CI
 ├── tools/
 │   └── version.sh               CalVer validation and Git version derivation
 ├── data/
 │   ├── icons/hicolor/512x512/apps/
-│   │   └── io.github.develancer.Losles.png
-│   ├── io.github.develancer.Losles.desktop
-│   └── io.github.develancer.Losles.metainfo.xml
+│   │   └── io.github.develancer.losles.png
+│   ├── io.github.develancer.losles.desktop
+│   ├── io.github.develancer.losles.metainfo.xml
+│   └── losles.1                 Command-line manual page
+├── debian/
+│   ├── changelog                Package version/upload history
+│   ├── control                  Source/binary metadata and dependencies
+│   ├── copyright                DEP-5 file licensing
+│   ├── rules                    debhelper bridge to GNU Make
+│   ├── source/format            3.0 (quilt) source-package format
+│   ├── upstream/metadata        Upstream repository and bug tracker
+│   └── watch                    Bare-CalVer GitHub tag discovery
 ├── src/
 │   ├── main.c                   Locale setup and GApplication entry point
 │   ├── losles-config.h          App ID, name, generated version include, URL
@@ -217,7 +268,7 @@ color manager logs connector names, lookup failures, and the selected profile.
     └── test-formats.c           Decode, ICC, transform, Trash, invalid data
 ```
 
-The `io.github.develancer.Losles` name is the current application ID and
+The `io.github.develancer.losles` name is the current application ID and
 therefore appears in C, the desktop filename/content, and AppStream metadata.
 It is derived from the upstream GitHub account. If the ID changes, update all
 references together and rename both installed metadata files and the icon.
@@ -705,8 +756,10 @@ Files in `data/` are installed desktop integration, not runtime source:
 - `.desktop` makes losles appear in launchers and associates JPEG/PNG MIME
   types;
 - `.metainfo.xml` supplies AppStream/software-center metadata;
-- `icons/hicolor/512x512/apps/io.github.develancer.Losles.png` is installed
-  under the matching hicolor theme path.
+- `icons/hicolor/512x512/apps/io.github.develancer.losles.png` is installed
+  under the matching hicolor theme path;
+- `losles.1` documents invocation, editing safety, shortcuts, and diagnostics
+  for command-line manual readers.
 
 `src/losles-config.h` is the canonical C-side location for the application
 ID, display name, and repository URL. It includes the generated
@@ -719,10 +772,37 @@ pull requests do not trigger it. GitHub's tag filter selects the
 month and nonzero-counter validation before dependencies are installed. The
 workflow checks that Git-derived and triggering-tag versions agree, builds
 and tests on Ubuntu 24.04, stages `prefix=/usr`, and uploads the staged tree.
-Keep `fetch-depth: 0`, because development-version derivation needs tag
-history. The AppStream file intentionally has no `<releases>` list: Git tags
-are the canonical release history, while the installed metadata remains valid
-without duplicating that history.
+Only after this clean-tag build is complete does it use `dch` to replace the
+placeholder changelog in the runner with `<tag>-0losles1`. Delaying that
+temporary edit matters: otherwise Git version derivation would see a dirty
+checkout and embed `<tag>+dirty` in the staged binary. It then builds the
+binary package through `dpkg-buildpackage`, verifies the generated version,
+inspects the package, runs Lintian with errors fatal, and uploads the `.deb`
+as a second workflow artifact. Keep `fetch-depth: 0`, because
+development-version derivation needs tag history. GitHub wraps downloaded
+Actions artifacts in ZIP files; the package artifact contains the actual
+standard-named `.deb`. The AppStream file intentionally has no `<releases>`
+list: Git tags are the canonical release history, while the installed
+metadata remains valid without duplicating that history.
+
+The Debian packaging is intentionally usable beyond CI. `debian/rules`
+passes `prefix=/usr` because the installed icon path is compiled in, and
+passes `VERSION=$(DEB_VERSION_UPSTREAM)` so source-package builds do not
+depend on `.git`. It passes an empty `SOURCE_ICON_FILE` so a distributable
+binary contains only the installed `/usr` icon path, not the build machine's
+absolute source checkout. The ordinary developer build retains its absolute
+source-icon fallback so `build/losles` has an icon before installation. The
+packaging enables all normal dpkg hardening. `debian/control` uses
+`Architecture: linux-any` because the cache budget currently uses Linux
+`sysinfo()`, and recommends rather than depends on `colord` because the
+viewer has an explicit sRGB fallback. The maintainer address is
+`piotr@develancer.pl`. Add Salsa `Vcs-Git`/`Vcs-Browser` fields only after
+the corresponding repository exists.
+
+The source tree and application icon are MIT-licensed. The AppStream XML is
+CC0-1.0 and carries an SPDX declaration; this exception is recorded in both
+top-level `COPYING` and `debian/copyright`. Do not change ownership or license
+claims without confirmation from the project owner.
 
 The Makefile embeds both source-tree and installed icon paths. The former
 lets a directly run `build/losles` load its own toplevel and About-dialog icon

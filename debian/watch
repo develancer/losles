@@ -1,0 +1,4 @@
+version=4
+opts="filenamemangle=s%.*/(\d{4}\.\d{2}\.\d+)\.tar\.gz%losles-$1.tar.gz%" \
+  https://github.com/develancer/losles/tags \
+  .*/(\d{4}\.\d{2}\.\d+)\.tar\.gz

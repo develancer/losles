@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="data/icons/hicolor/512x512/apps/io.github.develancer.Losles.png"
+  <img src="data/icons/hicolor/512x512/apps/io.github.develancer.losles.png"
        alt="losles icon"
        width="160">
 </p>
@@ -119,9 +119,31 @@ make VERSION=2026.07.1
 
 The GitHub Actions tagged-build workflow runs only for pushed tags matching
 the release-tag shape. It validates the month and release counter, compiles
-and tests on Ubuntu 24.04, stages an installation under `/usr`, and uploads
-that tree as a workflow artifact. AppStream release history is intentionally
-omitted: the Git tags are the project's canonical release record.
+and tests on Ubuntu 24.04, and produces two artifacts: a staged `/usr`
+installation tree and an installable Ubuntu 24.04 `.deb` package. The Debian
+package is assigned an ephemeral version derived from the tag, such as
+`2026.07.1-0losles1`. The `-0losles1` revision sorts below Debian's future
+`-1`, allowing an official repository package to replace the GitHub build
+automatically.
+
+The package is built with the normal Debian `debhelper` toolchain, validates
+the desktop and AppStream files, and runs Lintian. It is an unsigned
+convenience package rather than an APT repository. After extracting the
+GitHub Actions artifact, install it together with its repository dependencies
+using:
+
+```sh
+sudo apt install ./losles_2026.07.1-0losles1_amd64.deb
+```
+
+The versioned `debian/changelog` contains a neutral `0~unreleased-1`
+packaging-work entry. The workflow updates a private runner copy with `dch`;
+it does not commit the generated release entry. The real Debian changelog is
+updated separately when preparing an archive upload, starting with
+`YYYY.MM.N-1`, the target `unstable`, and the ITP bug closure.
+
+AppStream release history is intentionally omitted: Git tags are the
+project's canonical release record.
 
 ## Lossless editing semantics
 
@@ -252,9 +274,15 @@ preconverting them; otherwise conversion could be applied twice.
 ```text
 data/
   icons/hicolor/512x512/apps/
-    io.github.develancer.Losles.png  installed application icon
-  io.github.develancer.Losles.desktop
-  io.github.develancer.Losles.metainfo.xml
+    io.github.develancer.losles.png  installed application icon
+  io.github.develancer.losles.desktop
+  io.github.develancer.losles.metainfo.xml
+  losles.1                    command-line manual page
+debian/
+  control                     Debian build and binary package metadata
+  rules                       debhelper bridge to the upstream Makefile
+  copyright                   machine-readable licensing
+  changelog                   Debian package version and upload history
 tools/
   version.sh                  Git tag validation and build-version derivation
 src/
@@ -278,3 +306,10 @@ Current deliberate limits are RGB/grayscale JPEG and PNG viewing, editing of
 JPEG plus the common PNG subset described above, 8-bit display buffers, SDR
 ICC profiles, and local files for editing. CMYK JPEG display is not
 implemented yet.
+
+## License
+
+losles is distributed under the MIT License. This includes the application
+icon. The AppStream metadata is separately dedicated under CC0-1.0 so
+software catalogues and distributions can reuse it freely. See `COPYING` and
+the SPDX declaration in the metadata file.

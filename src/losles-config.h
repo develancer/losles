@@ -2,7 +2,7 @@
 
 #include "losles-version.h"
 
-#define LOSLES_APPLICATION_ID "io.github.develancer.Losles"
+#define LOSLES_APPLICATION_ID "io.github.develancer.losles"
 #define LOSLES_APPLICATION_NAME "losles"
 #define LOSLES_REPOSITORY_URL "https://github.com/develancer/losles"
 

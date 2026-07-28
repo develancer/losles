@@ -1,0 +1,35 @@
+Source: losles
+Section: graphics
+Priority: optional
+Maintainer: Piotr T. Różański <piotr@develancer.pl>
+Build-Depends:
+ appstream,
+ debhelper-compat (= 13),
+ desktop-file-utils,
+ libcolord-dev (>= 1.4.6),
+ libgtk-4-dev (>= 4.10),
+ libjpeg-dev,
+ liblcms2-dev (>= 2.14),
+ libpng-dev (>= 1.6),
+ libturbojpeg0-dev,
+ pkgconf,
+Standards-Version: 4.7.4
+Rules-Requires-Root: no
+Homepage: https://github.com/develancer/losles
+
+Package: losles
+Architecture: linux-any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Recommends:
+ colord,
+Description: color-managed image viewer with lossless editing
+ losles is a lightweight GTK image viewer that converts embedded image
+ profiles directly to the ICC profile selected for the active monitor. It
+ supports wide-gamut RGB display profiles and provides an explicit sRGB
+ fallback when no monitor profile is available.
+ .
+ It displays JPEG and PNG images and provides coefficient-lossless JPEG
+ rotation and cropping together with pixel-lossless editing of common 8-bit
+ PNG formats.

@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/pkg-info.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- SOURCE_ICON_FILE= prefix=/usr VERSION=$(DEB_VERSION_UPSTREAM)
+
+override_dh_auto_test:
+	dh_auto_test -- SOURCE_ICON_FILE= prefix=/usr VERSION=$(DEB_VERSION_UPSTREAM)
+	desktop-file-validate data/io.github.develancer.losles.desktop
+	appstreamcli validate --no-net data/io.github.develancer.losles.metainfo.xml
+
+override_dh_auto_install:
+	dh_auto_install -- \
+		INSTALL=install \
+		SOURCE_ICON_FILE= \
+		prefix=/usr \
+		VERSION=$(DEB_VERSION_UPSTREAM)

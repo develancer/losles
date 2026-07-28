@@ -1,0 +1,7 @@
+/.debhelper/
+/debhelper-build-stamp
+/files
+/losles/
+/losles-dbgsym/
+/*.debhelper.log
+/*.substvars

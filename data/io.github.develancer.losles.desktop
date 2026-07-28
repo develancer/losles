@@ -2,9 +2,10 @@
 Name=losles
 Comment=Color-managed lossless photo viewer
 Exec=losles %f
-Icon=io.github.develancer.Losles
+Icon=io.github.develancer.losles
 Terminal=false
 Type=Application
 Categories=Graphics;Viewer;Photography;
+Keywords=photo;image;viewer;ICC;color;crop;rotate;
 MimeType=image/jpeg;image/png;
 StartupNotify=true
