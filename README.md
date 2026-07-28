@@ -37,10 +37,11 @@ and not much more.
 - Explicit lossless EXIF-orientation normalization: the displayed orientation
   is baked into JPEG coefficients and the existing orientation tag is set to
   `1`.
-- Fast previous/next navigation. losles decodes and color-converts up to two
-  images on either side in the background. Decoded sources and
-  display-profile textures have separate 512 MiB cache limits, with at most
-  two background decodes and two background color conversions at once.
+- Fast previous/next navigation. losles decodes and color-converts up to five
+  images on either side in the background, prioritizing nearby images and the
+  current navigation direction. Decoded sources and display-profile textures
+  have separate 512 MiB cache limits, with at most two background decodes and
+  two background color conversions at once.
 - A format-module interface. JPEG and PNG are separate GObject
   implementations, so another decoder/editor does not need changes to the
   window or color pipeline.
@@ -220,6 +221,7 @@ data/
 src/
   losles-config.h             application identity, version, and repository URL
   losles-window.c             UI, navigation, two-level cache, background jobs
+  losles-cache-policy.c       cache ordering, admission, and eviction policy
   losles-color-manager.c      colord lookup and LittleCMS transforms
   losles-image.c              format-neutral decoded image
   formats/
@@ -228,6 +230,7 @@ src/
     losles-jpeg-format.c      JPEG decode and lossless writer
     losles-png-format.c       PNG decode, capability checks, and lossless writer
 tests/
+  test-cache-policy.c         cache ordering and memory-admission regression tests
   test-jpeg-metadata.c
   test-formats.c              ICC/render, JPEG/PNG edits, and Trash integration
 ```

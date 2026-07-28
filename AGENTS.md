@@ -177,8 +177,9 @@ color manager logs connector names, lookup failures, and the selected profile.
 │   └── io.github.develancer.Losles.metainfo.xml
 ├── src/
 │   ├── main.c                   Locale setup and GApplication entry point
-│   ├── losles-config.h          App ID, name, version, repository placeholder
+│   ├── losles-config.h          App ID, name, version, repository URL
 │   ├── losles-application.[ch]  Single-window app, open handling, shortcuts
+│   ├── losles-cache-policy.[ch] Cache ordering, admission, and eviction
 │   ├── losles-window.[ch]       UI, directory scan, jobs, caches, editing flow
 │   ├── losles-image.[ch]        Immutable decoded-source model
 │   ├── losles-rendered-image.[ch]
@@ -196,17 +197,18 @@ color manager logs connector names, lookup failures, and the selected profile.
 │       └── losles-png-format.[ch]
 │                                 PNG decode, iCCP, capability checks, editing
 └── tests/
+    ├── test-cache-policy.c      Cache order and admission regression tests
     ├── test-jpeg-metadata.c     Endian/orientation parser tests
     └── test-formats.c           Decode, ICC, transform, Trash, invalid data
 ```
 
-The `io.github.develancer.Losles` name is the current application ID and therefore
-appears in C, the desktop filename/content, and AppStream metadata. It is
-derived from the upstream GitHub account. If the ID changes, update all
+The `io.github.develancer.Losles` name is the current application ID and
+therefore appears in C, the desktop filename/content, and AppStream metadata.
+It is derived from the upstream GitHub account. If the ID changes, update all
 references together and rename both installed metadata files and the icon.
 The application icon is a checked-in 512×512 PNG named after this ID in the
-standard hicolor `apps` directory. The desktop entry uses the same unqualified
-icon name so GNOME can resolve the installed asset.
+standard hicolor `apps` directory. The desktop entry uses the same
+unqualified icon name so GNOME can resolve the installed asset.
 
 ## End-to-end architecture
 
@@ -462,10 +464,28 @@ Two independent caches are keyed by the file URI:
 - decoded `LoslesImage` cache: 512 MiB;
 - display-profile `LoslesRenderedImage`/texture cache: 512 MiB.
 
-Both retain only the current image and neighbors within distance two. At most
-two background decodes and two background renders are in flight. Foreground
-work may bypass those background concurrency checks. Preloading visits the
-next image before the previous image at each distance.
+Each cache is eligible to retain the current image and up to five neighbors on
+either side, for at most eleven entries per cache before memory pressure is
+considered. At most two background decodes and two background renders are in
+flight. Foreground work may bypass those background concurrency checks.
+
+Preloading visits neighbors nearest-first. At each distance it visits the
+current navigation direction first; forward is the default after opening,
+deleting, or resetting a browsing session. Memory pruning uses the inverse
+priority: farthest-first, with the side opposite the navigation direction
+evicted first at equal distance. Entries outside the eligible window are
+always removed before applying the byte limit. The current image is protected,
+and a foreground image may exceed its cache's nominal limit after lower
+priority neighbors have been removed.
+
+Background admission is a two-pass operation. It first checks whether enough
+lower-priority entries exist to fit the candidate, then performs those
+evictions. If the candidate cannot fit, it is rejected without flushing useful
+entries. Decode/render failures are recorded separately from memory-capacity
+rejections. Capacity-rejected or memory-evicted URIs are suppressed only for
+the current navigation position; moving again clears that suppression so they
+can be reconsidered under the new window and direction. A foreground request
+always retries either kind of suppressed URI.
 
 The size limits account primarily for pixel `GBytes`. They do not fully model
 the transient whole encoded file, object/hash overhead, GTK texture resources,
@@ -480,12 +500,15 @@ Async correctness relies on these rules:
   no-ops.
 - Navigation inside the same scanned directory does not increment generation.
   A prefetched job can become foreground, so completion callbacks determine
-  foreground status from the current file rather than the job's initial flag.
+  foreground status from the current file rather than whether it was
+  originally queued as background work.
 - `render_generation` identifies the active display target. Monitor/profile
   changes and opening a new file cancel render work and invalidate the entire
   URI-keyed render cache.
-- `inflight` tables prevent duplicate work. `failed`/`render_blocked` suppress
-  repeated background attempts, but a foreground request retries.
+- `inflight` tables prevent duplicate work. `decode_failed` and
+  `render_failed` suppress repeated background attempts after actual worker
+  errors. `decode_capacity_blocked` and `render_capacity_blocked` prevent
+  same-position retry loops after a cache-capacity rejection or eviction.
 - Worker job structs own strong references to every object they use. Preserve
   these ownership rules.
 - Always check generation before mutating an inflight/cache table in a
@@ -678,6 +701,11 @@ or preferences storage. `LOCALEDIR` is defined for the C target but currently
 unused; strings are hard-coded English.
 
 ## Tests and verification expectations
+
+`test-cache-policy` checks boundary handling, direction-aware preload and
+eviction order, early callback termination, priority-preserving admission,
+non-destructive capacity rejection, out-of-window rejection, and the
+foreground soft limit.
 
 `test-jpeg-metadata` checks little-endian, big-endian, stored value `1`,
 absent EXIF orientation, and in-file tag rewriting. `test-formats` creates

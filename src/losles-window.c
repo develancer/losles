@@ -2,6 +2,7 @@
 
 #include "formats/losles-format-registry.h"
 #include "formats/losles-format.h"
+#include "losles-cache-policy.h"
 #include "losles-color-manager.h"
 #include "losles-config.h"
 #include "losles-image.h"
@@ -9,7 +10,7 @@
 
 #define SOURCE_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
 #define RENDER_CACHE_LIMIT ((gsize)512 * 1024 * 1024)
-#define PRELOAD_DISTANCE 2
+#define PRELOAD_DISTANCE 5
 #define MAX_CONCURRENT_DECODES 2
 #define MAX_CONCURRENT_RENDERS 2
 #define CROP_HANDLE_SIZE 10.0
@@ -23,7 +24,6 @@ typedef struct {
   GFile *file;
   gchar *uri;
   guint generation;
-  gboolean foreground;
 } LoadJob;
 
 typedef struct {
@@ -44,6 +44,18 @@ typedef struct {
   GdkTexture *texture;
   gsize size;
 } RenderCacheEntry;
+
+typedef enum {
+  CACHE_SOURCE,
+  CACHE_RENDER,
+} CacheKind;
+
+typedef struct {
+  GHashTable *entries;
+  GHashTable *capacity_blocked;
+  gsize *size;
+  gsize limit;
+} CacheState;
 
 typedef enum {
   EDIT_ROTATE,
@@ -128,15 +140,18 @@ struct _LoslesWindow {
   guint current_index;
   GHashTable *cache;
   GHashTable *inflight;
-  GHashTable *failed;
+  GHashTable *decode_failed;
+  GHashTable *decode_capacity_blocked;
   gsize cache_size;
   guint generation;
 
   GHashTable *render_cache;
   GHashTable *render_inflight;
-  GHashTable *render_blocked;
+  GHashTable *render_failed;
+  GHashTable *render_capacity_blocked;
   gsize render_cache_size;
   guint render_generation;
+  gint navigation_direction;
 
   LoslesImage *current_image;
   GdkTexture *current_texture;
@@ -434,48 +449,211 @@ find_file_index(GPtrArray *files, GFile *file)
   return -1;
 }
 
+static CacheState
+cache_kind_state(LoslesWindow *self, CacheKind kind)
+{
+  if (kind == CACHE_SOURCE) {
+    return (CacheState){
+      .entries = self->cache,
+      .capacity_blocked = self->decode_capacity_blocked,
+      .size = &self->cache_size,
+      .limit = SOURCE_CACHE_LIMIT,
+    };
+  }
+
+  return (CacheState){
+    .entries = self->render_cache,
+    .capacity_blocked = self->render_capacity_blocked,
+    .size = &self->render_cache_size,
+    .limit = RENDER_CACHE_LIMIT,
+  };
+}
+
+static gsize
+cache_entry_size(CacheKind kind, gpointer value)
+{
+  if (kind == CACHE_SOURCE)
+    return losles_image_get_memory_size(value);
+  return ((RenderCacheEntry *)value)->size;
+}
+
+static gpointer
+cache_entry_at_index(LoslesWindow *self,
+                     CacheKind kind,
+                     guint index)
+{
+  if (!self->files || index >= self->files->len)
+    return NULL;
+
+  const CacheState state = cache_kind_state(self, kind);
+  g_autofree gchar *uri =
+    file_uri(g_ptr_array_index(self->files, index));
+  return g_hash_table_lookup(state.entries, uri);
+}
+
 static void
-prune_cache(LoslesWindow *self)
+evict_cache_index(LoslesWindow *self,
+                  CacheKind kind,
+                  guint index)
+{
+  if (!self->files || index >= self->files->len)
+    return;
+
+  const CacheState state = cache_kind_state(self, kind);
+  g_autofree gchar *uri =
+    file_uri(g_ptr_array_index(self->files, index));
+  gpointer entry = g_hash_table_lookup(state.entries, uri);
+  if (entry) {
+    *state.size -= cache_entry_size(kind, entry);
+    g_hash_table_remove(state.entries, uri);
+    g_hash_table_add(state.capacity_blocked, g_strdup(uri));
+  }
+}
+
+typedef struct {
+  LoslesWindow *window;
+  CacheKind kind;
+  gsize limit;
+} PruneContext;
+
+static gboolean
+prune_cache_index(guint index, gpointer user_data)
+{
+  PruneContext *context = user_data;
+  const CacheState state =
+    cache_kind_state(context->window, context->kind);
+
+  if (*state.size <= context->limit)
+    return FALSE;
+  evict_cache_index(context->window, context->kind, index);
+  return *state.size > context->limit;
+}
+
+static void
+prune_cache_kind(LoslesWindow *self, CacheKind kind)
 {
   if (!self->files || self->files->len == 0)
     return;
 
+  const CacheState state = cache_kind_state(self, kind);
+
   g_autoptr(GHashTable) allowed =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  const gint first =
-    MAX(0, (gint)self->current_index - PRELOAD_DISTANCE);
+  const guint first =
+    self->current_index > PRELOAD_DISTANCE
+      ? self->current_index - PRELOAD_DISTANCE
+      : 0;
   const guint last =
-    MIN(self->files->len - 1, self->current_index + PRELOAD_DISTANCE);
-  for (gint i = first; i <= (gint)last; i++) {
+    MIN(self->files->len - 1,
+        self->current_index + PRELOAD_DISTANCE);
+  for (guint i = first; i <= last; i++) {
     g_autofree gchar *uri =
-      file_uri(g_ptr_array_index(self->files, (guint)i));
+      file_uri(g_ptr_array_index(self->files, i));
     g_hash_table_add(allowed, g_steal_pointer(&uri));
   }
 
   GHashTableIter iter;
   gpointer key = NULL;
   gpointer value = NULL;
-  g_hash_table_iter_init(&iter, self->cache);
+  g_hash_table_iter_init(&iter, state.entries);
   while (g_hash_table_iter_next(&iter, &key, &value)) {
     if (!g_hash_table_contains(allowed, key)) {
-      self->cache_size -= losles_image_get_memory_size(value);
+      *state.size -= cache_entry_size(kind, value);
       g_hash_table_iter_remove(&iter);
     }
   }
 
-  if (self->cache_size <= SOURCE_CACHE_LIMIT)
+  if (*state.size <= state.limit)
     return;
 
-  g_autofree gchar *current_uri =
-    current_file(self) ? file_uri(current_file(self)) : NULL;
-  g_hash_table_iter_init(&iter, self->cache);
-  while (self->cache_size > SOURCE_CACHE_LIMIT &&
-         g_hash_table_iter_next(&iter, &key, &value)) {
-    if (g_strcmp0(key, current_uri) != 0) {
-      self->cache_size -= losles_image_get_memory_size(value);
-      g_hash_table_iter_remove(&iter);
-    }
-  }
+  PruneContext context = {
+    .window = self,
+    .kind = kind,
+    .limit = state.limit,
+  };
+  losles_cache_policy_foreach_eviction(self->current_index,
+                                       self->files->len,
+                                       PRELOAD_DISTANCE,
+                                       self->navigation_direction,
+                                       prune_cache_index,
+                                       &context);
+}
+
+typedef struct {
+  LoslesWindow *window;
+  CacheKind kind;
+} CachePolicyContext;
+
+static gsize
+cache_policy_index_size(guint index, gpointer user_data)
+{
+  CachePolicyContext *context = user_data;
+  gpointer entry =
+    cache_entry_at_index(context->window, context->kind, index);
+  return entry ? cache_entry_size(context->kind, entry) : 0;
+}
+
+static gboolean
+cache_policy_evict_index(guint index, gpointer user_data)
+{
+  CachePolicyContext *context = user_data;
+  evict_cache_index(context->window, context->kind, index);
+  return TRUE;
+}
+
+static gboolean
+prepare_cache_admission(LoslesWindow *self,
+                        CacheKind kind,
+                        guint candidate_index,
+                        const gchar *candidate_uri,
+                        gsize candidate_size,
+                        gboolean foreground)
+{
+  prune_cache_kind(self, kind);
+
+  if (!self->files || candidate_index >= self->files->len)
+    return FALSE;
+  const guint distance =
+    candidate_index > self->current_index
+      ? candidate_index - self->current_index
+      : self->current_index - candidate_index;
+  if (distance > PRELOAD_DISTANCE)
+    return FALSE;
+
+  CachePolicyContext context = {
+    .window = self,
+    .kind = kind,
+  };
+  const CacheState state = cache_kind_state(self, kind);
+  const gboolean admitted =
+    losles_cache_policy_admit(self->current_index,
+                              self->files->len,
+                              PRELOAD_DISTANCE,
+                              self->navigation_direction,
+                              candidate_index,
+                              *state.size,
+                              candidate_size,
+                              state.limit,
+                              foreground,
+                              cache_policy_index_size,
+                              cache_policy_evict_index,
+                              &context);
+  if (!admitted)
+    g_hash_table_add(state.capacity_blocked,
+                     g_strdup(candidate_uri));
+  return admitted;
+}
+
+static void
+prune_cache(LoslesWindow *self)
+{
+  prune_cache_kind(self, CACHE_SOURCE);
+}
+
+static void
+prune_render_cache(LoslesWindow *self)
+{
+  prune_cache_kind(self, CACHE_RENDER);
 }
 
 static gboolean
@@ -485,79 +663,53 @@ cache_image(LoslesWindow *self,
             gboolean foreground)
 {
   LoslesImage *old = g_hash_table_lookup(self->cache, uri);
-  if (old)
+  if (old) {
     self->cache_size -= losles_image_get_memory_size(old);
+    g_hash_table_remove(self->cache, uri);
+  }
 
+  const gint candidate_index =
+    find_file_index(self->files, losles_image_get_file(image));
   const gsize size = losles_image_get_memory_size(image);
-  if (!foreground && !old && self->cache_size + size > SOURCE_CACHE_LIMIT)
+  if (candidate_index < 0 ||
+      !prepare_cache_admission(self,
+                               CACHE_SOURCE,
+                               (guint)candidate_index,
+                               uri,
+                               size,
+                               foreground))
     return FALSE;
 
   self->cache_size += size;
   g_hash_table_replace(self->cache, g_strdup(uri), g_object_ref(image));
-  prune_cache(self);
+  g_hash_table_remove(self->decode_capacity_blocked, uri);
   return TRUE;
-}
-
-static void
-prune_render_cache(LoslesWindow *self)
-{
-  if (!self->files || self->files->len == 0)
-    return;
-
-  g_autoptr(GHashTable) allowed =
-    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  const gint first =
-    MAX(0, (gint)self->current_index - PRELOAD_DISTANCE);
-  const guint last =
-    MIN(self->files->len - 1, self->current_index + PRELOAD_DISTANCE);
-  for (gint i = first; i <= (gint)last; i++) {
-    g_autofree gchar *uri =
-      file_uri(g_ptr_array_index(self->files, (guint)i));
-    g_hash_table_add(allowed, g_steal_pointer(&uri));
-  }
-
-  GHashTableIter iter;
-  gpointer key = NULL;
-  gpointer value = NULL;
-  g_hash_table_iter_init(&iter, self->render_cache);
-  while (g_hash_table_iter_next(&iter, &key, &value)) {
-    RenderCacheEntry *entry = value;
-    if (!g_hash_table_contains(allowed, key)) {
-      self->render_cache_size -= entry->size;
-      g_hash_table_iter_remove(&iter);
-    }
-  }
-
-  if (self->render_cache_size <= RENDER_CACHE_LIMIT)
-    return;
-
-  g_autofree gchar *current_uri =
-    current_file(self) ? file_uri(current_file(self)) : NULL;
-  g_hash_table_iter_init(&iter, self->render_cache);
-  while (self->render_cache_size > RENDER_CACHE_LIMIT &&
-         g_hash_table_iter_next(&iter, &key, &value)) {
-    RenderCacheEntry *entry = value;
-    if (g_strcmp0(key, current_uri) != 0) {
-      self->render_cache_size -= entry->size;
-      g_hash_table_iter_remove(&iter);
-    }
-  }
 }
 
 static RenderCacheEntry *
 cache_rendered(LoslesWindow *self,
                const gchar *uri,
+               LoslesImage *image,
                LoslesRenderedImage *rendered,
                gboolean foreground)
 {
   RenderCacheEntry *old =
     g_hash_table_lookup(self->render_cache, uri);
-  if (old)
+  if (old) {
     self->render_cache_size -= old->size;
+    g_hash_table_remove(self->render_cache, uri);
+  }
 
   const gsize size = g_bytes_get_size(rendered->pixels);
-  if (!foreground && !old &&
-      self->render_cache_size + size > RENDER_CACHE_LIMIT)
+  const gint candidate_index =
+    find_file_index(self->files, losles_image_get_file(image));
+  if (candidate_index < 0 ||
+      !prepare_cache_admission(self,
+                               CACHE_RENDER,
+                               (guint)candidate_index,
+                               uri,
+                               size,
+                               foreground))
     return NULL;
 
   RenderCacheEntry *entry = g_new0(RenderCacheEntry, 1);
@@ -566,7 +718,7 @@ cache_rendered(LoslesWindow *self,
   entry->size = size;
   self->render_cache_size += size;
   g_hash_table_replace(self->render_cache, g_strdup(uri), entry);
-  prune_render_cache(self);
+  g_hash_table_remove(self->render_capacity_blocked, uri);
   return entry;
 }
 
@@ -628,7 +780,7 @@ load_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
 
   g_hash_table_remove(self->inflight, job->uri);
   if (!image) {
-    g_hash_table_add(self->failed, g_strdup(job->uri));
+    g_hash_table_add(self->decode_failed, g_strdup(job->uri));
     if (is_current_file(self, job->file)) {
       gtk_spinner_stop(self->spinner);
       gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
@@ -645,8 +797,6 @@ load_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   const gboolean foreground = is_current_file(self, job->file);
   const gboolean cached =
     cache_image(self, job->uri, image, foreground);
-  if (!cached)
-    g_hash_table_add(self->failed, g_strdup(job->uri));
   if (foreground) {
     gtk_spinner_stop(self->spinner);
     gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
@@ -670,10 +820,15 @@ start_load(LoslesWindow *self, GFile *file, gboolean foreground)
 
   if (g_hash_table_contains(self->inflight, uri))
     return;
-  if (g_hash_table_contains(self->failed, uri)) {
+  if (g_hash_table_contains(self->decode_failed, uri)) {
     if (!foreground)
       return;
-    g_hash_table_remove(self->failed, uri);
+    g_hash_table_remove(self->decode_failed, uri);
+  }
+  if (g_hash_table_contains(self->decode_capacity_blocked, uri)) {
+    if (!foreground)
+      return;
+    g_hash_table_remove(self->decode_capacity_blocked, uri);
   }
   if (!foreground &&
       g_hash_table_size(self->inflight) >= MAX_CONCURRENT_DECODES)
@@ -685,7 +840,6 @@ start_load(LoslesWindow *self, GFile *file, gboolean foreground)
   job->file = g_object_ref(file);
   job->uri = g_strdup(uri);
   job->generation = self->generation;
-  job->foreground = foreground;
 
   GTask *task =
     g_task_new(self, self->load_cancellable, load_done, NULL);
@@ -697,20 +851,39 @@ start_load(LoslesWindow *self, GFile *file, gboolean foreground)
 }
 
 static void
+clear_capacity_blocks(LoslesWindow *self)
+{
+  g_hash_table_remove_all(self->decode_capacity_blocked);
+  g_hash_table_remove_all(self->render_capacity_blocked);
+}
+
+typedef struct {
+  LoslesWindow *window;
+} PreloadContext;
+
+static gboolean
+preload_source_index(guint index, gpointer user_data)
+{
+  PreloadContext *context = user_data;
+  start_load(context->window,
+             g_ptr_array_index(context->window->files, index),
+             FALSE);
+  return TRUE;
+}
+
+static void
 preload_neighbors(LoslesWindow *self)
 {
-  for (guint distance = 1; distance <= PRELOAD_DISTANCE; distance++) {
-    if (self->current_index + distance < self->files->len)
-      start_load(self,
-                 g_ptr_array_index(self->files,
-                                   self->current_index + distance),
-                 FALSE);
-    if (self->current_index >= distance)
-      start_load(self,
-                 g_ptr_array_index(self->files,
-                                   self->current_index - distance),
-                 FALSE);
-  }
+  if (!self->files)
+    return;
+
+  PreloadContext context = {.window = self};
+  losles_cache_policy_foreach_preload(self->current_index,
+                                      self->files->len,
+                                      PRELOAD_DISTANCE,
+                                      self->navigation_direction,
+                                      preload_source_index,
+                                      &context);
   preload_rendered_neighbors(self);
 }
 
@@ -842,8 +1015,10 @@ scan_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   self->current_index =
     index >= 0 ? (guint)index : self->files->len - 1;
   update_controls(self);
-  preload_neighbors(self);
+  clear_capacity_blocks(self);
   prune_cache(self);
+  prune_render_cache(self);
+  preload_neighbors(self);
 }
 
 static void
@@ -964,7 +1139,7 @@ render_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   const gboolean foreground =
     is_current_file(self, losles_image_get_file(job->image));
   if (!rendered) {
-    g_hash_table_add(self->render_blocked, g_strdup(job->uri));
+    g_hash_table_add(self->render_failed, g_strdup(job->uri));
     if (foreground &&
         !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
       gtk_spinner_stop(self->spinner);
@@ -976,11 +1151,13 @@ render_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   }
 
   RenderCacheEntry *entry =
-    cache_rendered(self, job->uri, rendered, foreground);
+    cache_rendered(self,
+                   job->uri,
+                   job->image,
+                   rendered,
+                   foreground);
   if (entry)
     g_steal_pointer(&rendered);
-  else
-    g_hash_table_add(self->render_blocked, g_strdup(job->uri));
 
   if (foreground) {
     if (entry)
@@ -1023,10 +1200,15 @@ start_render_for_image(LoslesWindow *self,
     }
     return;
   }
-  if (g_hash_table_contains(self->render_blocked, uri)) {
+  if (g_hash_table_contains(self->render_failed, uri)) {
     if (!foreground)
       return;
-    g_hash_table_remove(self->render_blocked, uri);
+    g_hash_table_remove(self->render_failed, uri);
+  }
+  if (g_hash_table_contains(self->render_capacity_blocked, uri)) {
+    if (!foreground)
+      return;
+    g_hash_table_remove(self->render_capacity_blocked, uri);
   }
   if (!foreground &&
       g_hash_table_size(self->render_inflight) >=
@@ -1064,27 +1246,33 @@ start_render_for_image(LoslesWindow *self,
   g_object_unref(task);
 }
 
+static gboolean
+preload_render_index(guint index, gpointer user_data)
+{
+  PreloadContext *context = user_data;
+  GFile *file =
+    g_ptr_array_index(context->window->files, index);
+  g_autofree gchar *uri = file_uri(file);
+  LoslesImage *image =
+    g_hash_table_lookup(context->window->cache, uri);
+  if (image)
+    start_render_for_image(context->window, image, FALSE);
+  return TRUE;
+}
+
 static void
 preload_rendered_neighbors(LoslesWindow *self)
 {
   if (!self->files || !gtk_widget_get_mapped(GTK_WIDGET(self)))
     return;
 
-  for (guint distance = 1; distance <= PRELOAD_DISTANCE; distance++) {
-    const gint indices[] = {
-      (gint)self->current_index + (gint)distance,
-      (gint)self->current_index - (gint)distance,
-    };
-    for (guint i = 0; i < G_N_ELEMENTS(indices); i++) {
-      if (indices[i] < 0 || indices[i] >= (gint)self->files->len)
-        continue;
-      GFile *file = g_ptr_array_index(self->files, (guint)indices[i]);
-      g_autofree gchar *uri = file_uri(file);
-      LoslesImage *image = g_hash_table_lookup(self->cache, uri);
-      if (image)
-        start_render_for_image(self, image, FALSE);
-    }
-  }
+  PreloadContext context = {.window = self};
+  losles_cache_policy_foreach_preload(self->current_index,
+                                      self->files->len,
+                                      PRELOAD_DISTANCE,
+                                      self->navigation_direction,
+                                      preload_render_index,
+                                      &context);
 }
 
 static void
@@ -1105,7 +1293,8 @@ invalidate_render_cache(LoslesWindow *self)
   self->render_cancellable = g_cancellable_new();
   self->render_generation++;
   g_hash_table_remove_all(self->render_inflight);
-  g_hash_table_remove_all(self->render_blocked);
+  g_hash_table_remove_all(self->render_failed);
+  g_hash_table_remove_all(self->render_capacity_blocked);
   g_hash_table_remove_all(self->render_cache);
   self->render_cache_size = 0;
   g_clear_object(&self->current_texture);
@@ -1116,13 +1305,15 @@ invalidate_render_cache(LoslesWindow *self)
 static void
 reset_content_pipeline(LoslesWindow *self)
 {
+  self->navigation_direction = 1;
   self->generation++;
   if (self->load_cancellable)
     g_cancellable_cancel(self->load_cancellable);
   g_clear_object(&self->load_cancellable);
   self->load_cancellable = g_cancellable_new();
   g_hash_table_remove_all(self->inflight);
-  g_hash_table_remove_all(self->failed);
+  g_hash_table_remove_all(self->decode_failed);
+  g_hash_table_remove_all(self->decode_capacity_blocked);
   g_hash_table_remove_all(self->cache);
   self->cache_size = 0;
   invalidate_render_cache(self);
@@ -1133,13 +1324,15 @@ advance_pipeline_after_delete(LoslesWindow *self, GFile *deleted_file)
 {
   g_autofree gchar *uri = file_uri(deleted_file);
 
+  self->navigation_direction = 1;
   self->generation++;
   if (self->load_cancellable)
     g_cancellable_cancel(self->load_cancellable);
   g_clear_object(&self->load_cancellable);
   self->load_cancellable = g_cancellable_new();
   g_hash_table_remove_all(self->inflight);
-  g_hash_table_remove_all(self->failed);
+  g_hash_table_remove_all(self->decode_failed);
+  g_hash_table_remove_all(self->decode_capacity_blocked);
 
   LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
   if (cached)
@@ -1152,7 +1345,8 @@ advance_pipeline_after_delete(LoslesWindow *self, GFile *deleted_file)
   self->render_cancellable = g_cancellable_new();
   self->render_generation++;
   g_hash_table_remove_all(self->render_inflight);
-  g_hash_table_remove_all(self->render_blocked);
+  g_hash_table_remove_all(self->render_failed);
+  g_hash_table_remove_all(self->render_capacity_blocked);
 
   RenderCacheEntry *rendered =
     g_hash_table_lookup(self->render_cache, uri);
@@ -1168,6 +1362,7 @@ show_no_picture(LoslesWindow *self)
   self->files =
     g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
   self->current_index = 0;
+  self->navigation_direction = 1;
   clear_current_image(self);
   gtk_spinner_stop(self->spinner);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
@@ -1182,7 +1377,15 @@ show_index(LoslesWindow *self, guint index)
   if (!self->files || index >= self->files->len)
     return;
 
+  if (index < self->current_index)
+    self->navigation_direction = -1;
+  else if (index > self->current_index)
+    self->navigation_direction = 1;
   self->current_index = index;
+  clear_capacity_blocks(self);
+  prune_cache(self);
+  prune_render_cache(self);
+
   GFile *file = current_file(self);
   update_title(self, file);
   clear_current_image(self);
@@ -1192,8 +1395,6 @@ show_index(LoslesWindow *self, guint index)
   start_load(self, file, TRUE);
   update_controls(self);
   preload_neighbors(self);
-  prune_cache(self);
-  prune_render_cache(self);
 }
 
 static void
@@ -2635,10 +2836,12 @@ losles_window_dispose(GObject *object)
   g_clear_pointer(&self->files, g_ptr_array_unref);
   g_clear_pointer(&self->cache, g_hash_table_unref);
   g_clear_pointer(&self->inflight, g_hash_table_unref);
-  g_clear_pointer(&self->failed, g_hash_table_unref);
+  g_clear_pointer(&self->decode_failed, g_hash_table_unref);
+  g_clear_pointer(&self->decode_capacity_blocked, g_hash_table_unref);
   g_clear_pointer(&self->render_cache, g_hash_table_unref);
   g_clear_pointer(&self->render_inflight, g_hash_table_unref);
-  g_clear_pointer(&self->render_blocked, g_hash_table_unref);
+  g_clear_pointer(&self->render_failed, g_hash_table_unref);
+  g_clear_pointer(&self->render_capacity_blocked, g_hash_table_unref);
   g_clear_object(&self->color_manager);
   g_clear_object(&self->registry);
 
@@ -2666,7 +2869,9 @@ losles_window_init(LoslesWindow *self)
                           (GDestroyNotify)g_object_unref);
   self->inflight =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  self->failed =
+  self->decode_failed =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->decode_capacity_blocked =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->load_cancellable = g_cancellable_new();
   self->render_cache =
@@ -2676,9 +2881,12 @@ losles_window_init(LoslesWindow *self)
                           (GDestroyNotify)render_cache_entry_free);
   self->render_inflight =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-  self->render_blocked =
+  self->render_failed =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->render_capacity_blocked =
     g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
   self->render_cancellable = g_cancellable_new();
+  self->navigation_direction = 1;
   self->zoom_scale = 1.0;
   self->zoom_center_x = 0.5;
   self->zoom_center_y = 0.5;

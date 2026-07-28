@@ -63,6 +63,7 @@ COMMON_SOURCES := \
 APP_SOURCES := \
 	src/main.c \
 	src/losles-application.c \
+	src/losles-cache-policy.c \
 	src/losles-window.c \
 	$(COMMON_SOURCES)
 
@@ -77,8 +78,13 @@ FORMAT_TEST_OBJECTS := \
 	$(BUILD_DIR)/tests/test-formats.o \
 	$(COMMON_OBJECTS)
 
+CACHE_POLICY_TEST_OBJECTS := \
+	$(BUILD_DIR)/tests/test-cache-policy.o \
+	$(BUILD_DIR)/src/losles-cache-policy.o
+
 ALL_OBJECTS := $(sort \
 	$(APP_OBJECTS) \
+	$(CACHE_POLICY_TEST_OBJECTS) \
 	$(JPEG_METADATA_TEST_OBJECTS) \
 	$(FORMAT_TEST_OBJECTS))
 DEPENDENCY_FILES := $(ALL_OBJECTS:.o=.d)
@@ -86,7 +92,11 @@ DEPENDENCY_FILES := $(ALL_OBJECTS:.o=.d)
 APP := $(BUILD_DIR)/losles
 JPEG_METADATA_TEST := $(BUILD_DIR)/tests/test-jpeg-metadata
 FORMAT_TEST := $(BUILD_DIR)/tests/test-formats
-TEST_PROGRAMS := $(JPEG_METADATA_TEST) $(FORMAT_TEST)
+CACHE_POLICY_TEST := $(BUILD_DIR)/tests/test-cache-policy
+TEST_PROGRAMS := \
+	$(JPEG_METADATA_TEST) \
+	$(FORMAT_TEST) \
+	$(CACHE_POLICY_TEST)
 
 .PHONY: all check check-deps clean help install run test
 
@@ -115,9 +125,14 @@ $(FORMAT_TEST): $(FORMAT_TEST_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^ $(PKG_LIBS) $(LDLIBS)
 
+$(CACHE_POLICY_TEST): $(CACHE_POLICY_TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $^ $(PKG_LIBS) $(LDLIBS)
+
 test: $(TEST_PROGRAMS)
 	$(JPEG_METADATA_TEST)
 	$(FORMAT_TEST)
+	$(CACHE_POLICY_TEST)
 
 run: $(APP)
 	$(APP) $(ARGS)
@@ -150,7 +165,7 @@ clean:
 help:
 	@echo "losles GNU Make targets:"
 	@echo "  all       Build $(APP) (default)"
-	@echo "  test      Build and run both test programs"
+	@echo "  test      Build and run all test programs"
 	@echo "  check     Alias for test"
 	@echo "  run       Run the viewer; pass a file with ARGS=/path/image.jpg"
 	@echo "  install   Install under prefix (default: $(prefix)); honors DESTDIR"
