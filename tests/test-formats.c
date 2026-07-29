@@ -838,13 +838,15 @@ test_lossless_png_operations(void)
   g_assert_cmpuint(adjusted.y, ==, requested.y);
   g_assert_cmpuint(adjusted.width, ==, requested.width);
   g_assert_cmpuint(adjusted.height, ==, requested.height);
-  g_assert_true(losles_format_crop_lossless(format,
-                                            rotated,
-                                            file,
-                                            &adjusted,
-                                            NULL,
-                                            &error));
+  const gboolean crop_succeeded =
+    losles_format_crop_lossless(format,
+                                rotated,
+                                file,
+                                &adjusted,
+                                NULL,
+                                &error);
   g_assert_no_error(error);
+  g_assert_true(crop_succeeded);
 
   g_autoptr(LoslesImage) cropped = load_path(registry, png_path);
   g_assert_cmpuint(losles_image_get_width(cropped), ==, 2);
@@ -1114,13 +1116,15 @@ test_in_place_crop_uses_trash(void)
     LOSLES_FORMAT(losles_image_get_format(image));
   LoslesCrop crop = {.x = 8, .y = 0, .width = 8, .height = 8};
   g_autoptr(GFile) source = g_file_new_for_path(jpeg_path);
-  g_assert_true(losles_format_crop_lossless(format,
-                                            image,
-                                            source,
-                                            &crop,
-                                            NULL,
-                                            &error));
+  const gboolean crop_succeeded =
+    losles_format_crop_lossless(format,
+                                image,
+                                source,
+                                &crop,
+                                NULL,
+                                &error);
   g_assert_no_error(error);
+  g_assert_true(crop_succeeded);
 
   g_autoptr(LoslesImage) cropped = load_path(registry, jpeg_path);
   g_assert_cmpuint(losles_image_get_width(cropped), ==, 8);

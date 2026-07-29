@@ -167,14 +167,21 @@ such a tag gets that plain version. A later commit uses
 changes. With no reachable release tag, the result is
 `0+untagged.g<hash>`; outside a Git checkout it is `0+unknown`. Distribution
 builds without `.git` must pass `VERSION=YYYY.MM.N` explicitly.
+If a `.git` directory or worktree link is present but `git rev-parse` fails,
+`tools/version.sh` deliberately prints the underlying Git diagnostic and
+exits unsuccessfully rather than misclassifying the checkout as a source
+archive.
 
 The checked-in Debian changelog deliberately stays at the neutral
 `0~unreleased-1` packaging-work version until an actual Debian upload is
 prepared. The tag workflow uses `dch` only in its private runner checkout to
-replace that top entry with `YYYY.MM.N-0losles1`. Do not require upstream
-release tags to update the committed Debian changelog. The `-0losles1`
-revision sorts before Debian's eventual `-1`, so an archive package upgrades
-the convenience GitHub build.
+replace that top entry with a target-qualified version:
+`YYYY.MM.N-0losles1~ubuntu24.04.1`,
+`YYYY.MM.N-0losles1~ubuntu26.04.1`, or
+`YYYY.MM.N-0losles1~debian13.1`. Do not require upstream release tags to
+update the committed Debian changelog. These `-0losles1~...` revisions sort
+before Debian's eventual `-1`, so an archive package upgrades the convenience
+GitHub builds.
 
 For a non-privileged installation smoke test, use a temporary `DESTDIR`
 instead of installing into the live system.
@@ -199,7 +206,7 @@ For the first real Debian upload, use `dch` to replace the placeholder with
 `YYYY.MM.N-1`, add `(Closes: #ITP_NUMBER)`, and finalize the entry for
 `unstable`. Subsequent Debian-only revisions use `-2`, `-3`, and so on. These
 archive changes are intentionally independent of the temporary GitHub
-`-0losles1` entry.
+`-0losles1~...` entries.
 
 ```sh
 DEBFULLNAME="Piotr T. Różański" \
@@ -224,7 +231,7 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
 ├── .github/workflows/
-│   └── tagged-build.yml         Tag-only build/test/tree-and-DEB artifact CI
+│   └── tagged-build.yml         Tag-only build/test/DEB/release publishing CI
 ├── tools/
 │   └── version.sh               CalVer validation and Git version derivation
 ├── data/
@@ -787,35 +794,59 @@ config header and AppStream metadata synchronized.
 The GitHub Actions workflow is deliberately release-only: branch pushes and
 pull requests do not trigger it. GitHub's tag filter selects the
 `YYYY.MM.N` shape, and `tools/version.sh --from-tag` applies the stricter
-month and nonzero-counter validation before dependencies are installed. The
-workflow checks that Git-derived and triggering-tag versions agree, builds
-and tests on Ubuntu 24.04, stages `prefix=/usr`, and uploads the staged tree.
-Only after this clean-tag build is complete does it use `dch` to replace the
-placeholder changelog in the runner with `<tag>-0losles1`. Delaying that
-temporary edit matters: otherwise Git version derivation would see a dirty
-checkout and embed `<tag>+dirty` in the staged binary. It then builds the
-binary package through `dpkg-buildpackage`, verifies the generated version,
-inspects the package, runs Lintian with errors fatal, and uploads the `.deb`
-as a second workflow artifact. Keep `fetch-depth: 0`, because
-development-version derivation needs tag history. GitHub wraps downloaded
-Actions artifacts in ZIP files; the package artifact contains the actual
-standard-named `.deb`. The AppStream file intentionally has no `<releases>`
-list: Git tags are the canonical release history, while the installed
-metadata remains valid without duplicating that history.
+month and nonzero-counter validation in a dedicated job before any matrix
+build installs dependencies. A fail-fast-disabled matrix then builds inside
+the official `ubuntu:24.04`, `ubuntu:26.04`, and `debian:13` containers on a
+GitHub Ubuntu runner. Every target verifies the clean Git-derived version,
+builds and tests, and stages `prefix=/usr` as an installation smoke test. The
+staged trees remain job-local: they are not useful distribution archives and
+must not be uploaded unless a future diagnostic need justifies them.
+The container workspace is mounted with ownership inherited from the host
+runner, so a step after checkout adds exactly `$GITHUB_WORKSPACE` to the
+container user's global Git `safe.directory` list before running the version
+script. Do not replace this with the unsafe wildcard value `*`.
+
+Only after the clean-tag tree is staged does each matrix leg use `dch` to
+replace the placeholder changelog with
+`<tag>-0losles1~<target><revision>`. Delaying that temporary edit matters:
+otherwise Git version derivation would see a dirty checkout and embed
+`<tag>+dirty` in the staged binary. Each target then builds its native binary
+package through `dpkg-buildpackage`, verifies both changelog and `.deb`
+versions, inspects the package, runs Lintian with errors fatal, and uploads a
+separately labelled `.deb` artifact with seven-day retention. These temporary
+artifacts are the matrix-to-release handoff. Native container builds matter
+because runtime package names and symbol-derived minimum dependencies can
+differ even when shared-library SONAMEs match. Keep `fetch-depth: 0`, because
+development-version derivation needs tag history. Keep `fail-fast: false` so
+one target's packaging failure does not hide results from the others.
+
+After every matrix leg succeeds, the release job downloads the three package
+artifacts into one directory, requires the exact target-qualified amd64
+filenames, and creates `SHA256SUMS`. With job-local `contents: write`
+permission, it creates the tag's GitHub Release with generated notes and the
+four files. A rerun updates an existing release's assets with `--clobber`.
+Build and validation jobs retain read-only repository permission. GitHub adds
+the tag's source ZIP and tarball itself. The AppStream file intentionally has
+no `<releases>` list: Git tags are the canonical release history, while the
+installed metadata remains valid without duplicating that history.
 
 The Debian packaging is intentionally usable beyond CI. `debian/rules`
 passes `prefix=/usr` because the installed icon path is compiled in, and
-passes `VERSION=$(DEB_VERSION_UPSTREAM)` so source-package builds do not
-depend on `.git`. It passes an empty `SOURCE_ICON_FILE` so a distributable
-binary contains only the installed `/usr` icon path, not the build machine's
-absolute source checkout. The ordinary developer build retains its absolute
-source-icon fallback so `build/losles` has an icon before installation. The
-packaging enables all normal dpkg hardening. `debian/control` uses
-`Architecture: linux-any` because the cache budget currently uses Linux
-`sysinfo()`, and recommends rather than depends on `colord` because the
-viewer has an explicit sRGB fallback. The maintainer address is
-`piotr@develancer.pl`. Add Salsa `Vcs-Git`/`Vcs-Browser` fields only after
-the corresponding repository exists.
+passes `VERSION=$(DEB_VERSION_UPSTREAM)` to the clean, build, test, and
+install phases so source-package builds do not depend on `.git`. Supplying it
+during clean is important because `dh_auto_clean` dry-runs candidate Make
+targets before selecting one; a Git failure during that probe can otherwise
+be mistaken for output from an existing `distclean` target. The install phase
+passes an empty `SOURCE_ICON_FILE` so a distributable binary contains only
+the installed `/usr` icon path, not the build machine's absolute source
+checkout. The ordinary developer build retains its absolute source-icon
+fallback so `build/losles` has an icon before installation. The packaging
+enables all normal dpkg hardening. `debian/control` uses `Architecture:
+linux-any` because the cache budget currently uses Linux `sysinfo()`, and
+recommends rather than depends on `colord` because the viewer has an explicit
+sRGB fallback. The maintainer address is `piotr@develancer.pl`. Add Salsa
+`Vcs-Git`/`Vcs-Browser` fields only after the corresponding repository
+exists.
 
 The source tree and application icon are MIT-licensed. The AppStream XML is
 CC0-1.0 and carries an SPDX declaration; this exception is recorded in both
@@ -872,6 +903,15 @@ For ordinary C changes, at minimum run:
 ```sh
 make test
 ```
+
+The `test-formats` recipe runs with a temporary `HOME` and `TMPDIR` on the
+same filesystem. This is required for its isolated GIO Trash assertions:
+GLib compares a file's filesystem with the home directory's filesystem when
+choosing the home Trash. GitHub job containers mount their normal
+`/github/home` separately from `/tmp`, which would otherwise make temporary
+fixtures look like files on a system mount where Trash is unavailable. Keep
+the test home isolated and same-filesystem rather than weakening or skipping
+the Trash assertions.
 
 Run the sanitizer build for parser, memory-ownership, cache, cancellation, or
 threading changes. Add regression tests for new formats, malformed metadata,

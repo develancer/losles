@@ -9,9 +9,11 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Ubuntu 24.04
+  validate:
+    name: Validate release tag
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Check out the release tag
@@ -33,17 +35,45 @@ jobs:
           fi
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
+  build:
+    name: ${{ matrix.label }}
+    needs: validate
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Ubuntu 24.04
+            image: ubuntu:24.04
+            target: ubuntu-24.04
+            package_suffix: ubuntu24.04.1
+          - label: Ubuntu 26.04
+            image: ubuntu:26.04
+            target: ubuntu-26.04
+            package_suffix: ubuntu26.04.1
+          - label: Debian 13
+            image: debian:13
+            target: debian-13
+            package_suffix: debian13.1
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Install build environment
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends \
+          apt-get update
+          apt-get install --yes --no-install-recommends \
             appstream \
             build-essential \
+            ca-certificates \
             debhelper \
             desktop-file-utils \
             devscripts \
             dpkg-dev \
             fakeroot \
+            git \
             libcolord-dev \
             libgtk-4-dev \
             libjpeg-dev \
@@ -52,6 +82,31 @@ jobs:
             libturbojpeg0-dev \
             lintian \
             pkgconf
+
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Trust checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify checkout version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${{ needs.validate.outputs.version }}"
+          tag_version="$(./tools/version.sh --from-tag "$GITHUB_REF_NAME")"
+          build_version="$(make --no-print-directory print-version)"
+          if [[ "$tag_version" != "$expected_version" ]]; then
+            echo "Tag version '$tag_version' does not match validated version '$expected_version'." >&2
+            exit 1
+          fi
+          if [[ "$build_version" != "$expected_version" ]]; then
+            echo "Build version '$build_version' does not match validated version '$expected_version'." >&2
+            exit 1
+          fi
 
       - name: Compile
         run: make -j2 SOURCE_ICON_FILE= prefix=/usr all
@@ -62,19 +117,12 @@ jobs:
       - name: Stage installation
         run: make SOURCE_ICON_FILE= prefix=/usr DESTDIR="$PWD/build/stage" install
 
-      - name: Upload compiled installation tree
-        uses: actions/upload-artifact@v7
-        with:
-          name: losles-${{ steps.version.outputs.version }}-ubuntu-24.04-x86_64
-          path: build/stage/
-          if-no-files-found: error
-
       - name: Prepare GitHub package changelog
         id: package_version
         shell: bash
         run: |
           set -euo pipefail
-          package_version="${{ steps.version.outputs.version }}-0losles1"
+          package_version="${{ needs.validate.outputs.version }}-0losles1~${{ matrix.package_suffix }}"
           DEBFULLNAME="Piotr T. Różański" \
           DEBEMAIL="piotr@develancer.pl" \
             dch \
@@ -100,6 +148,11 @@ jobs:
           package_arch="$(dpkg --print-architecture)"
           package_file="../losles_${package_version}_${package_arch}.deb"
           test -f "$package_file"
+          resolved_version="$(dpkg-deb --field "$package_file" Version)"
+          if [[ "$resolved_version" != "$package_version" ]]; then
+            echo "Built package version '$resolved_version' does not match '$package_version'." >&2
+            exit 1
+          fi
           install -D -m 0644 "$package_file" "dist/$(basename "$package_file")"
           echo "path=dist/$(basename "$package_file")" >> "$GITHUB_OUTPUT"
 
@@ -112,6 +165,84 @@ jobs:
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
-          name: losles-${{ steps.version.outputs.version }}-ubuntu-24.04-amd64-deb
+          name: losles-${{ needs.validate.outputs.version }}-${{ matrix.target }}-amd64-deb
           path: ${{ steps.package.outputs.path }}
           if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download Debian packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: losles-${{ needs.validate.outputs.version }}-*-amd64-deb
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          expected=(
+            "losles_${version}-0losles1~ubuntu24.04.1_amd64.deb"
+            "losles_${version}-0losles1~ubuntu26.04.1_amd64.deb"
+            "losles_${version}-0losles1~debian13.1_amd64.deb"
+          )
+          mapfile -t packages < <(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' \
+              -printf '%f\n' |
+              sort
+          )
+          if [[ "${#packages[@]}" -ne "${#expected[@]}" ]]; then
+            echo "Expected ${#expected[@]} Debian packages, found ${#packages[@]}." >&2
+            printf 'Found: %s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+          for package in "${expected[@]}"; do
+            if [[ ! -f "release-assets/$package" ]]; then
+              echo "Missing expected release package: $package" >&2
+              exit 1
+            fi
+          done
+          (
+            cd release-assets
+            sha256sum "${expected[@]}" > SHA256SUMS
+          )
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${{ needs.validate.outputs.version }}"
+          mapfile -t assets < <(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              \( -name '*.deb' -o -name SHA256SUMS \) |
+              sort
+          )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --generate-notes \
+              --title "losles $version" \
+              --verify-tag
+          fi

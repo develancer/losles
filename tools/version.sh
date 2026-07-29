@@ -35,6 +35,12 @@ if [ "$#" -gt 0 ]; then
 fi
 
 if ! git -C "$repository_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
+  if [ -e "$repository_dir/.git" ]; then
+    echo "Git metadata is present but could not be read;" \
+      "check repository ownership and safe.directory." >&2
+    git -C "$repository_dir" rev-parse --verify HEAD
+    exit 1
+  fi
   printf '%s\n' "0+unknown"
   exit
 fi

@@ -117,23 +117,47 @@ provide the version explicitly:
 make VERSION=2026.07.1
 ```
 
-The GitHub Actions tagged-build workflow runs only for pushed tags matching
-the release-tag shape. It validates the month and release counter, compiles
-and tests on Ubuntu 24.04, and produces two artifacts: a staged `/usr`
-installation tree and an installable Ubuntu 24.04 `.deb` package. The Debian
-package is assigned an ephemeral version derived from the tag, such as
-`2026.07.1-0losles1`. The `-0losles1` revision sorts below Debian's future
-`-1`, allowing an official repository package to replace the GitHub build
-automatically.
+`0+unknown` is reserved for a source tree which genuinely has no `.git`
+metadata. If metadata exists but Git cannot read it—for example because Git's
+repository-ownership protection rejects a mounted directory—the version
+script reports the Git error and fails instead of silently embedding an
+unknown version.
 
-The package is built with the normal Debian `debhelper` toolchain, validates
-the desktop and AppStream files, and runs Lintian. It is an unsigned
-convenience package rather than an APT repository. After extracting the
-GitHub Actions artifact, install it together with its repository dependencies
-using:
+The GitHub Actions tagged-build workflow runs only for pushed tags matching
+the release-tag shape. It validates the month and release counter once, then
+compiles and tests independently in clean Ubuntu 24.04, Ubuntu 26.04, and
+Debian 13 containers. Each target exercises a staged `/usr` installation as a
+smoke test and produces a native `.deb`. The raw installation trees are not
+uploaded because the packages already contain those files together with
+dependency, ownership, upgrade, and removal metadata.
+
+The convenience packages have target-qualified versions derived from the tag:
+
+```text
+2026.07.1-0losles1~ubuntu24.04.1
+2026.07.1-0losles1~ubuntu26.04.1
+2026.07.1-0losles1~debian13.1
+```
+
+These revisions sort below Debian's future `-1`, allowing an official
+repository package to replace a GitHub build automatically. Building each
+package inside its target system also lets `debhelper` generate the correct
+native shared-library package names and minimum versions.
+
+Every package build validates the desktop and AppStream files and runs
+Lintian. After all three targets succeed, the workflow publishes one GitHub
+Release for the tag with the three `.deb` packages and a `SHA256SUMS` file.
+GitHub supplies the corresponding source ZIP and tarball automatically. The
+packages are also retained briefly as Actions artifacts so the release job can
+collect them, but the Release assets are the intended downloads.
+
+These are unsigned convenience packages rather than an APT repository.
+Download the package matching the installed distribution and install it
+together with its repository dependencies. For example, on Ubuntu 24.04:
 
 ```sh
-sudo apt install ./losles_2026.07.1-0losles1_amd64.deb
+sudo apt install \
+  './losles_2026.07.1-0losles1~ubuntu24.04.1_amd64.deb'
 ```
 
 The versioned `debian/changelog` contains a neutral `0~unreleased-1`

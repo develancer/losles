@@ -160,7 +160,10 @@ $(CACHE_POLICY_TEST): $(CACHE_POLICY_TEST_OBJECTS)
 
 test: $(TEST_PROGRAMS)
 	$(JPEG_METADATA_TEST)
-	$(FORMAT_TEST)
+	@test_home="$$(mktemp -d \
+	  "$${TMPDIR:-/tmp}/losles-format-test-home.XXXXXX")" || exit 1; \
+	trap '$(RM) -r -- "$$test_home"' EXIT HUP INT TERM; \
+	HOME="$$test_home" TMPDIR="$$test_home" $(FORMAT_TEST)
 	$(CACHE_POLICY_TEST)
 
 run: $(APP)
