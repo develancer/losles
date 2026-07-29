@@ -50,7 +50,9 @@ and not much more.
   images on either side in the background, prioritizing nearby images and the
   current navigation direction. Decoded sources and display-profile textures
   have separate cache limits of 10% of total system memory each, with at most
-  two background decodes and two background color conversions at once.
+  two background decodes and two background color conversions at once. When
+  adjacent images have identical displayed dimensions, navigation preserves
+  the current zoom and pan position.
 - A format-module interface. JPEG and PNG are separate GObject
   implementations, so another decoder/editor does not need changes to the
   window or color pipeline.
@@ -285,6 +287,11 @@ zooming, except when an image edge reaches the edge of the canvas. While
 zoomed in, drag the image with the primary mouse button to inspect another
 portion. Zooming scales the existing color-managed texture and does not
 decode or color-convert the source again.
+
+Use `Left` and `Right`, the header buttons, or the mouse's Back and Forward
+buttons to show the previous or next image. If the replacement has exactly
+the same displayed pixel dimensions, its zoom level and normalized pan
+position are preserved. A differently sized image starts at its fitted view.
 
 Double-click the picture or press `Alt+Enter` to enter or leave fullscreen.
 The header bar is hidden while fullscreen is active. `Escape` does not leave

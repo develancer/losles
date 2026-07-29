@@ -19,6 +19,8 @@
 #define ZOOM_STEP 1.25
 #define ZOOM_MAX 16.0
 #define LOADING_SPINNER_SIZE 64
+#define MOUSE_BUTTON_BACK 8
+#define MOUSE_BUTTON_FORWARD 9
 
 typedef struct {
   LoslesFormatRegistry *registry;
@@ -166,6 +168,7 @@ struct _LoslesWindow {
   gboolean operation_in_progress;
   gboolean foreground_loading;
   gboolean reset_zoom_on_next_display;
+  gboolean preserve_zoom_if_same_dimensions;
   gdouble zoom_scale;
   gdouble zoom_center_x;
   gdouble zoom_center_y;
@@ -191,7 +194,9 @@ struct _LoslesWindow {
 
 G_DEFINE_FINAL_TYPE(LoslesWindow, losles_window, GTK_TYPE_APPLICATION_WINDOW)
 
-static void show_index(LoslesWindow *self, guint index);
+static void show_index(LoslesWindow *self,
+                       guint index,
+                       gboolean preserve_zoom_if_same_dimensions);
 static void start_render(LoslesWindow *self);
 static void start_render_for_image(LoslesWindow *self,
                                    LoslesImage *image,
@@ -460,6 +465,7 @@ clear_current_image(LoslesWindow *self)
 {
   self->foreground_loading = FALSE;
   self->reset_zoom_on_next_display = FALSE;
+  self->preserve_zoom_if_same_dimensions = FALSE;
   g_clear_object(&self->current_image);
   g_clear_object(&self->current_texture);
   gtk_picture_set_paintable(self->picture, NULL);
@@ -471,7 +477,8 @@ clear_current_image(LoslesWindow *self)
 }
 
 static void
-prepare_for_image_load(LoslesWindow *self)
+prepare_for_image_load(LoslesWindow *self,
+                       gboolean preserve_zoom_if_same_dimensions)
 {
   /*
    * The decoded source belongs to the newly selected file, while the texture
@@ -481,6 +488,8 @@ prepare_for_image_load(LoslesWindow *self)
    */
   self->foreground_loading = TRUE;
   self->reset_zoom_on_next_display = TRUE;
+  self->preserve_zoom_if_same_dimensions =
+    preserve_zoom_if_same_dimensions;
   g_clear_object(&self->current_image);
   self->zoom_dragging = FALSE;
   self->crop_valid = FALSE;
@@ -1139,6 +1148,13 @@ display_rendered_image(LoslesWindow *self,
   gtk_spinner_stop(self->spinner);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
 
+  const gboolean preserve_zoom =
+    self->reset_zoom_on_next_display &&
+    self->preserve_zoom_if_same_dimensions &&
+    self->current_texture &&
+    (guint)gdk_texture_get_width(self->current_texture) == rendered->width &&
+    (guint)gdk_texture_get_height(self->current_texture) == rendered->height;
+
   g_clear_object(&self->current_texture);
   if (cached_texture)
     self->current_texture = g_object_ref(cached_texture);
@@ -1147,11 +1163,12 @@ display_rendered_image(LoslesWindow *self,
       losles_rendered_image_create_texture(rendered);
   gtk_picture_set_paintable(self->picture,
                             GDK_PAINTABLE(self->current_texture));
-  if (self->reset_zoom_on_next_display)
+  if (self->reset_zoom_on_next_display && !preserve_zoom)
     reset_zoom(self);
   else
     apply_zoom_layout(self);
   self->reset_zoom_on_next_display = FALSE;
+  self->preserve_zoom_if_same_dimensions = FALSE;
   self->foreground_loading = FALSE;
 
   const LoslesPixelFormat source_format =
@@ -1456,7 +1473,9 @@ show_no_picture(LoslesWindow *self)
 }
 
 static void
-show_index(LoslesWindow *self, guint index)
+show_index(LoslesWindow *self,
+           guint index,
+           gboolean preserve_zoom_if_same_dimensions)
 {
   if (!self->files || index >= self->files->len)
     return;
@@ -1472,7 +1491,7 @@ show_index(LoslesWindow *self, guint index)
 
   GFile *file = current_file(self);
   update_title(self, file);
-  prepare_for_image_load(self);
+  prepare_for_image_load(self, preserve_zoom_if_same_dimensions);
   g_autofree gchar *uri = file_uri(file);
   LoslesImage *cached_image =
     g_hash_table_lookup(self->cache, uri);
@@ -1498,7 +1517,7 @@ static void
 previous_image(LoslesWindow *self)
 {
   if (!self->operation_in_progress && self->current_index > 0)
-    show_index(self, self->current_index - 1);
+    show_index(self, self->current_index - 1, TRUE);
 }
 
 static void
@@ -1507,7 +1526,56 @@ next_image(LoslesWindow *self)
   if (!self->operation_in_progress &&
       self->files &&
       self->current_index + 1 < self->files->len)
-    show_index(self, self->current_index + 1);
+    show_index(self, self->current_index + 1, TRUE);
+}
+
+static gboolean
+is_mouse_navigation_button(guint button,
+                           gboolean *back)
+{
+  /*
+   * X11 and Wayland conventionally expose the two thumb buttons as 8 and 9.
+   * GTK's Win32 backend has also exposed XBUTTON1/2 as 4 and 5, so accept
+   * both pairs there. Wheel input is delivered as a scroll event, not one of
+   * these button events.
+   */
+#ifdef G_OS_WIN32
+  if (button == 4 || button == 5) {
+    *back = button == 4;
+    return TRUE;
+  }
+#endif
+  if (button == MOUSE_BUTTON_BACK ||
+      button == MOUSE_BUTTON_FORWARD) {
+    *back = button == MOUSE_BUTTON_BACK;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean
+mouse_navigation_event(GtkEventControllerLegacy *controller,
+                       GdkEvent *event,
+                       LoslesWindow *self)
+{
+  (void)controller;
+  const GdkEventType event_type = gdk_event_get_event_type(event);
+  if (event_type != GDK_BUTTON_PRESS &&
+      event_type != GDK_BUTTON_RELEASE)
+    return FALSE;
+
+  gboolean back = FALSE;
+  if (!is_mouse_navigation_button(gdk_button_event_get_button(event),
+                                  &back))
+    return FALSE;
+
+  if (event_type == GDK_BUTTON_PRESS) {
+    if (back)
+      previous_image(self);
+    else
+      next_image(self);
+  }
+  return TRUE;
 }
 
 static gboolean
@@ -2308,7 +2376,7 @@ delete_done(GObject *source_object,
     g_clear_pointer(&self->files, g_ptr_array_unref);
     self->files = g_steal_pointer(&delete_result->files);
     self->current_index = (guint)next_index;
-    show_index(self, self->current_index);
+    show_index(self, self->current_index, TRUE);
   }
   delete_result_free(delete_result);
 }
@@ -3092,9 +3160,11 @@ losles_window_init(LoslesWindow *self)
                            self);
 
   self->previous_button =
-    GTK_BUTTON(icon_button("go-previous-symbolic", "Previous image (Left)"));
+    GTK_BUTTON(icon_button("go-previous-symbolic",
+                           "Previous image (Left or mouse Back)"));
   self->next_button =
-    GTK_BUTTON(icon_button("go-next-symbolic", "Next image (Right)"));
+    GTK_BUTTON(icon_button("go-next-symbolic",
+                           "Next image (Right or mouse Forward)"));
   gtk_header_bar_pack_start(self->header_bar,
                             GTK_WIDGET(self->previous_button));
   gtk_header_bar_pack_start(self->header_bar,
@@ -3371,6 +3441,16 @@ losles_window_init(LoslesWindow *self)
   gtk_widget_add_controller(GTK_WIDGET(self),
                             GTK_EVENT_CONTROLLER(file_drop_target));
 
+  GtkEventController *mouse_navigation =
+    gtk_event_controller_legacy_new();
+  gtk_event_controller_set_propagation_phase(mouse_navigation,
+                                             GTK_PHASE_CAPTURE);
+  g_signal_connect(mouse_navigation,
+                   "event",
+                   G_CALLBACK(mouse_navigation_event),
+                   self);
+  gtk_widget_add_controller(GTK_WIDGET(self), mouse_navigation);
+
   g_signal_connect(self,
                    "map",
                    G_CALLBACK(window_mapped),
@@ -3411,7 +3491,7 @@ losles_window_open_file(LoslesWindow *self, GFile *file)
     g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
   g_ptr_array_add(self->files, g_object_ref(file));
   self->current_index = 0;
-  show_index(self, 0);
+  show_index(self, 0, FALSE);
   scan_directory(self, file);
   gtk_window_present(GTK_WINDOW(self));
 }

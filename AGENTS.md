@@ -79,7 +79,8 @@ them:
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
 - Viewing interaction: cursor-anchored wheel zoom from fit to 16× and
-  primary-button panning on overflowing axes.
+  primary-button panning on overflowing axes. Adjacent navigation preserves
+  zoom and normalized pan when the old and new displayed dimensions match.
 
 Important current exclusions include CMYK/YCCK JPEG display, editing of
 palette/sub-8-bit/16-bit/interlaced/animated PNGs, 16-bit display buffers,
@@ -678,6 +679,7 @@ Current actions and shortcuts:
 - Open: `Ctrl+O`;
 - Previous image: `Left`;
 - Next image: `Right`;
+- previous/next image: mouse Back/Forward thumb buttons;
 - toggle the information OSD: information header button or `I`;
 - enter/leave fullscreen: double-click the picture or `Alt+Enter`;
 - enter/leave crop mode: crop header button or `C`;
@@ -717,17 +719,22 @@ request, the previous `current_texture` remains attached to `GtkPicture` while
 the selected file is decoded and color-converted. `current_image` is cleared
 until the new decode completes, `foreground_loading` keeps edit controls and
 destructive shortcuts disabled through rendering, and
-`reset_zoom_on_next_display` resets zoom only when the replacement texture is
-installed. Thus the old image and its current zoom remain visible under the
-spinner without allowing an operation to target a file other than the one
-shown. The first image still loads over the black canvas because there is no
-texture to retain. Foreground decode/render errors clear the retained display
-rather than leaving a stale image associated with the failed filename. Before
-starting the spinner, `show_index()` checks both the source and rendered caches
-for the selected URI. If both entries exist, it installs the cached image and
-texture synchronously and never enters the visible loading state. A partial
-cache hit still uses the spinner because a decode or display-profile
-conversion remains to be completed.
+`reset_zoom_on_next_display` defers the zoom decision until the replacement
+texture is installed. Previous/next navigation also sets
+`preserve_zoom_if_same_dimensions`; `display_rendered_image()` compares the
+retained texture's displayed width and height with the replacement and keeps
+`zoom_scale` plus the normalized center only for an exact match. Differently
+sized images, direct opens, and edit reloads reset to fit. Thus the old image
+and its current zoom remain visible under the spinner without allowing an
+operation to target a file other than the one shown. The first image still
+loads over the black canvas because there is no texture to retain. Foreground
+decode/render errors clear the retained display rather than leaving a stale
+image associated with the failed filename. Before starting the spinner,
+`show_index()` checks both the source and rendered caches for the selected
+URI. If both entries exist, it installs the cached image and texture
+synchronously and never enters the visible loading state. A partial cache hit
+still uses the spinner because a decode or display-profile conversion remains
+to be completed.
 
 Fullscreen hides the header bar and its controls. Keep
 `notify::fullscreened` as the source of truth so the header is restored even
@@ -751,8 +758,20 @@ only on axes where the scaled image is larger than the viewport.
 the picture widget's size and position inside the clipped `GtkFixed`. It must
 not trigger a new decode, ICC transform, or scaled-pixel cache. The canvas
 `GtkDrawingArea::resize` signal updates the viewport dimensions; resizing or
-entering fullscreen keeps the normalized image center. Loading another image
-resets scale and center.
+entering fullscreen keeps the normalized image center. Previous/next
+navigation keeps the scale and center when the incoming texture has exactly
+the same width and height as the retained texture; otherwise the incoming
+image resets to fit. Direct file opens and post-edit reloads always reset.
+
+A capture-phase `GtkEventControllerLegacy` on the window consumes auxiliary
+Back/Forward button press and release events and calls the same
+`previous_image()`/`next_image()` functions as the header controls and
+keyboard actions. X11/Wayland use conventional button numbers 8/9. The Win32
+path additionally accepts GTK's XBUTTON1/2 mapping as 4/5; wheel motion is a
+separate scroll event and continues to control zoom. Keep this controller at
+the window level so the buttons work over the canvas, overlays, and header,
+and keep navigation policy in the shared functions rather than duplicating it
+in the event callback.
 
 The crop overlay maps between the contained picture rectangle and display
 pixel coordinates. Crop is disabled unless EXIF orientation is `1`, so those
@@ -1072,10 +1091,10 @@ overflow boundaries, orientation mappings, and editing guarantees.
 Automated tests do not validate real colord/Win32 display-profile discovery,
 movement between physical monitors, actual wide-gamut appearance, Windows
 Recycle Bin recovery, GTK interaction (including overlay placement,
-shortcuts, gestures, and fullscreen), or directory navigation timing. Changes
-in those areas need manual graphical-session checks on Ubuntu 24.04 and
-Windows as applicable. Never claim display-color correctness based only on an
-sRGB-to-sRGB unit test.
+shortcuts, auxiliary mouse buttons, zoom handoff, gestures, and fullscreen),
+or directory navigation timing. Changes in those areas need manual
+graphical-session checks on Ubuntu 24.04 and Windows as applicable. Never
+claim display-color correctness based only on an sRGB-to-sRGB unit test.
 
 ## Coding conventions and sensitive areas
 
