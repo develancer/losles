@@ -60,8 +60,9 @@ them:
   manager.
 - Navigation should favor low latency. Adjacent images are decoded and
   color-converted in advance, within bounded memory and concurrency limits.
-- Prefer libraries shipped by the default Ubuntu repositories. Avoid vendored
-  frameworks or a new language runtime without a concrete, measured reason.
+- Prefer libraries shipped by the default Ubuntu repositories and the MSYS2
+  UCRT64 repository. Avoid vendored frameworks or a new language runtime
+  without a concrete, measured reason.
 
 ## Supported behavior at a glance
 
@@ -72,8 +73,9 @@ them:
 - Editing: coefficient-level JPEG rotation, EXIF-orientation normalization,
   and MCU-aligned JPEG crop through libturbojpeg; pixel-lossless rotation and
   exact-pixel crop for static, non-interlaced, direct-color 8-bit PNGs.
-- Display color: selected/default colord profile for the window's current
-  monitor, with a built-in sRGB output fallback.
+- Display color: selected/default colord profile on Linux or Win32 output
+  profile on Windows for the window's current monitor, with a built-in sRGB
+  output fallback.
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
 - Viewing interaction: cursor-anchored wheel zoom from fit to 16× and
@@ -88,21 +90,34 @@ HDR, animations, free rotation, and zooming out below the initial fit.
 Build system: GNU Make. The Makefile defaults to `-O2 -g`, compiles as C17,
 and keeps generated output outside the source tree.
 
+Supported platform baselines are Ubuntu 24.04 or later and, while the native
+port is under test, x86-64 Windows 10/11 built in MSYS2 UCRT64. Windows
+compilation defines `_WIN32_WINNT` and `WINVER` as `0x0a00`, matching that
+baseline and exposing `IFileOperation`'s recycle-on-delete flags.
+
 Compile/link dependencies:
 
 - GTK 4 (`gtk4 >= 4.10`; Ubuntu 24.04 currently supplies 4.14);
 - GLib/GIO/GObject and GDK through GTK;
 - LittleCMS 2 (`lcms2 >= 2.14`);
-- colord (`colord >= 1.4.6`);
+- colord (`colord >= 1.4.6`, Linux only);
 - libjpeg, normally libjpeg-turbo on Ubuntu;
 - TurboJPEG, the public lossless-transform API from libjpeg-turbo;
 - libpng (`libpng >= 1.6`).
 
+Windows compilation also uses GNU `windres`, supplied by the UCRT64 GCC
+toolchain, to embed the native application icon. The tagged Windows packaging
+job uses the UCRT64 `mingw-w64-ucrt-x86_64-nsis` package; NSIS is not required
+for an ordinary developer build or for Linux.
+
 Runtime integration:
 
 - a running colord service and a display device/profile association are needed
-  for monitor-specific output; viewing still works with the built-in sRGB
-  target when lookup fails;
+  for monitor-specific Linux output;
+- Windows uses GTK's native Win32 surface handle plus `GetICMProfileW`; shell
+  APIs provide the Recycle Bin transaction;
+- viewing still works with the built-in sRGB target when platform lookup
+  fails;
 - a graphical GTK session is needed to exercise the application itself.
 
 Install the Ubuntu dependencies with:
@@ -126,9 +141,9 @@ The Makefile uses `pkg-config`, generates header dependency files, and keeps
 all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
 `applicationsdir`, `metainfodir`, `icondir`, `localedir`, `DESTDIR`,
 `mandir`, `man1dir`, `BUILD_DIR`, `VERSION`, `CFLAGS`, `LDFLAGS`, `LDLIBS`,
-`SOURCE_ICON_FILE`, and `SANITIZE` overrides. Use a distinct `BUILD_DIR`
-after changing compiler/sanitizer modes because Make does not record
-command-line flag changes:
+`SOURCE_ICON_FILE`, `WINDRES`, and `SANITIZE` overrides. Use a distinct
+`BUILD_DIR` after changing compiler/sanitizer modes because Make does not
+record command-line flag changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -220,7 +235,8 @@ DEBEMAIL="piotr@develancer.pl" \
 ```
 
 Set `G_MESSAGES_DEBUG=losles` when diagnosing monitor/colord selection. The
-color manager logs connector names, lookup failures, and the selected profile.
+color manager logs connector/device names, lookup failures, and the selected
+profile on either platform.
 
 ## Repository layout
 
@@ -231,12 +247,19 @@ color manager logs connector names, lookup failures, and the selected profile.
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
 ├── .github/workflows/
-│   └── tagged-build.yml         Tag-only build/test/DEB/release publishing CI
+│   └── tagged-build.yml         Tag-only Linux/Windows release CI
 ├── tools/
-│   └── version.sh               CalVer validation and Git version derivation
+│   ├── version.sh               CalVer validation and Git version derivation
+│   └── copy-pe-runtime.sh       Recursive Windows runtime-DLL collection
+├── packaging/windows/
+│   ├── COPYING.rtf             Windows installer license rendering
+│   ├── losles.rc                Native executable icon resource
+│   └── losles.nsi               Per-user NSIS installer definition
 ├── data/
 │   ├── icons/hicolor/512x512/apps/
 │   │   └── io.github.develancer.losles.png
+│   ├── icons/windows/
+│   │   └── io.github.develancer.losles.ico
 │   ├── io.github.develancer.losles.desktop
 │   ├── io.github.develancer.losles.metainfo.xml
 │   └── losles.1                 Command-line manual page
@@ -255,10 +278,13 @@ color manager logs connector names, lookup failures, and the selected profile.
 │   ├── losles-cache-policy.[ch] Cache ordering, admission, and eviction
 │   ├── losles-window.[ch]       UI, directory scan, jobs, caches, editing flow
 │   ├── losles-image.[ch]        Immutable decoded-source model
+│   ├── losles-platform.h        OS integration boundary
+│   ├── losles-platform-linux.c  sysinfo, GIO Trash, links, permissions
+│   ├── losles-platform-win32.c  RAM, Recycle Bin, links, portable icon path
 │   ├── losles-rendered-image.[ch]
 │   │                             Oriented, display-RGB pixel result/texture
 │   ├── losles-color-manager.[ch]
-│   │                             colord target lookup and LittleCMS rendering
+│   │                             platform ICC lookup and LittleCMS rendering
 │   └── formats/
 │       ├── losles-format.[ch]   GObject interface for decoding/editing
 │       ├── losles-format-registry.[ch]
@@ -281,7 +307,16 @@ It is derived from the upstream GitHub account. If the ID changes, update all
 references together and rename both installed metadata files and the icon.
 The application icon is a checked-in 512×512 PNG named after this ID in the
 standard hicolor `apps` directory. The desktop entry uses the same
-unqualified icon name so GNOME can resolve the installed asset.
+unqualified icon name so GNOME can resolve the installed asset. The Windows
+ICO is a multi-resolution derivative of the same icon and must be regenerated
+when the source PNG changes. Its entries are 256, 128, 64, 48, 32, 24, and
+16 pixels. ImageMagick can reproduce it with:
+
+```sh
+convert data/icons/hicolor/512x512/apps/io.github.develancer.losles.png \
+  -define icon:auto-resize=256,128,64,48,32,24,16 \
+  data/icons/windows/io.github.develancer.losles.ico
+```
 
 ## End-to-end architecture
 
@@ -416,10 +451,12 @@ transform before touching the source, then installs it with overwrite
 semantics. Rotation intentionally creates no Trash entry or persistent backup;
 failure before replacement leaves the source unchanged.
 
-Crop additionally requires a functioning GIO Trash implementation. It creates
-a same-directory hard-link safety backup (falling back to a
-metadata-preserving copy), moves the exact original with `g_file_trash()`, and
-then moves the cropped file into the original path. Cancellation is
+Crop additionally requires a functioning platform Trash implementation. It
+creates a same-directory hard-link safety backup (falling back to a
+metadata-preserving copy), moves the exact original with the shared platform
+helper, and then moves the cropped file into the original path. Linux uses
+GIO Trash; Windows uses `IFileOperation` with `FOFX_RECYCLEONDELETE`.
+Cancellation is
 deliberately ignored during this final crop commit phase. If installation
 fails after trashing, losles tries to restore the safety backup; the error
 identifies the backup path if automatic restoration also fails. Never replace
@@ -481,7 +518,8 @@ backup, restore, or cleanup logic need review and tests for both modules.
 ## ICC and display-color model
 
 Ubuntu 24.04's GTK 4.14 cannot attach an ICC colorspace to a surface. losles
-therefore uses application-managed display conversion:
+therefore uses application-managed display conversion. Its Linux target
+lookup is:
 
 1. Find the `GdkMonitor` containing the window surface.
 2. Read its connector with `gdk_monitor_get_connector()`.
@@ -501,12 +539,26 @@ the output buffer. An embedded source profile is used only if LittleCMS can
 open it and its color space matches the decoded pixel model: gray for
 `G8`/`GA8`, RGB for `RGB8`/`RGBA8`. Invalid or incompatible profiles fall back
 to D65 gamma-2.2 gray or sRGB respectively. The active output target falls
-back to a generated sRGB profile when colord lookup/profile loading fails.
+back to a generated sRGB profile when platform lookup/profile loading fails.
 
-`LoslesColorManager` caches one target for the active connector. It listens to
-the active colord device's `changed` signal. The window also watches monitor
-enter/leave signals. Either event invalidates every rendered result and starts
-a new foreground render.
+On Windows, `LoslesColorManager` receives both the `GdkMonitor` and the window
+surface. `GDK_SURFACE_HWND()` supplies the native window, `MonitorFromWindow`
+and `GetMonitorInfoW` supply its display device, and `GetICMProfileW` returns
+the current output profile path for that device context. The manager caches
+one target keyed by connector, profile path, mtime, and size, rechecking these
+whenever rendering starts. Windows currently has no installed event hook for
+a profile change while the same image remains idle; navigation or monitor
+movement rechecks it. A Win32 target ID contains a SHA-256 digest of the
+profile bytes. `LoslesWindow::render_profile_id` records the target used by
+the current render generation. `start_render_for_image()` obtains the target
+before accepting a cache or in-flight hit; an ID mismatch cancels in-flight
+work, invalidates the whole render cache, and recomputes instead of displaying
+old device-RGB pixels.
+
+On Linux, the manager caches one target for the active connector and listens
+to the active colord device's `changed` signal. The window watches monitor
+enter/leave signals on both platforms. Monitor movement invalidates every
+rendered result and starts a new foreground render.
 
 This is not HDR support. It also assumes the Ubuntu 24.04 desktop will present
 the supplied device-RGB values without applying a second per-surface ICC
@@ -538,10 +590,12 @@ Two independent caches are keyed by the file URI:
 - display-profile `LoslesRenderedImage`/texture cache: 10% of total system
   memory.
 
-`losles_window_init()` reads Linux `sysinfo().totalram` once per window,
-including its `mem_unit` multiplier, and gives both caches the resulting
-independent 10% soft limit. Overflow is clamped to `G_MAXSIZE`. If the kernel
-query fails or reports zero memory, each cache falls back to 512 MiB.
+`losles_window_init()` asks the platform layer for total physical memory once
+per window and gives both caches the resulting independent 10% soft limit.
+Linux uses `sysinfo().totalram` with its `mem_unit`; Windows uses
+`GlobalMemoryStatusEx().ullTotalPhys`. Overflow is clamped to `G_MAXSIZE`. If
+the platform query fails or reports zero memory, each cache falls back to
+512 MiB.
 `losles_cache_policy_limit_for_memory()` owns the tested percentage and
 clamping arithmetic; keep operating-system discovery out of the policy helper.
 
@@ -651,6 +705,12 @@ Current actions and shortcuts:
   `license-type` properties unless separate Credits/License pages are wanted
   again.
 
+The crop toggle deliberately uses a 16×16 Cairo-drawn crop-corner glyph
+instead of the theme name `crop-symbolic`. Yaru provides that nonstandard
+name, but Adwaita—and therefore the Windows bundle—does not. The drawn glyph
+inherits the widget's current GTK foreground color and disabled styling; do
+not replace it with another desktop-theme-only name.
+
 The centered loading spinner has a fixed 64×64-pixel request and an explicit
 white application-priority color. On navigation, reload, or a new open
 request, the previous `current_texture` remains attached to `GtkPicture` while
@@ -754,8 +814,9 @@ calling only the generic synchronous open/present path can leave keyboard
 focus in Nautilus.
 
 Delete is an explicit destructive action with recoverability through the
-system Trash. It runs in a worker and uses `g_file_trash()`; never replace it
-with unlinking. After Trash succeeds, the same worker rescans the directory.
+system Trash. It runs in a worker and uses `losles_platform_trash_file()`;
+never replace it with unlinking. After Trash succeeds, the same worker
+rescans the directory.
 The completion callback prefers the successor known before deletion, falling
 back to the first supported filename collating after the deleted filename.
 This matters when the original directory scan had not finished before the
@@ -791,16 +852,20 @@ ID, display name, and repository URL. It includes the generated
 `losles-version.h` for the build version. Keep the repository URL in the
 config header and AppStream metadata synchronized.
 
-The GitHub Actions workflow is deliberately release-only: branch pushes and
-pull requests do not trigger it. GitHub's tag filter selects the
+The tagged-build GitHub Actions workflow is deliberately release-only: branch
+pushes and pull requests do not trigger it. GitHub's tag filter selects the
 `YYYY.MM.N` shape, and `tools/version.sh --from-tag` applies the stricter
-month and nonzero-counter validation in a dedicated job before any matrix
-build installs dependencies. A fail-fast-disabled matrix then builds inside
-the official `ubuntu:24.04`, `ubuntu:26.04`, and `debian:13` containers on a
-GitHub Ubuntu runner. Every target verifies the clean Git-derived version,
-builds and tests, and stages `prefix=/usr` as an installation smoke test. The
-staged trees remain job-local: they are not useful distribution archives and
-must not be uploaded unless a future diagnostic need justifies them.
+month and nonzero-counter validation in a dedicated job before any platform
+build installs dependencies. A fail-fast-disabled Linux matrix then builds
+inside the official `ubuntu:24.04`, `ubuntu:26.04`, and `debian:13` containers
+on a GitHub Ubuntu runner. In parallel, a separate `windows-2025` job uses
+MSYS2 UCRT64; it remains separate because its runner, shell, dependencies,
+payload assembly, and installer smoke test do not fit cleanly into the Linux
+container matrix. Every platform verifies the clean Git-derived version
+before compiling. Each Linux target also stages `prefix=/usr` as an
+installation smoke test. Those staged Linux trees remain job-local: they are
+not useful distribution archives and must not be uploaded unless a future
+diagnostic need justifies them.
 The container workspace is mounted with ownership inherited from the host
 runner, so a step after checkout adds exactly `$GITHUB_WORKSPACE` to the
 container user's global Git `safe.directory` list before running the version
@@ -820,15 +885,89 @@ differ even when shared-library SONAMEs match. Keep `fetch-depth: 0`, because
 development-version derivation needs tag history. Keep `fail-fast: false` so
 one target's packaging failure does not hide results from the others.
 
-After every matrix leg succeeds, the release job downloads the three package
-artifacts into one directory, requires the exact target-qualified amd64
-filenames, and creates `SHA256SUMS`. With job-local `contents: write`
-permission, it creates the tag's GitHub Release with generated notes and the
-four files. A rerun updates an existing release's assets with `--clobber`.
-Build and validation jobs retain read-only repository permission. GitHub adds
-the tag's source ZIP and tarball itself. The AppStream file intentionally has
-no `<releases>` list: Git tags are the canonical release history, while the
-installed metadata remains valid without duplicating that history.
+The tagged workflow's Windows job uses the official `msys2/setup-msys2`
+action in UCRT64 mode, builds without colord, runs the portable tests, and
+builds one unsigned NSIS installer. Its private staging tree places the
+executable and DLLs under `bin`, the application and Adwaita icons under
+`share/icons`, GLib schemas under `share/glib-2.0`, and GdkPixbuf loaders
+under `lib`; preserve that relative layout because both GTK runtime discovery
+and the Win32 PNG-icon fallback depend on it. Project and MSYS2 dependency
+license texts accompany the installed binaries under `share/licenses`.
+
+The Windows installer payload does not copy the whole UCRT64 `bin` directory.
+`tools/copy-pe-runtime.sh` reads PE import tables with `objdump`, recursively
+follows only DLLs found in `/ucrt64/bin`, and treats imports not found there as
+Windows system libraries. Its roots are `losles.exe` plus the dynamically
+loaded GdkPixbuf JPEG and PNG modules. It prints each copied DLL together with
+the PE file that imported it, making unexpected branches auditable in the CI
+log. GTK 4 parses the restricted symbolic SVG format used by Adwaita icons
+itself; do not restore the general-purpose librsvg GdkPixbuf loader unless
+losles gains an actual runtime requirement for arbitrary SVG images. Add
+another explicit root when a future runtime feature loads a module that is not
+present in a PE import table. The workflow regenerates `loaders.cache` for
+just JPEG and PNG. It also derives package ownership for copied runtime files
+with `pacman` and includes only those packages' available license texts rather
+than licenses for unrelated build tools. The generated aggregate
+`gschemas.compiled` has no single pacman owner and is deliberately omitted
+from the license-owner query; GLib itself is already included through its
+runtime DLL.
+
+`packaging/windows/losles.nsi` installs the staged tree per user under
+`%LOCALAPPDATA%\Programs\losles` with no elevation. It creates a Start Menu
+shortcut and an Apps & Features uninstaller. Its HKCU
+`RegisteredApplications`, Capabilities, ProgID, and `Applications\losles.exe`
+entries expose `.jpg`, `.jpeg`, `.jpe`, and `.png` through “Open with” and
+Windows default-app selection; they must never directly replace the user's
+existing extension defaults. Uninstall removes the files, shortcut, and only
+losles-owned registry keys. Before recursively removing the application-owned
+installation tree, it requires the installer-created
+`.io.github.develancer.losles-install-root` marker; do not weaken that guard.
+
+The NSIS license page uses `packaging/windows/COPYING.rtf`, not the UTF-8
+plain-text `COPYING` file. The RTF stays ASCII at the byte level, declares
+Windows Central European code page 1250, and represents Polish characters
+with RTF Unicode escapes. Each prose paragraph is one unwrapped source line;
+`\par` alone controls semantic paragraph breaks while the installer performs
+visual word wrapping. Keep its legal text synchronized with `COPYING` without
+copying that file's terminal-oriented hard wrapping into the RTF.
+
+NSIS uses solid LZMA compression and embeds the checked-in Windows ICO in the
+installer and uninstaller. The Makefile independently compiles
+`packaging/windows/losles.rc` with `windres` so Explorer, Start Menu
+shortcuts, and file associations obtain the same icon from `losles.exe`.
+Calendar versions map naturally to the four-word PE installer version:
+`2026.07.1` becomes `2026.7.1.0`. The tagged job refuses a release counter
+larger than the PE format's 16-bit component limit rather than folding it to a
+colliding value.
+
+After packaging, the workflow silently installs into a temporary per-user
+directory, checks the executable, icon payload, and Apps & Features registry
+entry, then silently uninstalls and checks their removal. Only the resulting
+`losles-<version>-windows-x86_64-setup.exe` is uploaded as the
+Windows-to-release-job handoff. Keep
+`archive: false` on `actions/upload-artifact@v7` so the single installer is
+stored directly rather than wrapped in an artifact ZIP. The release job uses
+`actions/download-artifact@v8` with that exact filename; v8 is required for
+direct v7 artifacts. The staging tree is an implementation detail and is not
+uploaded.
+
+The test installer is unsigned. Do not claim that it avoids SmartScreen
+warnings. A future release workflow should Authenticode-sign and timestamp
+the application executable before packaging, then sign and timestamp the
+final installer; signing credentials must be supplied through protected
+secrets or a dedicated signing service, never committed.
+
+After every Linux matrix leg and the Windows job succeed, the release job
+downloads the three `.deb` artifacts and the direct `.exe` artifact into one
+directory. It requires the exact three target-qualified amd64 package names
+and exact CalVer Windows-installer name, then creates one `SHA256SUMS` over
+all four. With job-local `contents: write` permission, it creates the tag's
+GitHub Release with generated notes and those five files. A rerun updates an
+existing release's assets with `--clobber`. Build and validation jobs retain
+read-only repository permission. GitHub adds the tag's source ZIP and tarball
+itself. The AppStream file intentionally has no `<releases>` list: Git tags
+are the canonical release history, while the installed metadata remains valid
+without duplicating that history.
 
 The Debian packaging is intentionally usable beyond CI. `debian/rules`
 passes `prefix=/usr` because the installed icon path is compiled in, and
@@ -842,9 +981,10 @@ the installed `/usr` icon path, not the build machine's absolute source
 checkout. The ordinary developer build retains its absolute source-icon
 fallback so `build/losles` has an icon before installation. The packaging
 enables all normal dpkg hardening. `debian/control` uses `Architecture:
-linux-any` because the cache budget currently uses Linux `sysinfo()`, and
-recommends rather than depends on `colord` because the viewer has an explicit
-sRGB fallback. The maintainer address is `piotr@develancer.pl`. Add Salsa
+linux-any` because that binary package describes the Linux desktop
+integration, and recommends rather than depends on `colord` because the
+viewer has an explicit sRGB fallback. The maintainer address is
+`piotr@develancer.pl`. Add Salsa
 `Vcs-Git`/`Vcs-Browser` fields only after the corresponding repository
 exists.
 
@@ -858,7 +998,14 @@ lets a directly run `build/losles` load its own toplevel and About-dialog icon
 before installation; the latter keeps an installed binary independent of the
 source tree. On platforms that ignore per-toplevel icons (notably some
 Wayland paths), GNOME associates the window through the matching
-`GtkApplication`/desktop ID and finds the installed hicolor icon.
+`GtkApplication`/desktop ID and finds the installed hicolor icon. The Windows
+platform helper adds a third path. It first checks the source-tree
+`../data/icons/...` path relative to `build/losles.exe`, then the portable
+`../share/icons/hicolor/512x512/apps/<application-id>.png` path relative to a
+bundled or installed `bin/losles.exe`. This runtime PNG is distinct from the
+native ICO resource: the PNG supplies the GTK window/About image, while the
+ICO supplies the Explorer executable, shortcut, association, and installer
+icons.
 
 There is currently no GResource bundle, translation catalog, settings schema,
 or preferences storage. `LOCALEDIR` is defined for the C target but currently
@@ -904,25 +1051,31 @@ For ordinary C changes, at minimum run:
 make test
 ```
 
-The `test-formats` recipe runs with a temporary `HOME` and `TMPDIR` on the
+On Linux, the `test-formats` recipe runs with a temporary `HOME` and `TMPDIR`
+on the
 same filesystem. This is required for its isolated GIO Trash assertions:
 GLib compares a file's filesystem with the home directory's filesystem when
 choosing the home Trash. GitHub job containers mount their normal
 `/github/home` separately from `/tmp`, which would otherwise make temporary
 fixtures look like files on a system mount where Trash is unavailable. Keep
 the test home isolated and same-filesystem rather than weakening or skipping
-the Trash assertions.
+the Trash assertions. On Windows the native test executable uses its normal
+temporary directory and exercises the real Recycle Bin; exact contents of the
+opaque system Recycle Bin are not asserted. The privileged symbolic-link test
+is reported as skipped on Windows, while the transform and regular-file
+checks remain compiled.
 
 Run the sanitizer build for parser, memory-ownership, cache, cancellation, or
 threading changes. Add regression tests for new formats, malformed metadata,
 overflow boundaries, orientation mappings, and editing guarantees.
 
-Automated tests do not validate real colord discovery, movement between
-physical monitors, actual wide-gamut appearance, GTK interaction (including
-overlay placement, shortcuts, gestures, and fullscreen), or directory
-navigation timing. Changes in those areas need a manual Ubuntu 24.04
-graphical-session check in addition to unit tests. Never claim display-color
-correctness based only on an sRGB-to-sRGB unit test.
+Automated tests do not validate real colord/Win32 display-profile discovery,
+movement between physical monitors, actual wide-gamut appearance, Windows
+Recycle Bin recovery, GTK interaction (including overlay placement,
+shortcuts, gestures, and fullscreen), or directory navigation timing. Changes
+in those areas need manual graphical-session checks on Ubuntu 24.04 and
+Windows as applicable. Never claim display-color correctness based only on an
+sRGB-to-sRGB unit test.
 
 ## Coding conventions and sensitive areas
 
@@ -962,9 +1115,12 @@ the supported GTK baseline no longer needs it.
   preference.
 - Display buffers are always 8-bit; wide-gamut ICC support does not imply
   high-bit-depth or HDR output.
-- The colord path depends on connector metadata matching
+- The Linux colord path depends on connector metadata matching
   `CD_DEVICE_METADATA_XRANDR_NAME`. A missing connector/device/profile produces
   the visible sRGB fallback rather than guessing.
+- The Windows output-profile path is rechecked only when a render starts;
+  changing the selected profile while one image remains idle does not
+  immediately redraw it.
 - CMYK/YCCK JPEGs fail explicitly.
 - Invalid embedded profiles are ignored in favor of the documented source
   fallback; this is reported as an assumed profile in the information OSD.

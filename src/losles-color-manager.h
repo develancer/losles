@@ -1,6 +1,5 @@
 #pragma once
 
-#include <colord.h>
 #include <gdk/gdk.h>
 
 #include "losles-image.h"
@@ -32,7 +31,8 @@ G_DECLARE_FINAL_TYPE(LoslesColorManager,
 
 LoslesColorManager *losles_color_manager_new(void);
 LoslesColorTarget *losles_color_manager_get_target(LoslesColorManager *self,
-                                                   GdkMonitor *monitor);
+                                                   GdkMonitor *monitor,
+                                                   GdkSurface *surface);
 LoslesRenderedImage *losles_color_target_render(LoslesColorTarget *target,
                                                 LoslesImage *image,
                                                 GCancellable *cancellable,

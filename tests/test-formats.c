@@ -787,6 +787,7 @@ test_lossless_png_operations(void)
                                               &error));
   g_assert_no_error(error);
 
+#ifndef G_OS_WIN32
   g_autofree gchar *trashed_path =
     g_build_filename(test_data_home,
                      "Trash",
@@ -794,6 +795,7 @@ test_lossless_png_operations(void)
                      "png-in-place.png",
                      NULL);
   g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+#endif
 
   g_autoptr(LoslesImage) rotated = load_path(registry, png_path);
   g_assert_cmpuint(losles_image_get_width(rotated), ==, 2);
@@ -817,6 +819,7 @@ test_lossless_png_operations(void)
     read_png_metadata_chunks(png_path);
   g_assert_true(g_bytes_equal(rotated_metadata, original_metadata));
 
+#ifndef G_OS_WIN32
   g_autofree gchar *rotated_contents = NULL;
   gsize rotated_size = 0;
   g_assert_true(g_file_get_contents(png_path,
@@ -824,6 +827,7 @@ test_lossless_png_operations(void)
                                     &rotated_size,
                                     &error));
   g_assert_no_error(error);
+#endif
 
   LoslesCrop requested = {.x = 0, .y = 1, .width = 2, .height = 2};
   LoslesCrop adjusted = {0};
@@ -867,6 +871,7 @@ test_lossless_png_operations(void)
     read_png_metadata_chunks(png_path);
   g_assert_true(g_bytes_equal(cropped_metadata, original_metadata));
 
+#ifndef G_OS_WIN32
   g_assert_true(g_file_test(trashed_path, G_FILE_TEST_IS_REGULAR));
   g_autofree gchar *trashed_contents = NULL;
   gsize trashed_size = 0;
@@ -886,9 +891,10 @@ test_lossless_png_operations(void)
                      "info",
                      "png-in-place.png.trashinfo",
                      NULL);
-  g_assert_cmpint(g_remove(png_path), ==, 0);
   g_assert_cmpint(g_remove(trashed_path), ==, 0);
   g_assert_cmpint(g_remove(trash_info_path), ==, 0);
+#endif
+  g_assert_cmpint(g_remove(png_path), ==, 0);
   g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
@@ -1055,6 +1061,7 @@ test_in_place_rotation_overwrites_source(void)
     read_jpeg_marker_metadata(jpeg_path);
   g_assert_true(g_bytes_equal(rotated_metadata, original_metadata));
 
+#ifndef G_OS_WIN32
   g_autofree gchar *trashed_path =
     g_build_filename(test_data_home,
                      "Trash",
@@ -1070,6 +1077,7 @@ test_in_place_rotation_overwrites_source(void)
                      "in-place.jpg.trashinfo",
                      NULL);
   g_assert_false(g_file_test(trash_info_path, G_FILE_TEST_EXISTS));
+#endif
 
   g_autofree gchar *rotated_contents = NULL;
   gsize rotated_size = 0;
@@ -1101,6 +1109,7 @@ test_in_place_crop_uses_trash(void)
   g_autoptr(GBytes) original_metadata =
     read_jpeg_marker_metadata(jpeg_path);
 
+#ifndef G_OS_WIN32
   g_autofree gchar *original_contents = NULL;
   gsize original_size = 0;
   g_assert_true(g_file_get_contents(jpeg_path,
@@ -1108,6 +1117,7 @@ test_in_place_crop_uses_trash(void)
                                     &original_size,
                                     &error));
   g_assert_no_error(error);
+#endif
 
   g_autoptr(LoslesFormatRegistry) registry =
     losles_format_registry_new();
@@ -1137,6 +1147,7 @@ test_in_place_crop_uses_trash(void)
     read_jpeg_marker_metadata(jpeg_path);
   g_assert_true(g_bytes_equal(cropped_metadata, original_metadata));
 
+#ifndef G_OS_WIN32
   g_autofree gchar *trashed_path =
     g_build_filename(test_data_home,
                      "Trash",
@@ -1163,6 +1174,7 @@ test_in_place_crop_uses_trash(void)
                      "in-place-crop.jpg.trashinfo",
                      NULL);
   g_assert_true(g_file_test(trash_info_path, G_FILE_TEST_IS_REGULAR));
+#endif
 
   g_assert_cmpint(g_remove(jpeg_path), ==, 0);
   g_assert_cmpint(g_rmdir(directory), ==, 0);
@@ -1463,6 +1475,12 @@ test_orientation_normalization(void)
 static void
 test_in_place_rotation_rejects_symlink(void)
 {
+#ifdef G_OS_WIN32
+  g_test_skip("Creating symbolic links normally requires additional "
+              "Windows privileges");
+  return;
+#endif
+
   g_autoptr(GError) error = NULL;
   g_autofree gchar *directory =
     g_dir_make_tmp("losles-symlink-XXXXXX", &error);
@@ -1583,8 +1601,10 @@ main(int argc, char **argv)
     g_dir_make_tmp("losles-test-data-XXXXXX", &error);
   g_assert_no_error(error);
   g_assert_nonnull(test_data_home);
+#ifndef G_OS_WIN32
   g_setenv("XDG_DATA_HOME", test_data_home, TRUE);
   g_assert_cmpstr(g_get_user_data_dir(), ==, test_data_home);
+#endif
 
   g_test_init(&argc, &argv, NULL);
   g_test_add_func("/formats/embedded-profiles-and-render",

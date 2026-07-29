@@ -6,15 +6,17 @@
 
 # losles
 
-**losles** is a small, color-managed photo viewer for Ubuntu 24.04 and later.
-It currently displays JPEG and PNG files and performs lossless rotation and
-cropping for JPEGs and common 8-bit PNG encodings.
+**losles** is a small, color-managed photo viewer for Ubuntu 24.04 and later,
+with native Windows support under active development. It currently displays
+JPEG and PNG files and performs lossless rotation and cropping for JPEGs and
+common 8-bit PNG encodings.
 
 The application is deliberately written in C17. On Ubuntu this avoids a
 language runtime, an async executor, and format frameworks that would overlap
 with functionality losles needs to control itself. GTK 4 supplies the native
-desktop integration, LittleCMS performs color conversion, libjpeg-turbo and
-libpng decode pixels, and colord supplies the selected monitor profile.
+desktop integration, LittleCMS performs color conversion, and libjpeg-turbo
+and libpng decode pixels. On Linux, colord supplies the selected monitor
+profile; on Windows, losles obtains it from the Win32 color-management API.
 
 ## Why losles?
 
@@ -29,7 +31,8 @@ and not much more.
   APP2 markers.
 - Embedded PNG `iCCP` profiles.
 - Application-side conversion from the embedded image profile to the ICC
-  profile selected for the monitor in Ubuntu Settings.
+  profile selected for the current monitor in Ubuntu Settings or Windows
+  Color Management.
 - Wide-gamut RGB display profiles. Output values are encoded directly in the
   monitor profile's RGB space; the image is not collapsed to sRGB first.
 - Correct display of all eight EXIF orientation values.
@@ -92,6 +95,53 @@ make BUILD_DIR=build-asan \
 
 Run `make help` for the available targets and overrides.
 
+## Windows development build
+
+The native Windows port currently targets 64-bit Windows 10 and 11 using
+GTK's Win32 backend and the MSYS2 UCRT64 environment. Install MSYS2, open its
+**UCRT64** shell, and install:
+
+```sh
+pacman -S --needed \
+  git make \
+  mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-gtk4 \
+  mingw-w64-ucrt-x86_64-lcms2 \
+  mingw-w64-ucrt-x86_64-libjpeg-turbo \
+  mingw-w64-ucrt-x86_64-libpng
+
+make
+make test
+./build/losles.exe /path/to/photo.jpg
+```
+
+The Makefile detects the MinGW target from the compiler, omits colord, selects
+the Win32 platform implementation, adds `.exe` automatically, and embeds the
+multi-resolution Windows application icon with `windres` from the GCC
+toolchain.
+
+The tag-triggered GitHub Actions workflow performs the same native build on a
+Windows runner. It adds the UCRT64 NSIS package, assembles only the recursive
+runtime DLL dependency closure of losles and its JPEG/PNG GTK image loaders,
+and compresses that staged tree into one installer:
+
+```text
+losles-<version>-windows-x86_64-setup.exe
+```
+
+The installer uses a per-user location under
+`%LOCALAPPDATA%\Programs\losles`, so it does not request administrator
+privileges. It creates a Start Menu shortcut, appears in Apps & Features, and
+registers losles as an available JPEG/PNG handler without replacing the
+user's chosen default viewer. The workflow silently installs and uninstalls
+the result as a smoke test before publishing it with the corresponding
+release.
+
+GTK 4 reads the symbolic SVG subset used by its Adwaita icons itself, so the
+general-purpose librsvg GdkPixbuf loader is not included. The installer is
+currently unsigned and can therefore trigger a Windows SmartScreen warning.
+
 ## Versioning and tagged builds
 
 losles uses calendar versions—and matching Git release tags—in the form
@@ -129,7 +179,9 @@ compiles and tests independently in clean Ubuntu 24.04, Ubuntu 26.04, and
 Debian 13 containers. Each target exercises a staged `/usr` installation as a
 smoke test and produces a native `.deb`. The raw installation trees are not
 uploaded because the packages already contain those files together with
-dependency, ownership, upgrade, and removal metadata.
+dependency, ownership, upgrade, and removal metadata. In parallel, a Windows
+2025 runner builds and tests the UCRT64 application, creates the x86-64 NSIS
+installer, and verifies a silent install/uninstall cycle.
 
 The convenience packages have target-qualified versions derived from the tag:
 
@@ -144,12 +196,13 @@ repository package to replace a GitHub build automatically. Building each
 package inside its target system also lets `debhelper` generate the correct
 native shared-library package names and minimum versions.
 
-Every package build validates the desktop and AppStream files and runs
-Lintian. After all three targets succeed, the workflow publishes one GitHub
-Release for the tag with the three `.deb` packages and a `SHA256SUMS` file.
-GitHub supplies the corresponding source ZIP and tarball automatically. The
-packages are also retained briefly as Actions artifacts so the release job can
-collect them, but the Release assets are the intended downloads.
+Every Linux package build validates the desktop and AppStream files and runs
+Lintian. After the three Linux targets and Windows job succeed, the workflow
+publishes one GitHub Release for the tag with the three `.deb` packages, the
+Windows `.exe` installer, and one `SHA256SUMS` file covering all four package
+files. GitHub supplies the corresponding source ZIP and tarball automatically.
+The packages are also retained briefly as Actions artifacts so the release
+job can collect them, but the Release assets are the intended downloads.
 
 These are unsigned convenience packages rather than an APT repository.
 Download the package matching the installed distribution and install it
@@ -244,8 +297,10 @@ selection to move it, or drag any of its four edges or eight visible
 edge/corner handles to resize it. JPEG selections move in legal MCU-block
 increments, while supported PNGs use exact pixels, so the overlay always
 previews the crop that will be written. Press `Enter` to apply a valid
-selection. Entering Crop mode restores the fitted view; wheel zoom and image
-panning are inactive until Crop mode is left.
+selection. The header control uses a crop-corner glyph supplied by losles, so
+it does not depend on the desktop icon theme. Entering Crop mode restores the
+fitted view; wheel zoom and image panning are inactive until Crop mode is
+left.
 
 Use the warning-icon orientation control when it is enabled to bake a
 non-default EXIF orientation into the JPEG coefficients and set the tag to
@@ -258,9 +313,9 @@ image was last, it opens the preceding image, which is now last. It clears the
 browsing session and displays “No picture opened” only when the directory has
 no supported images left.
 
-An image file can also be opened by dragging its file icon from Nautilus onto
-the losles window. A multi-file drop opens the first file. File drops are
-rejected while Crop mode or another file operation is active. After an
+An image file can also be opened by dragging its file icon from a file manager
+onto the losles window. A multi-file drop opens the first file. File drops
+are rejected while Crop mode or another file operation is active. After an
 accepted drop, losles takes keyboard focus so its navigation and other
 shortcuts work immediately.
 
@@ -276,7 +331,14 @@ canvas because no previous image is available. If both the decoded image and
 its display-profile-converted texture are already cached, losles switches to
 it immediately without showing the spinner.
 
-## Color-management model on Ubuntu 24.04
+## Color-management model
+
+losles performs SDR display conversion itself on both supported platforms.
+It requires an RGB monitor profile, converts directly from the image's
+embedded profile with LittleCMS, and falls back visibly to sRGB if the
+selected display profile cannot be found or used.
+
+### Ubuntu 24.04
 
 losles does not depend on Mutter's newer color-management protocol. GTK 4.14
 on Ubuntu 24.04 cannot attach an ICC colorspace to a surface, so losles uses
@@ -302,12 +364,28 @@ implementation. On a future compositor that color-transforms every surface,
 losles will need a second backend that tags source pixels instead of
 preconverting them; otherwise conversion could be applied twice.
 
+### Windows
+
+The GTK Win32 surface exposes the native window handle. losles uses it to
+identify the monitor containing the window, creates that display's device
+context, and asks `GetICMProfileW` for its current output ICC profile. The
+same LittleCMS rendering pipeline then produces device-RGB pixels for that
+profile. Moving to another monitor starts a new render, and the profile path
+and file metadata are rechecked whenever rendering starts.
+
+Windows does not currently notify `LoslesColorManager` when the selected
+profile changes while the same image remains idle. Navigating, moving the
+window between monitors, or otherwise starting a render rechecks it. Like the
+Ubuntu path, this is wide-gamut SDR support with 8-bit output, not HDR.
+
 ## Source layout
 
 ```text
 data/
   icons/hicolor/512x512/apps/
     io.github.develancer.losles.png  installed application icon
+  icons/windows/
+    io.github.develancer.losles.ico  native multi-resolution Windows icon
   io.github.develancer.losles.desktop
   io.github.develancer.losles.metainfo.xml
   losles.1                    command-line manual page
@@ -318,11 +396,21 @@ debian/
   changelog                   Debian package version and upload history
 tools/
   version.sh                  Git tag validation and build-version derivation
+  copy-pe-runtime.sh          recursive Windows runtime-DLL collection
+packaging/windows/
+  COPYING.rtf                  Windows installer rendering of the MIT license
+  losles.rc                   embeds the native icon in losles.exe
+  losles.nsi                  per-user NSIS installer and uninstaller
+.github/workflows/
+  tagged-build.yml            tagged Linux/Windows builds and release publishing
 src/
   losles-config.h             application identity and repository URL
   losles-window.c             UI, navigation, two-level cache, background jobs
   losles-cache-policy.c       cache ordering, admission, and eviction policy
-  losles-color-manager.c      colord lookup and LittleCMS transforms
+  losles-color-manager.c      platform display profile lookup and LCMS render
+  losles-platform.h           OS integration boundary
+  losles-platform-linux.c     sysinfo, GIO Trash, POSIX hard links/permissions
+  losles-platform-win32.c     memory, Recycle Bin, Win32 hard links/icon path
   losles-image.c              format-neutral decoded image
   formats/
     losles-format.c           module interface
@@ -338,7 +426,8 @@ tests/
 Current deliberate limits are RGB/grayscale JPEG and PNG viewing, editing of
 JPEG plus the common PNG subset described above, 8-bit display buffers, SDR
 ICC profiles, and local files for editing. CMYK JPEG display is not
-implemented yet.
+implemented yet. Windows packaging currently produces an unsigned per-user
+NSIS installer; Authenticode signing is still future release work.
 
 ## License
 

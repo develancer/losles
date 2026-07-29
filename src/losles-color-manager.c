@@ -3,6 +3,16 @@
 #include <lcms2.h>
 #include <string.h>
 
+#ifdef G_OS_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <gdk/win32/gdkwin32.h>
+#include <glib/gstdio.h>
+#include <glib/gwin32.h>
+#else
+#include <colord.h>
+#endif
+
 struct _LoslesColorTarget {
   gint ref_count;
   GBytes *profile;
@@ -14,11 +24,17 @@ struct _LoslesColorTarget {
 struct _LoslesColorManager {
   GObject parent_instance;
 
+#ifdef G_OS_WIN32
+  gchar *active_profile_path;
+  gint64 active_profile_mtime;
+  goffset active_profile_size;
+#else
   CdClient *client;
   gboolean connected;
-  gchar *active_connector;
   CdDevice *active_device;
   gulong active_device_changed_id;
+#endif
+  gchar *active_connector;
   LoslesColorTarget *cached_target;
 };
 
@@ -152,6 +168,8 @@ create_srgb_target(void)
     return NULL;
   return color_target_new(bytes, "sRGB fallback", "builtin-srgb", TRUE);
 }
+
+#ifndef G_OS_WIN32
 
 static void
 clear_active_device(LoslesColorManager *self)
@@ -298,17 +316,180 @@ target_from_active_device(LoslesColorManager *self)
   return target;
 }
 
+#else
+
+static gchar *
+win32_profile_path_from_surface(GdkSurface *surface)
+{
+  if (!surface) {
+    g_debug("Cannot look up a Windows display profile without a surface");
+    return NULL;
+  }
+
+  HWND window = GDK_SURFACE_HWND(surface);
+  if (!window) {
+    g_debug("The GTK surface does not have a Win32 window handle");
+    return NULL;
+  }
+
+  HMONITOR monitor =
+    MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  MONITORINFOEXW monitor_info = {
+    .cbSize = sizeof(monitor_info),
+  };
+  if (!monitor ||
+      !GetMonitorInfoW(monitor, (MONITORINFO *)&monitor_info)) {
+    g_autofree gchar *message =
+      g_win32_error_message((gint)GetLastError());
+    g_warning("Could not identify the Windows monitor: %s",
+              message ? message : "unknown error");
+    return NULL;
+  }
+  g_autofree gchar *device_name =
+    g_utf16_to_utf8((const gunichar2 *)monitor_info.szDevice,
+                    -1,
+                    NULL,
+                    NULL,
+                    NULL);
+
+  HDC device_context =
+    CreateDCW(L"DISPLAY", monitor_info.szDevice, NULL, NULL);
+  if (!device_context) {
+    g_autofree gchar *message =
+      g_win32_error_message((gint)GetLastError());
+    g_warning("Could not open display %s for color management: %s",
+              device_name ? device_name : "(unknown)",
+              message ? message : "unknown error");
+    return NULL;
+  }
+
+  DWORD length = 0;
+  SetLastError(ERROR_SUCCESS);
+  const BOOL measured =
+    GetICMProfileW(device_context, &length, NULL);
+  const DWORD measure_error = GetLastError();
+  if ((!measured && measure_error != ERROR_INSUFFICIENT_BUFFER) ||
+      length == 0) {
+    g_autofree gchar *message =
+      g_win32_error_message((gint)measure_error);
+    g_debug("No selected ICC profile was found for display %s: %s",
+            device_name ? device_name : "(unknown)",
+            message ? message : "unknown error");
+    DeleteDC(device_context);
+    return NULL;
+  }
+
+  g_autofree gunichar2 *wide_path =
+    g_new(gunichar2, length);
+  if (!GetICMProfileW(device_context,
+                      &length,
+                      (LPWSTR)wide_path)) {
+    const DWORD profile_error = GetLastError();
+    g_autofree gchar *message =
+      g_win32_error_message((gint)profile_error);
+    g_warning("Could not read the selected ICC profile for display %s: %s",
+              device_name ? device_name : "(unknown)",
+              message ? message : "unknown error");
+    DeleteDC(device_context);
+    return NULL;
+  }
+  DeleteDC(device_context);
+
+  return g_utf16_to_utf8(wide_path, -1, NULL, NULL, NULL);
+}
+
+static LoslesColorTarget *
+target_from_win32_profile(const gchar *filename)
+{
+  g_autofree gchar *contents = NULL;
+  gsize length = 0;
+  g_autoptr(GError) error = NULL;
+  if (!g_file_get_contents(filename, &contents, &length, &error)) {
+    g_warning("Could not read display ICC profile %s: %s",
+              filename,
+              error->message);
+    return NULL;
+  }
+
+  g_autoptr(GBytes) bytes =
+    g_bytes_new_take(g_steal_pointer(&contents), length);
+  g_autofree gchar *basename = g_path_get_basename(filename);
+  g_autofree gchar *checksum =
+    g_compute_checksum_for_bytes(G_CHECKSUM_SHA256, bytes);
+  g_autofree gchar *profile_id =
+    g_strdup_printf("win32:%s", checksum);
+  LoslesColorTarget *target =
+    losles_color_target_new_for_profile(bytes,
+                                        basename,
+                                        profile_id,
+                                        &error);
+  if (!target) {
+    g_warning("Could not use Windows display ICC profile %s: %s",
+              filename,
+              error->message);
+    return NULL;
+  }
+
+  g_debug("Using Windows display profile “%s” (%s)",
+          target->name,
+          target->id);
+  return target;
+}
+
+static void
+ensure_win32_profile(LoslesColorManager *self,
+                     const gchar *connector,
+                     GdkSurface *surface)
+{
+  g_autofree gchar *profile_path =
+    win32_profile_path_from_surface(surface);
+  GStatBuf profile_stat = {0};
+  const gboolean have_stat =
+    profile_path && g_stat(profile_path, &profile_stat) == 0;
+  const gint64 profile_mtime =
+    have_stat ? (gint64)profile_stat.st_mtime : 0;
+  const goffset profile_size =
+    have_stat ? (goffset)profile_stat.st_size : 0;
+
+  if (g_strcmp0(self->active_connector, connector) == 0 &&
+      g_strcmp0(self->active_profile_path, profile_path) == 0 &&
+      self->active_profile_mtime == profile_mtime &&
+      self->active_profile_size == profile_size &&
+      self->cached_target)
+    return;
+
+  g_clear_pointer(&self->active_connector, g_free);
+  g_clear_pointer(&self->active_profile_path, g_free);
+  g_clear_pointer(&self->cached_target, losles_color_target_unref);
+  self->active_connector = g_strdup(connector);
+  self->active_profile_path = g_steal_pointer(&profile_path);
+  self->active_profile_mtime = profile_mtime;
+  self->active_profile_size = profile_size;
+
+  if (self->active_profile_path)
+    self->cached_target =
+      target_from_win32_profile(self->active_profile_path);
+}
+
+#endif
+
 LoslesColorTarget *
 losles_color_manager_get_target(LoslesColorManager *self,
-                                GdkMonitor *monitor)
+                                GdkMonitor *monitor,
+                                GdkSurface *surface)
 {
   g_return_val_if_fail(LOSLES_IS_COLOR_MANAGER(self), NULL);
 
   const gchar *connector = monitor ? gdk_monitor_get_connector(monitor) : NULL;
+#ifdef G_OS_WIN32
+  ensure_win32_profile(self, connector, surface);
+#else
+  (void)surface;
   ensure_active_device(self, connector);
 
   if (!self->cached_target)
     self->cached_target = target_from_active_device(self);
+#endif
   if (!self->cached_target) {
     self->cached_target = create_srgb_target();
     g_debug("No selected display profile for connector %s; using sRGB",
@@ -325,9 +506,14 @@ losles_color_manager_finalize(GObject *object)
 {
   LoslesColorManager *self = LOSLES_COLOR_MANAGER(object);
 
+#ifdef G_OS_WIN32
+  g_clear_pointer(&self->active_profile_path, g_free);
+  g_clear_pointer(&self->active_connector, g_free);
+#else
   clear_active_device(self);
-  g_clear_pointer(&self->cached_target, losles_color_target_unref);
   g_clear_object(&self->client);
+#endif
+  g_clear_pointer(&self->cached_target, losles_color_target_unref);
 
   G_OBJECT_CLASS(losles_color_manager_parent_class)->finalize(object);
 }
@@ -353,6 +539,7 @@ losles_color_manager_class_init(LoslesColorManagerClass *klass)
 static void
 losles_color_manager_init(LoslesColorManager *self)
 {
+#ifndef G_OS_WIN32
   self->client = cd_client_new();
   g_autoptr(GError) error = NULL;
   self->connected =
@@ -361,6 +548,9 @@ losles_color_manager_init(LoslesColorManager *self)
     g_warning("Could not connect to colord; using sRGB: %s",
               error ? error->message : "unknown error");
   }
+#else
+  (void)self;
+#endif
 }
 
 LoslesColorManager *

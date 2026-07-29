@@ -6,10 +6,8 @@
 #include "losles-color-manager.h"
 #include "losles-config.h"
 #include "losles-image.h"
+#include "losles-platform.h"
 #include "losles-rendered-image.h"
-
-#include <errno.h>
-#include <sys/sysinfo.h>
 
 #define CACHE_LIMIT_FALLBACK ((gsize)512 * 1024 * 1024)
 #define PRELOAD_DISTANCE 5
@@ -153,6 +151,7 @@ struct _LoslesWindow {
   GHashTable *render_inflight;
   GHashTable *render_failed;
   GHashTable *render_capacity_blocked;
+  gchar *render_profile_id;
   gsize render_cache_size;
   gsize render_cache_limit;
   guint render_generation;
@@ -197,6 +196,7 @@ static void start_render(LoslesWindow *self);
 static void start_render_for_image(LoslesWindow *self,
                                    LoslesImage *image,
                                    gboolean foreground);
+static void invalidate_render_cache(LoslesWindow *self);
 static void update_controls(LoslesWindow *self);
 static void preload_neighbors(LoslesWindow *self);
 static void preload_rendered_neighbors(LoslesWindow *self);
@@ -436,24 +436,12 @@ reset_zoom(LoslesWindow *self)
 static gsize
 detect_cache_limit(void)
 {
-  struct sysinfo info = {0};
-  if (sysinfo(&info) != 0) {
-    g_warning("Could not determine total system memory: %s; "
-              "using a 512 MiB cache limit",
-              g_strerror(errno));
-    return CACHE_LIMIT_FALLBACK;
-  }
-
-  guint64 total_memory = info.totalram;
-  if (info.mem_unit > 0 &&
-      total_memory > G_MAXUINT64 / info.mem_unit)
-    total_memory = G_MAXUINT64;
-  else
-    total_memory *= info.mem_unit;
-
-  if (total_memory == 0) {
-    g_warning("The system reported zero bytes of memory; "
-              "using a 512 MiB cache limit");
+  guint64 total_memory = 0;
+  g_autoptr(GError) error = NULL;
+  if (!losles_platform_get_total_memory(&total_memory, &error)) {
+    g_warning("%s; using a 512 MiB cache limit",
+              error ? error->message
+                    : "Could not determine total system memory");
     return CACHE_LIMIT_FALLBACK;
   }
 
@@ -1029,7 +1017,9 @@ delete_worker(GTask *task,
   (void)source_object;
   DeleteJob *job = task_data;
   g_autoptr(GError) error = NULL;
-  if (!g_file_trash(job->file, cancellable, &error)) {
+  if (!losles_platform_trash_file(job->file,
+                                  cancellable,
+                                  &error)) {
     g_task_return_error(task, g_steal_pointer(&error));
     return;
   }
@@ -1247,17 +1237,51 @@ start_render_for_image(LoslesWindow *self,
   if (!gtk_widget_get_mapped(GTK_WIDGET(self)))
     return;
 
+  GdkSurface *surface =
+    gtk_native_get_surface(GTK_NATIVE(self));
+  g_autoptr(LoslesColorTarget) target =
+    losles_color_manager_get_target(self->color_manager,
+                                    current_monitor(self),
+                                    surface);
+  if (!target) {
+    if (foreground) {
+      clear_current_image(self);
+      gtk_spinner_stop(self->spinner);
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
+      set_status(self, "No usable display color profile");
+    }
+    return;
+  }
+  const gchar *target_profile_id =
+    losles_color_target_get_id(target);
+  if (self->render_profile_id &&
+      g_strcmp0(self->render_profile_id, target_profile_id) != 0)
+    invalidate_render_cache(self);
+  if (g_strcmp0(self->render_profile_id, target_profile_id) != 0) {
+    g_free(self->render_profile_id);
+    self->render_profile_id = g_strdup(target_profile_id);
+  }
+
   g_autofree gchar *uri =
     file_uri(losles_image_get_file(image));
   RenderCacheEntry *cached =
     g_hash_table_lookup(self->render_cache, uri);
   if (cached) {
-    if (foreground)
-      display_rendered_image(self,
-                             image,
-                             cached->rendered,
-                             cached->texture);
-    return;
+    if (g_strcmp0(cached->rendered->display_profile_id,
+                  target_profile_id) == 0) {
+      if (foreground)
+        display_rendered_image(self,
+                               image,
+                               cached->rendered,
+                               cached->texture);
+      return;
+    }
+
+    /*
+     * A platform profile changed without a monitor-enter/leave signal. Drop
+     * every converted result because all of them target the old profile.
+     */
+    invalidate_render_cache(self);
   }
 
   if (g_hash_table_contains(self->render_inflight, uri)) {
@@ -1284,19 +1308,6 @@ start_render_for_image(LoslesWindow *self,
       g_hash_table_size(self->render_inflight) >=
         MAX_CONCURRENT_RENDERS)
     return;
-
-  g_autoptr(LoslesColorTarget) target =
-    losles_color_manager_get_target(self->color_manager,
-                                    current_monitor(self));
-  if (!target) {
-    if (foreground) {
-      clear_current_image(self);
-      gtk_spinner_stop(self->spinner);
-      gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
-      set_status(self, "No usable display color profile");
-    }
-    return;
-  }
 
   if (foreground) {
     self->foreground_loading = TRUE;
@@ -2850,12 +2861,54 @@ icon_button(const gchar *icon_name, const gchar *tooltip)
   return button;
 }
 
+static void
+crop_icon_draw(GtkDrawingArea *area,
+               cairo_t *cr,
+               int width,
+               int height,
+               gpointer user_data)
+{
+  (void)user_data;
+
+  GdkRGBA color;
+  gtk_widget_get_color(GTK_WIDGET(area), &color);
+
+  const gdouble size = MIN(width, height);
+  cairo_translate(cr, (width - size) / 2.0, (height - size) / 2.0);
+  cairo_scale(cr, size / 16.0, size / 16.0);
+  cairo_set_source_rgba(cr, color.red, color.green, color.blue, color.alpha);
+  cairo_set_line_width(cr, 2.0);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+  cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+
+  cairo_move_to(cr, 3.0, 0.0);
+  cairo_line_to(cr, 3.0, 12.0);
+  cairo_line_to(cr, 10.0, 12.0);
+  cairo_move_to(cr, 0.0, 3.0);
+  cairo_line_to(cr, 12.0, 3.0);
+  cairo_line_to(cr, 12.0, 15.0);
+  cairo_stroke(cr);
+}
+
+static GtkWidget *
+crop_icon(void)
+{
+  GtkDrawingArea *icon = GTK_DRAWING_AREA(gtk_drawing_area_new());
+  gtk_drawing_area_set_content_width(icon, 16);
+  gtk_drawing_area_set_content_height(icon, 16);
+  gtk_drawing_area_set_draw_func(icon, crop_icon_draw, NULL, NULL);
+  return GTK_WIDGET(icon);
+}
+
 static GdkTexture *
 load_application_icon(void)
 {
+  g_autofree gchar *portable_icon =
+    losles_platform_get_portable_icon_path();
   const gchar *paths[] = {
     LOSLES_SOURCE_ICON_FILE,
     LOSLES_INSTALLED_ICON_FILE,
+    portable_icon,
     NULL,
   };
 
@@ -2944,6 +2997,7 @@ losles_window_dispose(GObject *object)
   g_clear_pointer(&self->render_inflight, g_hash_table_unref);
   g_clear_pointer(&self->render_failed, g_hash_table_unref);
   g_clear_pointer(&self->render_capacity_blocked, g_hash_table_unref);
+  g_clear_pointer(&self->render_profile_id, g_free);
   g_clear_object(&self->color_manager);
   g_clear_object(&self->registry);
 
@@ -3101,8 +3155,7 @@ losles_window_init(LoslesWindow *self)
 
   self->crop_button =
     GTK_TOGGLE_BUTTON(gtk_toggle_button_new());
-  gtk_button_set_icon_name(GTK_BUTTON(self->crop_button),
-                           "crop-symbolic");
+  gtk_button_set_child(GTK_BUTTON(self->crop_button), crop_icon());
   gtk_widget_set_tooltip_text(GTK_WIDGET(self->crop_button),
                               "Lossless crop "
                               "(C; original goes to Trash)");

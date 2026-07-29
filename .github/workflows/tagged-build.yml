@@ -170,11 +170,247 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows:
+    name: Windows x86-64 installer
+    needs: validate
+    runs-on: windows-2025
+
+    steps:
+      - name: Keep repository scripts as LF
+        shell: bash
+        run: git config --global core.autocrlf input
+
+      - name: Check out the release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-lcms2
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-nsis
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Verify checkout version
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          expected_version="${{ needs.validate.outputs.version }}"
+          tag_version="$(./tools/version.sh --from-tag "$GITHUB_REF_NAME")"
+          build_version="$(make --no-print-directory print-version)"
+          if [[ "$tag_version" != "$expected_version" ]]; then
+            echo "Tag version '$tag_version' does not match validated version '$expected_version'." >&2
+            exit 1
+          fi
+          if [[ "$build_version" != "$expected_version" ]]; then
+            echo "Build version '$build_version' does not match validated version '$expected_version'." >&2
+            exit 1
+          fi
+
+      - name: Compile
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          make -j2 SOURCE_ICON_FILE= all
+
+      - name: Run portable tests
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          make -j2 SOURCE_ICON_FILE= test
+
+      - name: Assemble installer payload
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          bundle="dist/losles-${version}-windows-x86_64"
+          mkdir -p \
+            "$bundle/bin" \
+            "$bundle/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+            "$bundle/share/glib-2.0/schemas" \
+            "$bundle/share/icons/hicolor/512x512/apps" \
+            "$bundle/share/licenses/losles"
+
+          cp build/losles.exe "$bundle/bin/"
+          cp COPYING README.md "$bundle/"
+          cp COPYING README.md "$bundle/share/licenses/losles/"
+          cp data/icons/hicolor/512x512/apps/io.github.develancer.losles.png \
+            "$bundle/share/icons/hicolor/512x512/apps/"
+
+          loader_directory="/ucrt64/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+          shopt -s nullglob
+          pixbuf_loaders=()
+          for loader_kind in jpeg png; do
+            matching_loaders=(
+              "$loader_directory"/*"$loader_kind"*.dll
+            )
+            if (( ${#matching_loaders[@]} == 0 )); then
+              echo "No GdkPixbuf $loader_kind loader was installed." >&2
+              exit 1
+            fi
+            pixbuf_loaders+=("${matching_loaders[@]}")
+          done
+          cp "${pixbuf_loaders[@]}" \
+            "$bundle/lib/gdk-pixbuf-2.0/2.10.0/loaders/"
+
+          gdk-pixbuf-query-loaders "${pixbuf_loaders[@]}" \
+            > "$bundle/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+          tools/copy-pe-runtime.sh \
+            /ucrt64/bin \
+            "$bundle/bin" \
+            build/losles.exe \
+            "${pixbuf_loaders[@]}"
+
+          cp /ucrt64/share/glib-2.0/schemas/gschemas.compiled \
+            "$bundle/share/glib-2.0/schemas/"
+          cp -R /ucrt64/share/icons/Adwaita "$bundle/share/icons/"
+          cp /ucrt64/share/icons/hicolor/index.theme \
+            "$bundle/share/icons/hicolor/"
+          if [[ -d /ucrt64/etc/fonts ]]; then
+            mkdir -p "$bundle/etc"
+            cp -R /ucrt64/etc/fonts "$bundle/etc/"
+          fi
+
+          declare -A runtime_packages=()
+          runtime_assets=(
+            "${pixbuf_loaders[@]}"
+            /ucrt64/share/icons/Adwaita/index.theme
+            /ucrt64/share/icons/hicolor/index.theme
+          )
+          for bundled_dll in "$bundle/bin"/*.dll; do
+            runtime_assets+=("/ucrt64/bin/$(basename "$bundled_dll")")
+          done
+          if [[ -f /ucrt64/etc/fonts/fonts.conf ]]; then
+            runtime_assets+=(/ucrt64/etc/fonts/fonts.conf)
+          fi
+
+          for runtime_asset in "${runtime_assets[@]}"; do
+            if package="$(pacman -Qqo "$runtime_asset" 2>/dev/null)"; then
+              runtime_packages["$package"]=1
+            else
+              echo "No package owner recorded for generated asset: $runtime_asset"
+            fi
+          done
+
+          while IFS= read -r package; do
+            while IFS= read -r license_file; do
+              case "$license_file" in
+                /ucrt64/share/licenses/*)
+                  relative_license="${license_file#/ucrt64/share/licenses/}"
+                  if [[ -f "$license_file" ]]; then
+                    mkdir -p \
+                      "$bundle/share/licenses/$(dirname "$relative_license")"
+                    cp "$license_file" \
+                      "$bundle/share/licenses/$relative_license"
+                  fi
+                  ;;
+              esac
+            done < <(pacman -Qlq "$package")
+          done < <(printf '%s\n' "${!runtime_packages[@]}" | sort)
+
+          echo "Installer payload contents:"
+          du -sh "$bundle"
+          find "$bundle/bin" -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Build NSIS installer
+        id: installer
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          bundle="dist/losles-${version}-windows-x86_64"
+          installer="dist/losles-${version}-windows-x86_64-setup.exe"
+
+          IFS=. read -r year month release_number <<< "$version"
+          year=$((10#$year))
+          month=$((10#$month))
+          release_number=$((10#$release_number))
+          if (( year > 65535 || month > 65535 || release_number > 65535 )); then
+            echo "Version '$version' cannot be represented as a Windows PE version." >&2
+            exit 1
+          fi
+          file_version="$year.$month.$release_number.0"
+
+          payload_windows="$(cygpath -aw "$PWD/$bundle")"
+          output_windows="$(cygpath -aw "$PWD/$installer")"
+          icon_windows="$(cygpath -aw \
+            "$PWD/data/icons/windows/io.github.develancer.losles.ico")"
+          script_windows="$(cygpath -aw \
+            "$PWD/packaging/windows/losles.nsi")"
+
+          MSYS2_ARG_CONV_EXCL='*' makensis \
+            "/DAPP_VERSION=$version" \
+            "/DAPP_FILE_VERSION=$file_version" \
+            "/DPAYLOAD_DIR=$payload_windows" \
+            "/DOUTPUT_FILE=$output_windows" \
+            "/DINSTALLER_ICON=$icon_windows" \
+            "$script_windows"
+
+          test -f "$installer"
+          echo "Installer version: $version (PE $file_version)"
+          du -h "$installer"
+          sha256sum "$installer"
+          echo "path=$installer" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test installer and uninstaller
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          installer="${{ steps.installer.outputs.path }}"
+          smoke_root="$(cygpath -au "$RUNNER_TEMP")/losles-installer-smoke"
+          smoke_windows="$(cygpath -aw "$smoke_root")"
+
+          MSYS2_ARG_CONV_EXCL='*' "$installer" /S "/D=$smoke_windows"
+          test -f "$smoke_root/bin/losles.exe"
+          test -f "$smoke_root/uninstall.exe"
+          test -f \
+            "$smoke_root/share/icons/hicolor/512x512/apps/io.github.develancer.losles.png"
+          MSYS2_ARG_CONV_EXCL='*' reg.exe query \
+            'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\io.github.develancer.losles' \
+            /v InstallLocation /reg:64
+
+          MSYS2_ARG_CONV_EXCL='*' "$smoke_root/uninstall.exe" /S
+          for attempt in {1..15}; do
+            if [[ ! -e "$smoke_root/bin/losles.exe" ]]; then
+              break
+            fi
+            sleep 1
+          done
+          test ! -e "$smoke_root/bin/losles.exe"
+          if MSYS2_ARG_CONV_EXCL='*' reg.exe query \
+            'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\io.github.develancer.losles' \
+            /reg:64 >/dev/null 2>&1; then
+            echo "The uninstaller left its Apps & Features registry key." >&2
+            exit 1
+          fi
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.installer.outputs.path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Publish GitHub release
     needs:
       - validate
       - build
+      - windows
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -188,6 +424,12 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: losles-${{ needs.validate.outputs.version }}-windows-x86_64-setup.exe
+          path: release-assets
+
       - name: Verify release assets and create checksums
         shell: bash
         run: |
@@ -197,17 +439,18 @@ jobs:
             "losles_${version}-0losles1~ubuntu24.04.1_amd64.deb"
             "losles_${version}-0losles1~ubuntu26.04.1_amd64.deb"
             "losles_${version}-0losles1~debian13.1_amd64.deb"
+            "losles-${version}-windows-x86_64-setup.exe"
           )
           mapfile -t packages < <(
             find release-assets \
               -maxdepth 1 \
               -type f \
-              -name '*.deb' \
+              \( -name '*.deb' -o -name '*.exe' \) \
               -printf '%f\n' |
               sort
           )
           if [[ "${#packages[@]}" -ne "${#expected[@]}" ]]; then
-            echo "Expected ${#expected[@]} Debian packages, found ${#packages[@]}." >&2
+            echo "Expected ${#expected[@]} release packages, found ${#packages[@]}." >&2
             printf 'Found: %s\n' "${packages[@]}" >&2
             exit 1
           fi
@@ -235,7 +478,7 @@ jobs:
             find release-assets \
               -maxdepth 1 \
               -type f \
-              \( -name '*.deb' -o -name SHA256SUMS \) |
+              \( -name '*.deb' -o -name '*.exe' -o -name SHA256SUMS \) |
               sort
           )
           if gh release view "$tag" >/dev/null 2>&1; then

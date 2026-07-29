@@ -4,7 +4,8 @@
 #include <glib/gstdio.h>
 #include <png.h>
 #include <string.h>
-#include <unistd.h>
+
+#include "../losles-platform.h"
 
 struct _LoslesPngFormat {
   GObject parent_instance;
@@ -816,7 +817,7 @@ create_temporary_file(const gchar *directory,
     g_free(path);
     return NULL;
   }
-  close(fd);
+  g_close(fd, NULL);
   return path;
 }
 
@@ -848,9 +849,14 @@ create_source_backup(const gchar *source_path,
     return NULL;
   }
 
-  if (link(source_path, backup_path) == 0)
+  g_autoptr(GError) link_error = NULL;
+  if (losles_platform_create_hard_link(source_path,
+                                       backup_path,
+                                       &link_error))
     return g_steal_pointer(&backup_path);
 
+  g_debug("Could not hard-link the crop backup: %s; copying instead",
+          link_error ? link_error->message : "unknown error");
   g_autoptr(GFile) source = g_file_new_for_path(source_path);
   g_autoptr(GFile) backup = g_file_new_for_path(backup_path);
   if (!g_file_copy(source,
@@ -870,13 +876,8 @@ static void
 copy_source_permissions(const gchar *source_path,
                         const gchar *temporary_path)
 {
-  GStatBuf source_stat;
-  if (g_stat(source_path, &source_stat) == 0 &&
-      g_chmod(temporary_path, source_stat.st_mode & 07777) != 0) {
-    g_debug("Could not preserve PNG permissions on %s: %s",
-            temporary_path,
-            g_strerror(errno));
-  }
+  losles_platform_copy_file_permissions(source_path,
+                                        temporary_path);
 }
 
 static gboolean
@@ -912,7 +913,9 @@ install_transformed_file(GFile *source,
     return FALSE;
   }
 
-  if (!g_file_trash(source, cancellable, error)) {
+  if (!losles_platform_trash_file(source,
+                                  cancellable,
+                                  error)) {
     remove_temporary_file(backup_path);
     return FALSE;
   }
