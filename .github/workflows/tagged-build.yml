@@ -498,6 +498,6 @@ jobs:
           else
             gh release create "$tag" "${assets[@]}" \
               --generate-notes \
-              --title "losles $version" \
+              --title "$version" \
               --verify-tag
           fi
