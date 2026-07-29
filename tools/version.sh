@@ -46,7 +46,12 @@ if ! git -C "$repository_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
 fi
 
 dirty=
-if ! git -C "$repository_dir" diff-index --quiet HEAD --; then
+tracked_changes=$(
+  git -C "$repository_dir" status \
+    --porcelain=v1 \
+    --untracked-files=no
+)
+if [ -n "$tracked_changes" ]; then
   dirty=.dirty
 fi
 

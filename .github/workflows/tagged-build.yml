@@ -176,10 +176,6 @@ jobs:
     runs-on: windows-2025
 
     steps:
-      - name: Keep repository scripts as LF
-        shell: bash
-        run: git config --global core.autocrlf input
-
       - name: Check out the release tag
         uses: actions/checkout@v6
         with:
@@ -206,6 +202,22 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
+          # The checkout is created by Git for Windows but inspected by MSYS2
+          # Git. Ignore filesystem mode emulation and rely on .gitattributes
+          # for the repository's LF policy.
+          git config --local core.autocrlf false
+          git config --local core.filemode false
+          tracked_changes="$(
+            git status --porcelain=v1 --untracked-files=no
+          )"
+          if [[ -n "$tracked_changes" ]]; then
+            echo "Tracked files changed while preparing the Windows build:" >&2
+            printf '%s\n' "$tracked_changes" >&2
+            git diff HEAD --stat >&2
+            git diff HEAD --summary >&2
+            exit 1
+          fi
+
           expected_version="${{ needs.validate.outputs.version }}"
           tag_version="$(./tools/version.sh --from-tag "$GITHUB_REF_NAME")"
           build_version="$(make --no-print-directory print-version)"

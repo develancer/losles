@@ -274,6 +274,7 @@ profile on either platform.
 ├── README.md                    User-facing capabilities and build guide
 ├── COPYING                      MIT license
 ├── Makefile                     Build, install, test, and sanitizer rules
+├── .gitattributes               Cross-platform LF and binary-file policy
 ├── .github/workflows/
 │   └── tagged-build.yml         Tag-only Linux/Windows release CI
 ├── tools/
@@ -956,12 +957,24 @@ one target's packaging failure does not hide results from the others.
 
 The tagged workflow's Windows job uses the official `msys2/setup-msys2`
 action in UCRT64 mode, builds without colord, runs the portable tests, and
-builds one unsigned NSIS installer. Its private staging tree places the
-executable and DLLs under `bin`, the application and Adwaita icons under
-`share/icons`, GLib schemas under `share/glib-2.0`, and GdkPixbuf loaders
-under `lib`; preserve that relative layout because both GTK runtime discovery
-and the Win32 PNG-icon fallback depend on it. Project and MSYS2 dependency
-license texts accompany the installed binaries under `share/licenses`.
+builds one unsigned NSIS installer. Git for Windows performs checkout, while
+MSYS2 Git performs version derivation. `.gitattributes` therefore pins
+repository text to LF, and the verification step disables file-mode and
+automatic-line-ending comparisons locally before checking for tracked
+changes. Do not replace this with an ignore rule: `tools/version.sh` uses
+`git status --porcelain=v1 --untracked-files=no`, so untracked build output
+cannot add `.dirty`. This status query also refreshes Git's stat cache; do not
+replace it with a bare `git diff-index`, which can report false changes when
+Git for Windows and MSYS2 Git inspect the same checkout. If the tree is
+genuinely changed, the verification step prints the tracked status and diff
+summary before failing.
+
+The job's private staging tree places the executable and DLLs under `bin`, the
+application and Adwaita icons under `share/icons`, GLib schemas under
+`share/glib-2.0`, and GdkPixbuf loaders under `lib`; preserve that relative
+layout because both GTK runtime discovery and the Win32 PNG-icon fallback
+depend on it. Project and MSYS2 dependency license texts accompany the
+installed binaries under `share/licenses`.
 
 The Windows installer payload does not copy the whole UCRT64 `bin` directory.
 `tools/copy-pe-runtime.sh` reads PE import tables with `objdump`, recursively

@@ -1,0 +1,7 @@
+# Keep source and packaging text stable across Linux, Git for Windows, and
+# MSYS2. This also ensures that shell scripts retain LF line endings.
+* text=auto eol=lf
+
+# Never subject binary application artwork to text conversion.
+*.ico binary
+*.png binary
