@@ -1,8 +1,9 @@
 # AGENTS.md
 
-This file is the technical handoff for AI agents working on losles. It applies
-to the entire repository. Read it together with `README.md` before changing
-the project.
+This file is the technical source of truth for AI agents working on losles. It
+applies to the entire repository. Read it completely before changing the
+project, then use `README.md` for the supported user-facing behavior and
+installation story.
 
 ## Maintenance contract
 
@@ -26,10 +27,10 @@ this root file rather than silently contradicting it.
 
 ## Product intent and non-negotiable properties
 
-losles is a small, responsive, color-managed photo viewer aimed at Ubuntu
-24.04 and later. Releases use `YYYY.MM.N` calendar versions, the code is
-MIT-licensed, and the implementation is deliberately C17 with GTK 4 rather
-than a runtime-heavy application stack.
+losles is a small, responsive, color-managed photo viewer for Ubuntu 24.04
+and later, Debian 13, and x86-64 Windows 10/11. Releases use `YYYY.MM.N`
+calendar versions, the code is MIT-licensed, and the implementation is
+deliberately C17 with GTK 4 rather than a runtime-heavy application stack.
 
 Preserve these product properties unless the project owner explicitly changes
 them:
@@ -66,7 +67,9 @@ them:
 
 ## Supported behavior at a glance
 
-- Viewing: 8-bit grayscale, grayscale-alpha, RGB, and RGBA JPEG/PNG paths.
+- Viewing: grayscale and RGB JPEG; grayscale, grayscale-alpha, RGB, RGBA,
+  palette, low-bit-depth, 16-bit, transparent, and interlaced PNG. PNG inputs
+  are normalized to 8-bit display buffers, and animations are not played.
 - JPEG ICC: `ICC_PROFILE` APP2 chunks, including multi-marker profiles.
 - PNG ICC: `iCCP`.
 - Orientation: all eight JPEG EXIF orientation values are displayed.
@@ -86,15 +89,24 @@ Important current exclusions include CMYK/YCCK JPEG display, editing of
 palette/sub-8-bit/16-bit/interlaced/animated PNGs, 16-bit display buffers,
 HDR, animations, free rotation, and zooming out below the initial fit.
 
-## Toolchain and dependencies
+Published releases contain x86-64 packages for Ubuntu 24.04, Ubuntu 26.04,
+and Debian 13 plus one x86-64 Windows NSIS installer and `SHA256SUMS`. They
+are upstream convenience packages, not packages in the Debian or Ubuntu
+archives. `README.md` is the canonical installation guide; keep it based on
+stable filename patterns and the GitHub `releases/latest` URL so routine
+releases do not require documentation-only version updates.
+
+## Build, test, and local packaging
+
+### Toolchain and dependencies
 
 Build system: GNU Make. The Makefile defaults to `-O2 -g`, compiles as C17,
 and keeps generated output outside the source tree.
 
-Supported platform baselines are Ubuntu 24.04 or later and, while the native
-port is under test, x86-64 Windows 10/11 built in MSYS2 UCRT64. Windows
-compilation defines `_WIN32_WINNT` and `WINVER` as `0x0a00`, matching that
-baseline and exposing `IFileOperation`'s recycle-on-delete flags.
+Supported platform baselines are Ubuntu 24.04 or later, Debian 13, and x86-64
+Windows 10/11 built in MSYS2 UCRT64. Windows compilation defines
+`_WIN32_WINNT` and `WINVER` as `0x0a00`, matching that baseline and exposing
+`IFileOperation`'s recycle-on-delete flags.
 
 Compile/link dependencies:
 
@@ -130,6 +142,8 @@ sudo apt install \
   libjpeg-dev libturbojpeg0-dev libpng-dev
 ```
 
+### Normal developer build
+
 Normal build, test, and run:
 
 ```sh
@@ -139,12 +153,15 @@ make test
 ```
 
 The Makefile uses `pkg-config`, generates header dependency files, and keeps
-all normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
+normal output in `build`. It supports `prefix`, `bindir`, `datadir`,
 `applicationsdir`, `metainfodir`, `icondir`, `localedir`, `DESTDIR`,
 `mandir`, `man1dir`, `BUILD_DIR`, `VERSION`, `CFLAGS`, `LDFLAGS`, `LDLIBS`,
-`SOURCE_ICON_FILE`, `WINDRES`, and `SANITIZE` overrides. Use a distinct
-`BUILD_DIR` after changing compiler/sanitizer modes because Make does not
-record command-line flag changes:
+`SOURCE_ICON_FILE`, `WINDRES`, and `SANITIZE` overrides. The checked-in
+`.gitignore` covers `build` and `build-*`; a differently named `BUILD_DIR`
+may need a local ignore rule.
+
+Use a distinct `BUILD_DIR` after changing compiler/sanitizer modes because
+Make does not record command-line flag changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -166,12 +183,22 @@ ASAN_OPTIONS=detect_leaks=0 \
 This workaround disables only leak detection and is not a substitute for a
 normal LeakSanitizer run on an unrestricted host.
 
-Build directories and their generated files are ignored and must not be
-committed. Installation uses the normal Make prefix, `/usr/local` by default:
+The normal build directories and their generated files must not be committed.
+Installation uses the normal Make prefix, `/usr/local` by default:
 
 ```sh
-make install
+build_version="$(make --no-print-directory print-version)"
+sudo make VERSION="$build_version" install
 ```
+
+A source-tree installation is not tracked by APT and there is currently no
+`uninstall` target. Recommend a matching `.deb` to ordinary users. For a
+privileged source install, resolve and pass `VERSION` before `sudo` as shown:
+this avoids running Git version discovery as root and its possible
+`safe.directory` rejection. For a non-privileged installation smoke test, use
+a temporary `DESTDIR`.
+
+### Version derivation
 
 The build version is generated into
 `build/generated/losles-version.h` by `tools/version.sh`. Run
@@ -182,7 +209,8 @@ such a tag gets that plain version. A later commit uses
 `YYYY.MM.N+<distance>.g<hash>`, with `.dirty` appended for tracked worktree
 changes. With no reachable release tag, the result is
 `0+untagged.g<hash>`; outside a Git checkout it is `0+unknown`. Distribution
-builds without `.git` must pass `VERSION=YYYY.MM.N` explicitly.
+builds without `.git` must pass `VERSION=YYYY.MM.N` explicitly on every Make
+invocation that can regenerate the version header.
 If a `.git` directory or worktree link is present but `git rev-parse` fails,
 `tools/version.sh` deliberately prints the underlying Git diagnostic and
 exits unsuccessfully rather than misclassifying the checkout as a source
@@ -199,8 +227,7 @@ update the committed Debian changelog. These `-0losles1~...` revisions sort
 before Debian's eventual `-1`, so an archive package upgrades the convenience
 GitHub builds.
 
-For a non-privileged installation smoke test, use a temporary `DESTDIR`
-instead of installing into the live system.
+### Debian package checks
 
 For a local Ubuntu binary-package check after installing the
 `debian/control` build dependencies:
@@ -218,10 +245,10 @@ file are written one directory above the source tree by
 `debian/.gitignore`; do not commit them. Until an ITP bug exists, Lintian is
 expected to report only `initial-upload-closes-no-bugs`.
 
-For the first real Debian upload, use `dch` to replace the placeholder with
-`YYYY.MM.N-1`, add `(Closes: #ITP_NUMBER)`, and finalize the entry for
-`unstable`. Subsequent Debian-only revisions use `-2`, `-3`, and so on. These
-archive changes are intentionally independent of the temporary GitHub
+For the first Debian archive upload, use `dch` to replace the placeholder
+with `YYYY.MM.N-1`, add `(Closes: #ITP_NUMBER)`, and finalize the entry for
+`unstable`. Subsequent Debian-only revisions use `-2`, `-3`, and so on.
+These archive changes are intentionally independent of the temporary GitHub
 `-0losles1~...` entries.
 
 ```sh
@@ -268,6 +295,7 @@ profile on either platform.
 │   ├── changelog                Package version/upload history
 │   ├── control                  Source/binary metadata and dependencies
 │   ├── copyright                DEP-5 file licensing
+│   ├── docs                     Install README with the binary package
 │   ├── rules                    debhelper bridge to GNU Make
 │   ├── source/format            3.0 (quilt) source-package format
 │   ├── upstream/metadata        Upstream repository and bug tracker
@@ -457,11 +485,10 @@ creates a same-directory hard-link safety backup (falling back to a
 metadata-preserving copy), moves the exact original with the shared platform
 helper, and then moves the cropped file into the original path. Linux uses
 GIO Trash; Windows uses `IFileOperation` with `FOFX_RECYCLEONDELETE`.
-Cancellation is
-deliberately ignored during this final crop commit phase. If installation
-fails after trashing, losles tries to restore the safety backup; the error
-identifies the backup path if automatic restoration also fails. Never replace
-the crop sequence with unlinking or direct truncation.
+Cancellation is deliberately ignored during this final crop commit phase. If
+installation fails after trashing, losles tries to restore the safety backup;
+the error identifies the backup path if automatic restoration also fails.
+Never replace the crop sequence with unlinking or direct truncation.
 
 Crop is enabled only for orientation `1`. A requested rectangle is expanded
 outward to MCU boundaries and clipped to image edges. The window calls the
@@ -848,7 +875,8 @@ inflight work before installing the fresh file list. Completed neighbor
 caches are retained so the successor can still display quickly; only entries
 for the deleted URI are removed. Stale callbacks must continue checking their
 generation before touching these tables. `operation_in_progress` serializes
-rotation, normalization, crop, deletion, navigation, and opening.
+rotation, normalization, crop, and deletion; navigation and opening check it
+and refuse to start while one of those operations is active.
 
 ## Application and installed metadata
 
@@ -870,6 +898,26 @@ Files in `data/` are installed desktop integration, not runtime source:
 ID, display name, and repository URL. It includes the generated
 `losles-version.h` for the build version. Keep the repository URL in the
 config header and AppStream metadata synchronized.
+
+## Release engineering and distribution packaging
+
+There is one release workflow,
+`.github/workflows/tagged-build.yml`. It is the source of all GitHub release
+artifacts; ordinary branch pushes and pull requests do not produce packages.
+Each published release contains:
+
+- `losles_<version>-0losles1~ubuntu24.04.1_amd64.deb`;
+- `losles_<version>-0losles1~ubuntu26.04.1_amd64.deb`;
+- `losles_<version>-0losles1~debian13.1_amd64.deb`;
+- `losles-<version>-windows-x86_64-setup.exe`;
+- `SHA256SUMS`, covering the four installable files.
+
+The `.deb` files are upstream convenience builds, not an APT repository and
+not official Debian/Ubuntu archive packages. The Windows installer is a
+per-user, unsigned NSIS package. Keep the release description and filename
+patterns in `README.md` synchronized with the workflow.
+
+### Tag-triggered workflow
 
 The tagged-build GitHub Actions workflow is deliberately release-only: branch
 pushes and pull requests do not trigger it. GitHub's tag filter selects the
@@ -903,6 +951,8 @@ because runtime package names and symbol-derived minimum dependencies can
 differ even when shared-library SONAMEs match. Keep `fetch-depth: 0`, because
 development-version derivation needs tag history. Keep `fail-fast: false` so
 one target's packaging failure does not hide results from the others.
+
+### Windows installer assembly
 
 The tagged workflow's Windows job uses the official `msys2/setup-msys2`
 action in UCRT64 mode, builds without colord, runs the portable tests, and
@@ -954,10 +1004,11 @@ NSIS uses solid LZMA compression and embeds the checked-in Windows ICO in the
 installer and uninstaller. The Makefile independently compiles
 `packaging/windows/losles.rc` with `windres` so Explorer, Start Menu
 shortcuts, and file associations obtain the same icon from `losles.exe`.
-Calendar versions map naturally to the four-word PE installer version:
-`2026.07.1` becomes `2026.7.1.0`. The tagged job refuses a release counter
-larger than the PE format's 16-bit component limit rather than folding it to a
-colliding value.
+Calendar-version components map directly to the four-word PE installer
+version: `YYYY.MM.N` becomes `YYYY.MM.N.0`, with leading zeroes removed from
+the numeric components. The tagged job refuses a release counter larger than
+the PE format's 16-bit component limit rather than folding it to a colliding
+value.
 
 After packaging, the workflow silently installs into a temporary per-user
 directory, checks the executable, icon payload, and Apps & Features registry
@@ -970,11 +1021,13 @@ stored directly rather than wrapped in an artifact ZIP. The release job uses
 direct v7 artifacts. The staging tree is an implementation detail and is not
 uploaded.
 
-The test installer is unsigned. Do not claim that it avoids SmartScreen
+The released installer is unsigned. Do not claim that it avoids SmartScreen
 warnings. A future release workflow should Authenticode-sign and timestamp
 the application executable before packaging, then sign and timestamp the
 final installer; signing credentials must be supplied through protected
 secrets or a dedicated signing service, never committed.
+
+### Release publication
 
 After every Linux matrix leg and the Windows job succeed, the release job
 downloads the three `.deb` artifacts and the direct `.exe` artifact into one
@@ -984,9 +1037,27 @@ all four. With job-local `contents: write` permission, it creates the tag's
 GitHub Release with generated notes and those five files. A rerun updates an
 existing release's assets with `--clobber`. Build and validation jobs retain
 read-only repository permission. GitHub adds the tag's source ZIP and tarball
-itself. The AppStream file intentionally has no `<releases>` list: Git tags
-are the canonical release history, while the installed metadata remains valid
-without duplicating that history.
+itself.
+
+For future releases:
+
+1. Update user-visible documentation only when behavior, supported targets,
+   dependencies, installation, or packaging has changed; do not edit it just
+   to substitute a new release number.
+2. Ensure the worktree is clean and `make test` passes.
+3. Create and push exactly one `YYYY.MM.N` tag on the intended release commit;
+   do not prefix it with `v`.
+4. Let the workflow create or update the GitHub Release. Do not hand-build or
+   rename its platform packages.
+5. Check that the release has the three `.deb` files, one `.exe`, and
+   `SHA256SUMS`, then smoke-test installation on representative Linux and
+   Windows systems.
+
+The AppStream metadata intentionally has no explicit release list. Tags and
+GitHub Releases are the upstream release history; do not duplicate every tag
+in `data/io.github.develancer.losles.metainfo.xml`.
+
+### Debian packaging policy
 
 The Debian packaging is intentionally usable beyond CI. `debian/rules`
 passes `prefix=/usr` because the installed icon path is compiled in, and
@@ -1143,8 +1214,8 @@ the supported GTK baseline no longer needs it.
 - CMYK/YCCK JPEGs fail explicitly.
 - Invalid embedded profiles are ignored in favor of the documented source
   fallback; this is reported as an assumed profile in the information OSD.
-- PNG 16-bit samples and non-iCCP color chunks are not preserved in the view
-  pipeline.
+- PNG 16-bit samples are reduced to 8-bit for viewing. PNG `sRGB`, `gAMA`, and
+  `cHRM` color descriptions are not interpreted as source profiles.
 - PNG editing intentionally excludes palette, sub-8-bit, 16-bit, Adam7, and
   animated files. PNG recompression is pixel-lossless but is not expected to
   reproduce identical `IDAT` bytes.

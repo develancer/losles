@@ -6,15 +6,44 @@ losles \- color-managed image viewer with lossless editing
 .RI [ FILE ]
 .SH DESCRIPTION
 .B losles
-is a lightweight GTK image viewer for JPEG and PNG files.
-It converts an embedded image profile directly to the ICC profile selected
-for the active monitor and supports wide-gamut RGB display profiles.
+is a lightweight GTK viewer for JPEG and PNG images.
+It interprets an embedded image profile and converts the image directly to
+the RGB ICC profile selected for the active monitor.
+RGB images without a usable embedded profile are assumed to be sRGB;
+grayscale images use a D65 gamma-2.2 assumption.
+If no monitor profile can be loaded, losles uses an explicit sRGB display
+fallback.
 .PP
-Supported images can be rotated and cropped without changing their JPEG
-coefficients or PNG sample values.
-Rotation overwrites the original file.
+Opening a file also discovers supported images in its parent directory for
+previous/next navigation.
+Nearby images are decoded and color-converted in the background.
+.SH EDITING AND FILE SAFETY
+Editing is immediate and in place.
+Lossless JPEG operations rearrange DCT coefficients without decoding and
+re-encoding lossy image data.
+Supported PNG operations preserve sample values but recompress the PNG image
+data.
+.PP
+Rotation and EXIF-orientation normalization overwrite the original path
+without keeping a Trash backup.
 Crop moves the exact original to the system Trash before installing the
 cropped replacement.
+The
+.B Delete
+shortcut also moves the current file to Trash.
+.PP
+JPEG transforms require a mathematically perfect coefficient operation.
+An operation fails rather than discarding incomplete edge blocks.
+JPEG crop is available only when EXIF orientation is 1; use the warning-icon
+Normalize control first when a non-default orientation is stored.
+.PP
+PNG editing is limited to static, non-interlaced, direct-color 8-bit
+grayscale, grayscale-alpha, RGB, and RGBA files.
+Other supported PNG encodings remain view-only.
+.PP
+Metadata is retained, but dimension-dependent metadata such as embedded
+thumbnails or EXIF pixel-dimension fields is not regenerated after editing
+and can describe the pre-edit image.
 .SH KEYBOARD SHORTCUTS
 .TP
 .B Ctrl+O
@@ -24,16 +53,17 @@ Open an image.
 Show the previous or next image.
 .TP
 .B I
-Toggle the image information overlay.
+Toggle the image and color-profile information overlay.
 .TP
 .B C
-Enter or leave crop mode.
+Enter or leave Crop mode.
 .TP
 .B Enter
 Apply the current crop selection.
 .TP
 .B Escape
-Leave crop mode, or reset a zoomed image to its fitted size.
+Leave Crop mode, or reset a zoomed image to its fitted size.
+It does not leave fullscreen.
 .TP
 .B Alt+Enter
 Enter or leave fullscreen mode.
@@ -53,17 +83,31 @@ Zoom at the pointer.
 .TP
 .B Primary-button drag
 Pan a zoomed image.
+.TP
+.B Double-click
+Enter or leave fullscreen mode.
+.TP
+.B File drag and drop
+Open the first dropped image unless Crop mode or another file operation is
+active.
 .SH ENVIRONMENT
 .TP
 .B G_MESSAGES_DEBUG=losles
 Enable diagnostic messages about monitor and display-profile selection.
 .SH FILES
+Packaged installations normally use a prefix of
+.IR /usr ;
+the default source installation prefix is
+.IR /usr/local .
 .TP
-.I /usr/share/applications/io.github.develancer.losles.desktop
+.I PREFIX/share/applications/io.github.develancer.losles.desktop
 Desktop launcher and image MIME associations.
 .TP
-.I /usr/share/metainfo/io.github.develancer.losles.metainfo.xml
+.I PREFIX/share/metainfo/io.github.develancer.losles.metainfo.xml
 AppStream software-catalogue metadata.
+.TP
+.I PREFIX/share/icons/hicolor/512x512/apps/io.github.develancer.losles.png
+Application icon.
 .SH BUGS
 Report bugs at
 .UR https://github.com/develancer/losles/issues

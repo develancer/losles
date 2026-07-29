@@ -6,88 +6,314 @@
 
 # losles
 
-**losles** is a small, color-managed photo viewer for Ubuntu 24.04 and later,
-with native Windows support under active development. It currently displays
-JPEG and PNG files and performs lossless rotation and cropping for JPEGs and
-common 8-bit PNG encodings.
+**losles** is a small, color-managed photo viewer for JPEG and PNG images. It
+uses embedded ICC profiles, converts images directly to the profile selected
+for the current monitor, and provides carefully constrained lossless rotation
+and cropping.
 
-The application is deliberately written in C17. On Ubuntu this avoids a
-language runtime, an async executor, and format frameworks that would overlap
-with functionality losles needs to control itself. GTK 4 supplies the native
-desktop integration, LittleCMS performs color conversion, and libjpeg-turbo
-and libpng decode pixels. On Linux, colord supplies the selected monitor
-profile; on Windows, losles obtains it from the Win32 color-management API.
+The
+[latest GitHub release](https://github.com/develancer/losles/releases/latest)
+provides prebuilt x86-64 packages for Ubuntu 24.04, Ubuntu 26.04, Debian 13,
+and Windows 10/11.
+
+losles is written in C17 with GTK 4. LittleCMS handles color conversion,
+libjpeg-turbo provides coefficient-level JPEG transforms, and libpng handles
+PNG decoding and editing.
 
 ## Why losles?
 
 Because every other photo viewer was missing something I considered a
 must-have, while providing a lot of clutter I did not need. This one focuses
-on ICC profile support, lossless operations, speed (pre-loading),
-and not much more.
+on ICC profile support, lossless operations, speed through preloading, and not
+much more.
 
-## What works
+## Install a release
+
+Download packages from the
+[latest release page](https://github.com/develancer/losles/releases/latest).
+The release also contains `SHA256SUMS` for all four installable artifacts.
+
+### Ubuntu and Debian
+
+Use the package built for your exact distribution:
+
+| System | Package |
+| --- | --- |
+| Ubuntu 24.04, x86-64 | `losles_<version>-0losles1~ubuntu24.04.1_amd64.deb` |
+| Ubuntu 26.04, x86-64 | `losles_<version>-0losles1~ubuntu26.04.1_amd64.deb` |
+| Debian 13, x86-64 | `losles_<version>-0losles1~debian13.1_amd64.deb` |
+
+After downloading the matching package and `SHA256SUMS` into the same
+directory, optionally verify it:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Install it with APT so dependencies are obtained from the distribution. For
+example, from a directory containing only the downloaded Ubuntu 24.04
+package:
+
+```sh
+sudo apt install ./losles_*~ubuntu24.04.1_amd64.deb
+```
+
+Use the corresponding filename suffix on Ubuntu 26.04 or Debian 13. The
+packages are standalone GitHub downloads, not an APT repository; they do not
+configure an additional package source. Remove the application with:
+
+```sh
+sudo apt remove losles
+```
+
+These are upstream convenience packages, not yet packages from the official
+Debian or Ubuntu archives. Their version sorts below a future official Debian
+revision, so an archive package can replace them normally.
+
+### Windows 10 and 11
+
+Download and run the file named
+`losles-<version>-windows-x86_64-setup.exe`.
+
+The installer is per-user, does not request administrator privileges, and
+installs under `%LOCALAPPDATA%\Programs\losles`. It creates a Start Menu
+shortcut, appears in Apps & Features, and makes losles available in JPEG and
+PNG “Open with” lists without changing the default viewer.
+
+The installer is not Authenticode-signed, so Windows SmartScreen may warn
+before running it. Its SHA-256 value can be compared with the release's
+`SHA256SUMS`. Uninstall losles from Windows Settings → Apps → Installed apps.
+
+## Features
 
 - Embedded JPEG `ICC_PROFILE` data, including profiles split over multiple
   APP2 markers.
 - Embedded PNG `iCCP` profiles.
-- Application-side conversion from the embedded image profile to the ICC
-  profile selected for the current monitor in Ubuntu Settings or Windows
-  Color Management.
-- Wide-gamut RGB display profiles. Output values are encoded directly in the
-  monitor profile's RGB space; the image is not collapsed to sRGB first.
-- Correct display of all eight EXIF orientation values.
-- Lossless JPEG rotation and MCU-aligned cropping through libturbojpeg, while
-  preserving JPEG marker metadata including ICC, EXIF, XMP, IPTC, comments,
-  and unknown APP markers.
-- Pixel-lossless rotation and exact-pixel cropping for static, non-interlaced,
-  8-bit grayscale, grayscale-alpha, RGB, and RGBA PNGs. Original ancillary
-  chunks, including `iCCP`, text, and physical-resolution data, are retained
-  byte-for-byte.
-- Explicit lossless EXIF-orientation normalization: the displayed orientation
-  is baked into JPEG coefficients and the existing orientation tag is set to
-  `1`.
-- Fast previous/next navigation. losles decodes and color-converts up to five
-  images on either side in the background, prioritizing nearby images and the
-  current navigation direction. Decoded sources and display-profile textures
-  have separate cache limits of 10% of total system memory each, with at most
-  two background decodes and two background color conversions at once. When
-  adjacent images have identical displayed dimensions, navigation preserves
-  the current zoom and pan position.
-- A format-module interface. JPEG and PNG are separate GObject
-  implementations, so another decoder/editor does not need changes to the
-  window or color pipeline.
+- Direct conversion to the RGB ICC profile selected for the current monitor
+  on Ubuntu/Debian or Windows, including wide-gamut profiles.
+- Explicit, visible sRGB fallback when no usable monitor profile is available.
+- Correct display of all eight JPEG EXIF orientation values.
+- Coefficient-lossless JPEG rotation, orientation normalization, and
+  MCU-aligned crop through libjpeg-turbo.
+- Pixel-lossless rotation and exact-pixel crop for common static,
+  non-interlaced, direct-color 8-bit PNG files.
+- Preservation of JPEG marker metadata and non-image-data PNG chunks, subject
+  to the metadata-consistency caveat below.
+- Background decode and color conversion of nearby images for fast browsing.
+- Cursor-anchored wheel zoom, mouse panning, fullscreen, drag-and-drop
+  opening, and mouse Back/Forward navigation.
 
-Images without an embedded profile are treated as sRGB. Grayscale PNG files
-without a profile use a D65 gamma-2.2 gray profile. If no selected monitor ICC
-profile can be found, losles uses an explicit sRGB display fallback and says
-so in the information overlay.
+Images without an embedded profile use an explicit source assumption: RGB is
+treated as sRGB, while grayscale is treated as D65 gamma 2.2. Invalid or
+incompatible embedded profiles use the same fallback and are reported as an
+assumption in the information overlay.
 
-## Ubuntu 24.04 build
+## Using losles
 
-All dependencies are in the standard Ubuntu repositories:
+Open a file from the application, pass it on the command line, choose losles
+from a file manager's “Open with” menu, or drag a file onto the window:
+
+```sh
+losles /path/to/photo.jpg
+```
+
+When one image is opened, losles scans its directory for `.jpg`, `.jpeg`,
+`.jpe`, and `.png` files and sorts them by filename using the current locale.
+
+| Action | Control |
+| --- | --- |
+| Open an image | `Ctrl+O` or drag a file onto the window |
+| Previous / next image | `Left` / `Right`, header buttons, or mouse Back / Forward |
+| Zoom at the pointer | Mouse wheel |
+| Pan a zoomed image | Primary-button drag |
+| Reset zoom | `Escape` when Crop mode is inactive |
+| Toggle information overlay | `I` or the information button |
+| Enter or leave fullscreen | Double-click the picture or `Alt+Enter` |
+| Enter or leave Crop mode | `C` or the crop button |
+| Apply the crop selection | `Enter` or the visible Crop button |
+| Move the current file to Trash | `Delete` |
+
+`Escape` deliberately does not leave fullscreen. It first leaves Crop mode;
+otherwise it resets a zoomed image to its fitted size.
+
+The information overlay is hidden by default and appears at the bottom-left
+of the image. It shows the format, displayed dimensions, source-profile
+choice, and selected display target.
+
+While browsing, losles retains the current image and up to five images on each
+side in both its decoded-image and display-converted caches. Each cache has a
+soft limit of 10% of total system memory, and no more than two background
+decodes and two background color conversions run at once. When adjacent
+images have identical displayed dimensions, zoom and pan are preserved.
+
+The previous image remains visible under a spinner while an uncached
+replacement is prepared. A fully decoded and color-converted cache hit appears
+immediately without a spinner.
+
+## Lossless editing and file safety
+
+Editing is immediate and in place. Read these rules before relying on the
+editing controls:
+
+- **Rotate left/right** prepares the transformed file and then overwrites the
+  original path. It does not keep a backup in Trash.
+- **Normalize EXIF orientation** also overwrites the original without a Trash
+  backup.
+- **Crop** first prepares the result, then moves the exact original to the
+  system Trash before installing the cropped file at the original path.
+- **Delete** moves the current file to the system Trash and then opens its
+  successor, or its predecessor when the deleted file was last.
+
+Editing requires a regular local file. Rotation and normalization complete
+their transformed output before replacing the source. Crop refuses to proceed
+if the original cannot be moved to Trash.
+
+### JPEG
+
+JPEG transforms rearrange DCT coefficients through libjpeg-turbo; they do not
+decode and re-encode lossy image data. A mathematically perfect transform is
+required. If incomplete edge blocks would need to be discarded, the operation
+fails rather than silently trimming pixels.
+
+Ordinary rotation respects and retains the existing EXIF orientation value.
+The warning-icon Normalize control is enabled only when a valid non-default
+orientation tag is present. It applies the stored orientation to the JPEG
+coefficients and sets that existing tag to `1` without changing the displayed
+image. Cropping is available only at orientation `1`; use Normalize first when
+needed.
+
+JPEG crop selections snap to legal MCU boundaries while they are dragged,
+moved, or resized. The rectangle shown on screen is the rectangle that will
+be written.
+
+JPEG APP and COM markers—including ICC, EXIF, XMP, IPTC, comments, and
+unrecognized application markers—are retained. For supported perfect
+transforms, rotating right and then left reproduces the encoded file
+byte-for-byte.
+
+### PNG
+
+PNG edits decode and recompress the original samples without changing their
+values. `IHDR` and `IDAT` are regenerated as required; every other original
+chunk is copied byte-for-byte and in order. The resulting PNG is
+pixel-lossless but is not expected to have identical compressed `IDAT` bytes.
+
+Editing is enabled only for static, non-interlaced, 8-bit grayscale,
+grayscale-alpha, RGB, and RGBA PNG files. Palette PNGs, sub-8-bit grayscale,
+16-bit PNGs, Adam7-interlaced PNGs, and animated PNGs remain view-only.
+
+### Metadata caveat
+
+Metadata whose meaning depends on image dimensions is preserved rather than
+rewritten. Embedded thumbnails, EXIF pixel-dimension fields, and
+dimension- or position-dependent PNG ancillary fields can therefore describe
+the image before a crop or quarter-turn. The actual encoded image dimensions
+are updated correctly.
+
+## Color management
+
+losles performs application-managed SDR display conversion with LittleCMS.
+Source pixels are converted directly from the embedded or assumed source
+profile into the active monitor's RGB profile. Wide-gamut output is not
+collapsed through sRGB first.
+
+On Ubuntu and Debian, losles matches the GTK monitor connector to a colord
+display device and uses that device's selected/default profile. Moving the
+window to another monitor or changing the selected colord profile invalidates
+the display-converted cache and renders the current image again.
+
+On Windows, losles obtains the output profile for the monitor containing the
+window through the Win32 color-management API. It rechecks the profile when a
+render starts or the window moves between monitors. Changing the Windows
+profile while the same image remains idle does not redraw immediately;
+navigating or moving between monitors triggers a recheck.
+
+Both paths use 8-bit SDR output. Wide-gamut ICC support does not imply HDR or
+high-bit-depth display. If no valid RGB monitor profile can be loaded, losles
+uses a built-in sRGB target and reports the fallback in the information
+overlay.
+
+For Linux display-profile diagnostics:
+
+```sh
+G_MESSAGES_DEBUG=losles losles /path/to/photo.jpg
+```
+
+## Current limitations
+
+- Viewing supports grayscale and RGB JPEG; CMYK and YCCK JPEG are rejected.
+- PNG palette, low-bit-depth, 16-bit, transparency, and interlaced inputs can
+  be viewed, but 16-bit samples are reduced to 8-bit for display.
+- Animated images are not played.
+- Display output is 8-bit SDR; there is no HDR pipeline.
+- Zoom cannot go below the initial fitted size.
+- There is no file-change monitor. External edits do not invalidate cached
+  images during the current browsing session.
+- There is no recursive directory scan, thumbnail view, recent-files list,
+  settings UI, or runtime plugin loader.
+- The interface is currently English only.
+- Release packages are currently available only for x86-64.
+
+## Build from source
+
+Installing the matching release package is recommended for normal use. A
+source build is useful for development or unsupported distributions.
+
+### Ubuntu 24.04 or later and Debian 13
+
+Install the build dependencies from the standard distribution repositories:
 
 ```sh
 sudo apt install \
   build-essential pkg-config \
   libgtk-4-dev liblcms2-dev libcolord-dev \
   libjpeg-dev libturbojpeg0-dev libpng-dev
-
-make
-make test
-./build/losles /path/to/photo.jpg
 ```
 
-The Makefile uses `pkg-config` to find the system libraries and writes all
-output under `build` by default. Installation follows the usual Make
-variables and honors `DESTDIR`:
+Then build, test, and run:
 
 ```sh
-sudo make install                 # prefix=/usr/local by default
+make -j2
+make test
+make run ARGS=/path/to/photo.jpg
+```
+
+The Makefile detects dependencies with `pkg-config` and writes generated
+output under `build`. A Git checkout derives its version from the nearest
+release tag. GitHub-generated source archives do not contain Git metadata, so
+pass the release version to every Make invocation when building one:
+
+```sh
+release_version=YYYY.MM.N  # replace with the archive's release version
+make -j2 VERSION="$release_version"
+make VERSION="$release_version" test
+```
+
+To install a source build under `/usr/local`:
+
+```sh
+build_version="$(make --no-print-directory print-version)"
+sudo make VERSION="$build_version" install
+```
+
+Resolving the version before `sudo` avoids Git repository-ownership checks
+under the root account. When installing from a GitHub-generated source
+archive, reuse the value set above:
+
+```sh
+sudo make VERSION="$release_version" install
+```
+
+This direct installation is not tracked by APT and the Makefile currently has
+no uninstall target. Prefer the `.deb` package when one matches the system.
+For a non-privileged installation smoke test:
+
+```sh
 make DESTDIR=/tmp/losles-stage install
 ```
 
-For AddressSanitizer and UndefinedBehaviorSanitizer, use a separate output
-directory because Make does not track changes to compiler flags:
+Use a separate build directory for sanitizer builds because Make does not
+record compiler-option changes:
 
 ```sh
 make BUILD_DIR=build-asan \
@@ -95,13 +321,11 @@ make BUILD_DIR=build-asan \
   test
 ```
 
-Run `make help` for the available targets and overrides.
+Run `make help` for other targets and overrides.
 
-## Windows development build
+### Windows development build
 
-The native Windows port currently targets 64-bit Windows 10 and 11 using
-GTK's Win32 backend and the MSYS2 UCRT64 environment. Install MSYS2, open its
-**UCRT64** shell, and install:
+Open an MSYS2 **UCRT64** shell and install:
 
 ```sh
 pacman -S --needed \
@@ -112,333 +336,42 @@ pacman -S --needed \
   mingw-w64-ucrt-x86_64-lcms2 \
   mingw-w64-ucrt-x86_64-libjpeg-turbo \
   mingw-w64-ucrt-x86_64-libpng
+```
 
-make
+Build and test from that shell:
+
+```sh
+make -j2
 make test
 ./build/losles.exe /path/to/photo.jpg
 ```
 
-The Makefile detects the MinGW target from the compiler, omits colord, selects
-the Win32 platform implementation, adds `.exe` automatically, and embeds the
-multi-resolution Windows application icon with `windres` from the GCC
-toolchain.
+The Makefile recognizes the MinGW compiler, selects the Win32 platform layer,
+omits colord, adds `.exe`, and embeds the native multi-resolution icon.
+Creating the distributable NSIS installer is handled by the tagged GitHub
+Actions workflow rather than the normal developer build.
 
-The tag-triggered GitHub Actions workflow performs the same native build on a
-Windows runner. It adds the UCRT64 NSIS package, assembles only the recursive
-runtime DLL dependency closure of losles and its JPEG/PNG GTK image loaders,
-and compresses that staged tree into one installer:
+## Versions and releases
 
-```text
-losles-<version>-windows-x86_64-setup.exe
-```
+Release versions and Git tags use `YYYY.MM.N`, where `N` counts releases
+within the month. A clean checkout at a release tag builds with that exact
+version; later commits append the distance and abbreviated commit ID, as in
+`YYYY.MM.N+3.g1a2b3c4d5e6f`. Tracked local changes add a `.dirty` suffix.
 
-The installer uses a per-user location under
-`%LOCALAPPDATA%\Programs\losles`, so it does not request administrator
-privileges. It creates a Start Menu shortcut, appears in Apps & Features, and
-registers losles as an available JPEG/PNG handler without replacing the
-user's chosen default viewer. The workflow silently installs and uninstalls
-the result as a smoke test before publishing it with the corresponding
-release.
+Pushing a valid release tag runs the GitHub Actions release workflow. It
+builds and tests in Ubuntu 24.04, Ubuntu 26.04, Debian 13, and Windows 2025
+environments, then publishes the three `.deb` files, the Windows installer,
+and `SHA256SUMS` in one GitHub Release. The checked-in Debian changelog remains
+at a neutral packaging-work version; the workflow creates target-qualified
+package versions only in its private build checkouts.
 
-GTK 4 reads the symbolic SVG subset used by its Adwaita icons itself, so the
-general-purpose librsvg GdkPixbuf loader is not included. The installer is
-currently unsigned and can therefore trigger a Windows SmartScreen warning.
+## License and contributing
 
-## Versioning and tagged builds
+losles and its application icon are distributed under the MIT License. The
+AppStream metadata is separately dedicated under CC0-1.0. See
+[`COPYING`](COPYING).
 
-losles uses calendar versions—and matching Git release tags—in the form
-`YYYY.MM.N`, where `N` starts at `1` and counts releases made in that month:
-
-```text
-2026.07.1
-2026.07.2
-2026.08.1
-```
-
-The build obtains its version from Git. An exact clean release tag produces
-`2026.07.1`; later commits produce a version such as
-`2026.07.1+3.g1a2b3c4d5e6f`, and a modified worktree adds `.dirty`. A checkout
-with no reachable release tag uses `0+untagged.g<commit>`. Use
-`make print-version` to see the value that will be compiled into the About
-window.
-
-Builds without Git metadata, such as distribution source packages, can
-provide the version explicitly:
-
-```sh
-make VERSION=2026.07.1
-```
-
-`0+unknown` is reserved for a source tree which genuinely has no `.git`
-metadata. If metadata exists but Git cannot read it—for example because Git's
-repository-ownership protection rejects a mounted directory—the version
-script reports the Git error and fails instead of silently embedding an
-unknown version.
-
-The GitHub Actions tagged-build workflow runs only for pushed tags matching
-the release-tag shape. It validates the month and release counter once, then
-compiles and tests independently in clean Ubuntu 24.04, Ubuntu 26.04, and
-Debian 13 containers. Each target exercises a staged `/usr` installation as a
-smoke test and produces a native `.deb`. The raw installation trees are not
-uploaded because the packages already contain those files together with
-dependency, ownership, upgrade, and removal metadata. In parallel, a Windows
-2025 runner builds and tests the UCRT64 application, creates the x86-64 NSIS
-installer, and verifies a silent install/uninstall cycle.
-
-The convenience packages have target-qualified versions derived from the tag:
-
-```text
-2026.07.1-0losles1~ubuntu24.04.1
-2026.07.1-0losles1~ubuntu26.04.1
-2026.07.1-0losles1~debian13.1
-```
-
-These revisions sort below Debian's future `-1`, allowing an official
-repository package to replace a GitHub build automatically. Building each
-package inside its target system also lets `debhelper` generate the correct
-native shared-library package names and minimum versions.
-
-Every Linux package build validates the desktop and AppStream files and runs
-Lintian. After the three Linux targets and Windows job succeed, the workflow
-publishes one GitHub Release for the tag with the three `.deb` packages, the
-Windows `.exe` installer, and one `SHA256SUMS` file covering all four package
-files. GitHub supplies the corresponding source ZIP and tarball automatically.
-The packages are also retained briefly as Actions artifacts so the release
-job can collect them, but the Release assets are the intended downloads.
-
-These are unsigned convenience packages rather than an APT repository.
-Download the package matching the installed distribution and install it
-together with its repository dependencies. For example, on Ubuntu 24.04:
-
-```sh
-sudo apt install \
-  './losles_2026.07.1-0losles1~ubuntu24.04.1_amd64.deb'
-```
-
-The versioned `debian/changelog` contains a neutral `0~unreleased-1`
-packaging-work entry. The workflow updates a private runner copy with `dch`;
-it does not commit the generated release entry. The real Debian changelog is
-updated separately when preparing an archive upload, starting with
-`YYYY.MM.N-1`, the target `unstable`, and the ITP bug closure.
-
-AppStream release history is intentionally omitted: Git tags are the
-project's canonical release record.
-
-## Lossless editing semantics
-
-Rotation and crop are applied in place as soon as their action button is
-clicked. Rotation first creates the transformed image and then overwrites the
-source path; it does not create a backup in the system Trash.
-
-Crop first creates the transformed image and a safety backup, then moves the
-exact original file into the system Trash and installs the cropped file at the
-original path. If the original cannot be moved to Trash, it is left unchanged
-and the crop fails.
-
-JPEG transforms operate on DCT coefficients through libturbojpeg, not by
-decoding and re-encoding pixels. JPEG marker metadata is copied without
-selectively rewriting or discarding fields. Ordinary left/right rotation
-retains the original EXIF orientation tag. For mirrored EXIF orientations,
-losles reverses the raw coefficient direction so that the result still rotates
-in the direction requested on screen. A right rotation followed by a left
-rotation is byte-identical for the supported perfect-transform path.
-
-The separate warning-icon normalization button is enabled only for a JPEG
-containing an EXIF orientation tag whose value is not `1`. It applies that
-orientation to the coefficients and changes the existing tag to `1`, without
-changing the displayed image. Its tooltip explains whether a non-default
-orientation is present. Like ordinary rotation, normalization overwrites the
-source without creating a Trash backup. This explicit action is useful for
-software that ignores EXIF orientation and enables losles cropping afterward.
-
-JPEG crop coordinates must start on an MCU boundary. While the rectangle is
-drawn, moved, or resized, losles snaps it to the format module's nearest legal
-boundaries. The visible rectangle is therefore the rectangle that will be
-applied; clicking Crop does not perform a second hidden expansion. A transform
-is refused when a mathematically perfect result is impossible; losles does not
-silently trim edge pixels.
-
-Metadata fields whose meaning depends on image dimensions, such as an embedded
-thumbnail, EXIF pixel dimensions, or PNG metadata, are retained unchanged
-rather than discarded or regenerated. They can therefore describe the
-pre-edit image after a crop, a quarter-turn rotation, or orientation
-normalization. The image format's own encoded dimensions are updated
-correctly.
-
-PNG transforms decode and recompress the original samples without changing
-their values. The original `IHDR` and `IDAT` chunks are replaced as required;
-every other original chunk is copied unchanged and in order. Editing is
-enabled only for static, non-interlaced, 8-bit grayscale, grayscale-alpha,
-RGB, and RGBA PNG files. Palette PNGs, sub-8-bit grayscale, 16-bit samples,
-Adam7 interlacing, and animated PNG chunks remain view-only: Rotate and Crop
-stay disabled rather than converting those files to a simpler representation.
-
-## Interface
-
-Image and color-profile information is shown on an opaque black overlay
-anchored directly to the bottom-left corner of the picture, so it does not
-consume layout space. It is hidden by default and can be toggled with the
-information button or the `I` key. The image canvas is always pure black,
-independently of the desktop color scheme and in fullscreen.
-
-Scroll the mouse wheel over the image to zoom in or back out toward the
-initial fit. The image point under the mouse remains under the mouse while
-zooming, except when an image edge reaches the edge of the canvas. While
-zoomed in, drag the image with the primary mouse button to inspect another
-portion. Zooming scales the existing color-managed texture and does not
-decode or color-convert the source again.
-
-Use `Left` and `Right`, the header buttons, or the mouse's Back and Forward
-buttons to show the previous or next image. If the replacement has exactly
-the same displayed pixel dimensions, its zoom level and normalized pan
-position are preserved. A differently sized image starts at its fitted view.
-
-Double-click the picture or press `Alt+Enter` to enter or leave fullscreen.
-The header bar is hidden while fullscreen is active. `Escape` does not leave
-fullscreen. It first cancels Crop mode when active; otherwise it restores the
-initial fitted view when zoomed in.
-
-Press `C` to enter or leave crop mode, including while fullscreen. In crop
-mode, drag over the image to create a selection. Drag inside an existing
-selection to move it, or drag any of its four edges or eight visible
-edge/corner handles to resize it. JPEG selections move in legal MCU-block
-increments, while supported PNGs use exact pixels, so the overlay always
-previews the crop that will be written. Press `Enter` to apply a valid
-selection. The header control uses a crop-corner glyph supplied by losles, so
-it does not depend on the desktop icon theme. Entering Crop mode restores the
-fitted view; wheel zoom and image panning are inactive until Crop mode is
-left.
-
-Use the warning-icon orientation control when it is enabled to bake a
-non-default EXIF orientation into the JPEG coefficients and set the tag to
-`1`. The image keeps the same visual orientation, and the operation is
-coefficient-lossless.
-
-Press `Delete` to move the current image to the system Trash. losles then
-opens the next image in directory order when one exists. When the deleted
-image was last, it opens the preceding image, which is now last. It clears the
-browsing session and displays “No picture opened” only when the directory has
-no supported images left.
-
-An image file can also be opened by dragging its file icon from a file manager
-onto the losles window. A multi-file drop opens the first file. File drops
-are rejected while Crop mode or another file operation is active. After an
-accepted drop, losles takes keyboard focus so its navigation and other
-shortcuts work immediately.
-
-The question-mark About button in the header bar opens a single-page window
-with application, version, creator, license, and source-repository
-information, with a link to
-`https://github.com/develancer/losles`.
-
-When opening or navigating to another image, losles keeps the currently
-displayed image on screen with a large centered loading spinner until the new
-image has been decoded and color-converted. The initial load uses the black
-canvas because no previous image is available. If both the decoded image and
-its display-profile-converted texture are already cached, losles switches to
-it immediately without showing the spinner.
-
-## Color-management model
-
-losles performs SDR display conversion itself on both supported platforms.
-It requires an RGB monitor profile, converts directly from the image's
-embedded profile with LittleCMS, and falls back visibly to sRGB if the
-selected display profile cannot be found or used.
-
-### Ubuntu 24.04
-
-losles does not depend on Mutter's newer color-management protocol. GTK 4.14
-on Ubuntu 24.04 cannot attach an ICC colorspace to a surface, so losles uses
-the established application-managed path:
-
-1. Obtain the active `GdkMonitor` and its connector name (for example
-   `DP-0`).
-2. Find the corresponding colord display device by its `XRANDR_name`
-   metadata.
-3. Read that device's selected/default RGB profile.
-4. Use LittleCMS to convert the decoded source pixels from their embedded
-   profile directly into the monitor profile.
-5. Give those already converted device-RGB values to GTK 4.14.
-
-Moving the window to another monitor or changing the device's selected
-profile invalidates the current transform and rebuilds the visible texture.
-Calibration curves (VCGT) remain the desktop color service's responsibility
-and are not applied a second time by losles.
-
-This design targets the Ubuntu 24.04 SDR desktop pipeline. It supports the
-gamut described by an RGB monitor ICC profile, but it is not an HDR
-implementation. On a future compositor that color-transforms every surface,
-losles will need a second backend that tags source pixels instead of
-preconverting them; otherwise conversion could be applied twice.
-
-### Windows
-
-The GTK Win32 surface exposes the native window handle. losles uses it to
-identify the monitor containing the window, creates that display's device
-context, and asks `GetICMProfileW` for its current output ICC profile. The
-same LittleCMS rendering pipeline then produces device-RGB pixels for that
-profile. Moving to another monitor starts a new render, and the profile path
-and file metadata are rechecked whenever rendering starts.
-
-Windows does not currently notify `LoslesColorManager` when the selected
-profile changes while the same image remains idle. Navigating, moving the
-window between monitors, or otherwise starting a render rechecks it. Like the
-Ubuntu path, this is wide-gamut SDR support with 8-bit output, not HDR.
-
-## Source layout
-
-```text
-data/
-  icons/hicolor/512x512/apps/
-    io.github.develancer.losles.png  installed application icon
-  icons/windows/
-    io.github.develancer.losles.ico  native multi-resolution Windows icon
-  io.github.develancer.losles.desktop
-  io.github.develancer.losles.metainfo.xml
-  losles.1                    command-line manual page
-debian/
-  control                     Debian build and binary package metadata
-  rules                       debhelper bridge to the upstream Makefile
-  copyright                   machine-readable licensing
-  changelog                   Debian package version and upload history
-tools/
-  version.sh                  Git tag validation and build-version derivation
-  copy-pe-runtime.sh          recursive Windows runtime-DLL collection
-packaging/windows/
-  COPYING.rtf                  Windows installer rendering of the MIT license
-  losles.rc                   embeds the native icon in losles.exe
-  losles.nsi                  per-user NSIS installer and uninstaller
-.github/workflows/
-  tagged-build.yml            tagged Linux/Windows builds and release publishing
-src/
-  losles-config.h             application identity and repository URL
-  losles-window.c             UI, navigation, two-level cache, background jobs
-  losles-cache-policy.c       cache ordering, admission, and eviction policy
-  losles-color-manager.c      platform display profile lookup and LCMS render
-  losles-platform.h           OS integration boundary
-  losles-platform-linux.c     sysinfo, GIO Trash, POSIX hard links/permissions
-  losles-platform-win32.c     memory, Recycle Bin, Win32 hard links/icon path
-  losles-image.c              format-neutral decoded image
-  formats/
-    losles-format.c           module interface
-    losles-format-registry.c  format selection
-    losles-jpeg-format.c      JPEG decode and lossless writer
-    losles-png-format.c       PNG decode, capability checks, and lossless writer
-tests/
-  test-cache-policy.c         cache ordering and memory-admission regression tests
-  test-jpeg-metadata.c
-  test-formats.c              ICC/render, JPEG/PNG edits, and Trash integration
-```
-
-Current deliberate limits are RGB/grayscale JPEG and PNG viewing, editing of
-JPEG plus the common PNG subset described above, 8-bit display buffers, SDR
-ICC profiles, and local files for editing. CMYK JPEG display is not
-implemented yet. Windows packaging currently produces an unsigned per-user
-NSIS installer; Authenticode signing is still future release work.
-
-## License
-
-losles is distributed under the MIT License. This includes the application
-icon. The AppStream metadata is separately dedicated under CC0-1.0 so
-software catalogues and distributions can reuse it freely. See `COPYING` and
-the SPDX declaration in the metadata file.
+Issues and patches are welcome at
+[`github.com/develancer/losles`](https://github.com/develancer/losles).
+Technical contributors and AI agents should read
+[`AGENTS.md`](AGENTS.md) before changing the project.

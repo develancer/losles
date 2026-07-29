@@ -11,8 +11,14 @@
   <project_license>MIT</project_license>
   <description>
     <p>
-      losles is a lightweight photo viewer with embedded and display ICC
-      profile support and lossless crop and rotation.
+      losles is a lightweight JPEG and PNG photo viewer that converts embedded
+      image profiles directly to the ICC profile selected for the active
+      monitor.
+    </p>
+    <p>
+      It provides fast directory navigation, pointer-centered zoom, and
+      carefully constrained lossless rotation and crop for JPEG and common
+      direct-color 8-bit PNG files.
     </p>
   </description>
   <launchable type="desktop-id">io.github.develancer.losles.desktop</launchable>
