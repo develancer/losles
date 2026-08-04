@@ -156,9 +156,10 @@ Editing is immediate and in place. Read these rules before relying on the
 editing controls:
 
 - **Rotate left/right** prepares the transformed file and then overwrites the
-  original path. It does not keep a backup in Trash.
+  original path. A normal, warning-free rotation does not keep a backup in
+  Trash.
 - **Normalize EXIF orientation** also overwrites the original without a Trash
-  backup.
+  backup when TurboJPEG reports no warning.
 - **Crop** first prepares the result, then moves the exact original to the
   system Trash before installing the cropped file at the original path.
 - **Delete** moves the current file to the system Trash and then opens its
@@ -166,7 +167,10 @@ editing controls:
 
 Editing requires a regular local file. Rotation and normalization complete
 their transformed output before replacing the source. Crop refuses to proceed
-if the original cannot be moved to Trash.
+if the original cannot be moved to Trash. If TurboJPEG reports a warning for
+any JPEG edit, losles leaves the source untouched and asks whether to continue.
+An approved retry also requires Trash and preserves the exact original there,
+including for rotation and EXIF-orientation normalization.
 
 ### JPEG
 
@@ -174,6 +178,14 @@ JPEG transforms rearrange DCT coefficients through libjpeg-turbo; they do not
 decode and re-encode lossy image data. A mathematically perfect transform is
 required. If incomplete edge blocks would need to be discarded, the operation
 fails rather than silently trimming pixels.
+
+For every JPEG operation, losles first asks TurboJPEG to stop on warnings. If
+that strict attempt reports one, the source remains unchanged and a dialog
+shows the warning. Choosing Continue retries the same perfect coefficient
+transform while allowing warnings; losles does not attempt to prove that the
+result is complete or undamaged. The exact original is therefore moved to
+Trash before the replacement is installed. Choosing Cancel leaves it in
+place.
 
 Ordinary rotation respects and retains the existing EXIF orientation value.
 The warning-icon Normalize control is enabled only when a valid non-default
@@ -187,9 +199,11 @@ moved, or resized. The rectangle shown on screen is the rectangle that will
 be written.
 
 JPEG APP and COM markers—including ICC, EXIF, XMP, IPTC, comments, and
-unrecognized application markers—are retained. For supported perfect
-transforms, rotating right and then left reproduces the encoded file
-byte-for-byte.
+unrecognized application markers—are retained. For structurally valid files
+and supported perfect transforms, rotating right and then left reproduces the
+encoded file byte-for-byte. A warning-approved edit of a damaged file may
+normalize damaged entropy-stream bytes and may produce incomplete or damaged
+output; use the original retained in Trash if the result is not acceptable.
 
 ### PNG
 
@@ -204,11 +218,13 @@ grayscale-alpha, RGB, and RGBA PNG files. Palette PNGs, sub-8-bit grayscale,
 
 ### Metadata caveat
 
-Metadata whose meaning depends on image dimensions is preserved rather than
-rewritten. Embedded thumbnails, EXIF pixel-dimension fields, and
-dimension- or position-dependent PNG ancillary fields can therefore describe
-the image before a crop or quarter-turn. The actual encoded image dimensions
-are updated correctly.
+Metadata whose meaning depends on image dimensions is generally preserved
+rather than regenerated. The libjpeg-turbo transform may update recognized
+EXIF pixel-dimension fields during a JPEG transform, but embedded thumbnails
+and other dimension-dependent JPEG metadata can still describe the pre-edit
+image. Dimension- or position-dependent PNG ancillary fields are copied
+unchanged and can do the same. The actual encoded image dimensions are
+updated correctly.
 
 ## Color management
 

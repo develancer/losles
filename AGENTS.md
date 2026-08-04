@@ -44,10 +44,12 @@ them:
   protocol or a newer GTK surface-color API.
 - An operation advertised as lossless must not decode and re-encode lossy
   image data. Never silently trim image edges to make a transform possible.
-- Rotation and crop are intentionally in place. Rotation prepares the
-  transformed file and directly overwrites the source without creating a
-  Trash backup. Crop prepares the transformed file, moves the exact original
-  into the system Trash, then installs the cropped file at its original path.
+- Rotation, normalization, and crop are intentionally in place. A normal
+  warning-free rotation or normalization directly overwrites the source
+  without creating a Trash backup. Crop moves the exact original into the
+  system Trash before installing its replacement. If a strict JPEG edit
+  reports a TurboJPEG warning, an explicitly confirmed retry of any of the
+  three operations must also preserve the exact original in Trash.
 - JPEG marker metadata must be retained. Do not discard EXIF, XMP, IPTC, ICC,
   COM, or unrecognized APP markers. Ordinary rotation retains EXIF
   orientation. Only the explicit Normalize action may bake it into the
@@ -76,6 +78,8 @@ them:
 - Editing: coefficient-level JPEG rotation, EXIF-orientation normalization,
   and MCU-aligned JPEG crop through libturbojpeg; pixel-lossless rotation and
   exact-pixel crop for static, non-interlaced, direct-color 8-bit PNGs.
+- JPEG warnings: strict first attempt, explicit user confirmation before a
+  warning-tolerant retry, and exact-original Trash protection on that retry.
 - Display color: selected/default colord profile on Linux or Win32 output
   profile on Windows for the window's current monitor, with a built-in sRGB
   output fallback.
@@ -370,10 +374,12 @@ LoslesImage + requested transform
   -> format-specific JPEG coefficient transform or PNG sample transform
      in a worker
   -> transformed temporary file with format metadata retained
-  -> rotation: overwrite original path, without a Trash entry
-  -> orientation normalization: rewrite the existing tag to 1, then overwrite
-     the original path without a Trash entry
+  -> warning-free rotation: overwrite original path, without a Trash entry
+  -> warning-free orientation normalization: rewrite the existing tag to 1,
+     then overwrite the original path without a Trash entry
   -> crop: safety backup, original to Trash, replacement at original path
+  -> confirmed JPEG warning retry for any operation: safety backup, original
+     to Trash, replacement at original path
   -> result reopened and its directory rescanned
 ```
 
@@ -400,7 +406,16 @@ retains both the rendered description and texture.
 - capability queries for lossless rotation, orientation normalization, and
   crop;
 - crop adjustment;
-- lossless rotation, orientation-normalization, and crop execution.
+- lossless rotation, orientation-normalization, and crop execution, each with
+  `LoslesFormatEditFlags`.
+
+The normal flag is `LOSLES_FORMAT_EDIT_NONE`. A JPEG implementation returns
+`LOSLES_FORMAT_ERROR_WARNING_REQUIRES_CONFIRMATION` when its strict
+`TJFLAG_STOPONWARNING` attempt encounters a warning. Only the main-thread UI
+may turn that into an explicit question. If the user continues, it repeats the
+same operation with `LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS`; format
+modules which do not have this warning behavior, currently PNG, ignore the
+flag. Do not infer consent or retry automatically inside a format module.
 
 The registry reads the complete `GFile` into memory once, then asks modules to
 match the encoded signature in registration order. Directory discovery is
@@ -456,40 +471,62 @@ The transform uses `TJXOPT_PERFECT` and does not set `TJXOPT_COPYNONE`, so
 TurboJPEG copies extra markers including ICC and EXIF. Output first goes to a
 `.losles-output-XXXXXX` temporary file in the destination directory.
 
+Every JPEG edit first calls `tjTransform()` with `TJFLAG_STOPONWARNING`. A
+`TJERR_WARNING` is returned through the format-specific confirmation error;
+the strict attempt never modifies the source. The GTK main thread presents a
+Cancel/Continue alert containing TurboJPEG's message. Continue resubmits the
+same job with `LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS`, causing the
+module to omit `TJFLAG_STOPONWARNING`. TurboJPEG can return `-1` with
+`TJERR_WARNING` even after producing output; the confirmed path accepts that
+output only when its buffer is nonempty. It deliberately performs no inverse
+transform or decoded-content equality check. Fatal errors and warning results
+without output still fail.
+
+The confirmed path applies equally to rotation, orientation normalization,
+and crop. Because its result may be incomplete or damaged, every in-place
+confirmed retry uses the same exact-original-to-Trash transaction as crop.
+Cancel leaves the source byte-for-byte unchanged. Keep the confirmation on the
+main thread, the retry explicit in its flag, and the Trash requirement inside
+the format commit path; never turn warning tolerance into an automatic retry.
+
 Ordinary rotation retains the EXIF orientation tag. Requested visual rotations
 commute with orientations `1`, `3`, `6`, and `8`, so their raw coefficient
 direction is unchanged. Orientations `2`, `4`, `5`, and `7` contain a
 reflection; conjugating a rotation through a reflection reverses it, so a
 visual right turn uses `TJXOP_ROT270` and a visual left turn uses
 `TJXOP_ROT90`. `TJXOPT_PERFECT` means a rotation that would require trimming
-incomplete edge blocks fails. A supported right rotation followed by a left
-rotation must reproduce the complete encoded file byte for byte for all eight
-orientations; keep the regression tests for this invariant.
+incomplete edge blocks fails. For a structurally valid JPEG, a supported right
+rotation followed by a left rotation must reproduce the complete encoded file
+byte for byte for all eight orientations; keep the regression tests for this
+invariant. A warning-approved transform may normalize damaged entropy-stream
+bytes and is not guaranteed to reproduce the loaded pixels exactly; the user
+must be able to recover the byte-exact source from Trash.
 
 The explicit orientation-normalization operation is available only when a
 valid stored EXIF orientation tag exists and has value `2`–`8`. It maps those
 values to the corresponding TurboJPEG symmetry operation (`HFLIP`, `ROT180`,
 `VFLIP`, `TRANSPOSE`, `ROT90`, `TRANSVERSE`, or `ROT270`), then rewrites only
 the copied orientation value to `1`. It leaves the displayed image unchanged.
-Normalization uses the same direct-overwrite/no-Trash commit semantics as
-ordinary rotation. Never remove the tag or synthesize one for an image that
-does not have it.
+Warning-free normalization uses the same direct-overwrite/no-Trash commit
+semantics as ordinary rotation. A confirmed warning retry instead uses Trash.
+Never remove the tag or synthesize one for an image that does not have it.
 
 The UI passes the source itself as the destination for both editing actions.
 In-place editing requires a regular local file. Rotation completes the
 transform before touching the source, then installs it with overwrite
-semantics. Rotation intentionally creates no Trash entry or persistent backup;
-failure before replacement leaves the source unchanged.
+semantics. A warning-free rotation intentionally creates no Trash entry or
+persistent backup; failure before replacement leaves the source unchanged.
 
-Crop additionally requires a functioning platform Trash implementation. It
-creates a same-directory hard-link safety backup (falling back to a
-metadata-preserving copy), moves the exact original with the shared platform
-helper, and then moves the cropped file into the original path. Linux uses
-GIO Trash; Windows uses `IFileOperation` with `FOFX_RECYCLEONDELETE`.
-Cancellation is deliberately ignored during this final crop commit phase. If
-installation fails after trashing, losles tries to restore the safety backup;
-the error identifies the backup path if automatic restoration also fails.
-Never replace the crop sequence with unlinking or direct truncation.
+Crop and every confirmed-warning retry require a functioning platform Trash
+implementation. The commit creates a same-directory hard-link safety backup
+(falling back to a metadata-preserving copy), moves the exact original with
+the shared platform helper, and then installs the transformed file at the
+original path. Linux uses GIO Trash; Windows uses `IFileOperation` with
+`FOFX_RECYCLEONDELETE`. Cancellation is deliberately ignored during this final
+commit phase. If installation fails after trashing, losles tries to restore
+the safety backup; the error identifies the backup path if automatic
+restoration also fails. Never replace this sequence with unlinking or direct
+truncation.
 
 Crop is enabled only for orientation `1`. A requested rectangle is expanded
 outward to MCU boundaries and clipped to image edges. The window calls the
@@ -501,11 +538,11 @@ silently discard edge pixels.
 TurboJPEG preserves JPEG COM and APP markers. Except for the explicit
 orientation-value rewrite during normalization, losles does not selectively
 rewrite them, so ICC, EXIF, XMP, IPTC, comments, maker-specific metadata, and
-unknown APP markers remain. This means semantic dimension fields and embedded
-thumbnails are retained but are not regenerated after a crop, quarter-turn
-rotation, or normalization; they can describe the pre-edit image. Treat that
-as a known metadata-consistency limitation, not permission to drop those
-fields.
+unknown APP markers remain. Libjpeg-turbo can update recognized EXIF image
+dimension values during a geometric transform and may normalize their field
+representation. Embedded thumbnails and other semantic dimension metadata
+are not regenerated and can still describe the pre-edit image. Treat that as
+a known metadata-consistency limitation, not permission to drop those fields.
 
 ### PNG module details
 
@@ -719,15 +756,22 @@ Current actions and shortcuts:
 - open a dropped file: drag a Nautilus-style `GdkFileList` anywhere onto the
   window; the first file enters the normal open/directory-scan pipeline;
 - lossless rotate left/right in place: header-bar buttons; the transformed
-  file overwrites the source without creating a Trash entry;
+  file overwrites the source without creating a Trash entry after a
+  warning-free transform;
 - normalize orientation: a header-bar `dialog-warning-symbolic` icon button,
   enabled only for a valid stored EXIF orientation value `2`–`8`; its dynamic
   tooltip states whether a non-default EXIF orientation is present. It bakes
   the current display orientation into JPEG coefficients, sets the tag to
-  `1`, and overwrites without creating a Trash entry;
+  `1`, and overwrites without creating a Trash entry after a warning-free
+  transform;
 - lossless crop in place: toggle, drag a new selection, move it from its
   interior, or resize it from any edge/corner, then Crop; the original goes to
   Trash before the cropped replacement is installed;
+- JPEG warning confirmation: any strict rotation, normalization, or crop which
+  receives `TJERR_WARNING` stops and opens a `GtkAlertDialog` showing the
+  TurboJPEG message. Cancel leaves the source untouched. Continue starts a
+  warning-tolerant worker retry and moves the exact original to Trash before
+  installing the possibly incomplete or damaged result;
 - About: a header-bar `dialog-question-symbolic` button opens a modal GTK
   About dialog with the application icon, version, copyright holder, MIT
   license, and source-repository link. Creator and license text deliberately
@@ -1140,6 +1184,10 @@ fixtures at runtime and checks:
 - preservation of EXIF, XMP, IPTC, ICC, COM, and unknown APP marker metadata;
 - byte-identical right-then-left rotation, including a non-default EXIF
   orientation;
+- strict rejection with the dedicated confirmation error for rotation,
+  normalization, and crop of a JPEG with extraneous scan data and an
+  unexpected restart marker, followed by successful explicitly flagged
+  retries, preserved marker metadata, and the byte-exact originals in Trash;
 - visually correct rotation and byte-identical right/left round trips for all
   eight EXIF orientation values, including mirrored values;
 - normalization of values `2`–`8`, including unchanged displayed pixels,
@@ -1198,6 +1246,11 @@ claim display-color correctness based only on an sRGB-to-sRGB unit test.
   every failure path, except for a safety backup explicitly retained after an
   unrecoverable replacement failure.
 - Do not weaken `TJXOPT_PERFECT` merely to make more rotations succeed.
+- Do not retry or accept TurboJPEG warning output without explicit user
+  confirmation. The retry must carry
+  `LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS`, require a nonempty output,
+  and preserve the exact original in Trash for rotation, normalization, and
+  crop. It intentionally makes no inverse-transform equality guarantee.
 - Do not label a transform that reduces the source sample depth, changes
   sample values, or discards metadata as lossless. Recompressing PNG samples
   at their original precision is pixel-lossless; lossy JPEG pixels must never
@@ -1232,9 +1285,10 @@ the supported GTK baseline no longer needs it.
 - PNG editing intentionally excludes palette, sub-8-bit, 16-bit, Adam7, and
   animated files. PNG recompression is pixel-lossless but is not expected to
   reproduce identical `IDAT` bytes.
-- JPEG marker metadata is retained byte-for-byte except for the intentional
-  orientation-tag rewrite during normalization, but dimension-dependent
-  metadata is not regenerated after coefficient edits.
+- JPEG marker metadata is retained, except for the intentional orientation-tag
+  rewrite during normalization and any EXIF dimension-field adjustment made
+  by libjpeg-turbo itself. Embedded thumbnails and other dimension-dependent
+  metadata are not generally regenerated after coefficient edits.
 - Viewing may use any `GFile` that GIO can load, but lossless JPEG/PNG editing
   requires local filesystem paths.
 - There is no file watching, thumbnail view, recursive scanning, recent-files

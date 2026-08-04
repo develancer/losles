@@ -11,6 +11,18 @@ typedef enum {
   LOSLES_ROTATE_RIGHT,
 } LoslesRotation;
 
+typedef enum {
+  LOSLES_FORMAT_EDIT_NONE = 0,
+  LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS = 1 << 0,
+} LoslesFormatEditFlags;
+
+typedef enum {
+  LOSLES_FORMAT_ERROR_WARNING_REQUIRES_CONFIRMATION,
+} LoslesFormatError;
+
+#define LOSLES_FORMAT_ERROR (losles_format_error_quark())
+GQuark losles_format_error_quark(void);
+
 typedef struct {
   guint x;
   guint y;
@@ -44,17 +56,20 @@ struct _LoslesFormatInterface {
                               LoslesImage *image,
                               GFile *destination,
                               LoslesRotation rotation,
+                              LoslesFormatEditFlags flags,
                               GCancellable *cancellable,
                               GError **error);
   gboolean (*normalize_orientation_lossless)(LoslesFormat *self,
                                              LoslesImage *image,
                                              GFile *destination,
+                                             LoslesFormatEditFlags flags,
                                              GCancellable *cancellable,
                                              GError **error);
   gboolean (*crop_lossless)(LoslesFormat *self,
                             LoslesImage *image,
                             GFile *destination,
                             const LoslesCrop *crop,
+                            LoslesFormatEditFlags flags,
                             GCancellable *cancellable,
                             GError **error);
 };
@@ -79,18 +94,21 @@ gboolean losles_format_rotate_lossless(LoslesFormat *self,
                                        LoslesImage *image,
                                        GFile *destination,
                                        LoslesRotation rotation,
+                                       LoslesFormatEditFlags flags,
                                        GCancellable *cancellable,
                                        GError **error);
 gboolean losles_format_normalize_orientation_lossless(
   LoslesFormat *self,
   LoslesImage *image,
   GFile *destination,
+  LoslesFormatEditFlags flags,
   GCancellable *cancellable,
   GError **error);
 gboolean losles_format_crop_lossless(LoslesFormat *self,
                                      LoslesImage *image,
                                      GFile *destination,
                                      const LoslesCrop *crop,
+                                     LoslesFormatEditFlags flags,
                                      GCancellable *cancellable,
                                      GError **error);
 

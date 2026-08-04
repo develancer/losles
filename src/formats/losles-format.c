@@ -2,6 +2,12 @@
 
 G_DEFINE_INTERFACE(LoslesFormat, losles_format, G_TYPE_OBJECT)
 
+GQuark
+losles_format_error_quark(void)
+{
+  return g_quark_from_static_string("losles-format-error-quark");
+}
+
 static void
 losles_format_default_init(LoslesFormatInterface *iface)
 {
@@ -93,6 +99,7 @@ losles_format_rotate_lossless(LoslesFormat *self,
                               LoslesImage *image,
                               GFile *destination,
                               LoslesRotation rotation,
+                              LoslesFormatEditFlags flags,
                               GCancellable *cancellable,
                               GError **error)
 {
@@ -109,6 +116,7 @@ losles_format_rotate_lossless(LoslesFormat *self,
                                 image,
                                 destination,
                                 rotation,
+                                flags,
                                 cancellable,
                                 error);
 }
@@ -118,6 +126,7 @@ losles_format_normalize_orientation_lossless(
   LoslesFormat *self,
   LoslesImage *image,
   GFile *destination,
+  LoslesFormatEditFlags flags,
   GCancellable *cancellable,
   GError **error)
 {
@@ -134,6 +143,7 @@ losles_format_normalize_orientation_lossless(
   return iface->normalize_orientation_lossless(self,
                                                image,
                                                destination,
+                                               flags,
                                                cancellable,
                                                error);
 }
@@ -143,6 +153,7 @@ losles_format_crop_lossless(LoslesFormat *self,
                             LoslesImage *image,
                             GFile *destination,
                             const LoslesCrop *crop,
+                            LoslesFormatEditFlags flags,
                             GCancellable *cancellable,
                             GError **error)
 {
@@ -159,6 +170,7 @@ losles_format_crop_lossless(LoslesFormat *self,
                               image,
                               destination,
                               crop,
+                              flags,
                               cancellable,
                               error);
 }

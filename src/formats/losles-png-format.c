@@ -1153,10 +1153,12 @@ png_rotate_lossless(LoslesFormat *format,
                     LoslesImage *image,
                     GFile *destination,
                     LoslesRotation rotation,
+                    LoslesFormatEditFlags flags,
                     GCancellable *cancellable,
                     GError **error)
 {
   (void)format;
+  (void)flags;
   if (!losles_image_supports_lossless_rotation(image)) {
     g_set_error_literal(error,
                         G_IO_ERROR,
@@ -1178,9 +1180,11 @@ png_crop_lossless(LoslesFormat *format,
                   LoslesImage *image,
                   GFile *destination,
                   const LoslesCrop *crop,
+                  LoslesFormatEditFlags flags,
                   GCancellable *cancellable,
                   GError **error)
 {
+  (void)flags;
   LoslesCrop adjusted;
   if (!png_adjust_crop(format, image, crop, &adjusted, error))
     return FALSE;

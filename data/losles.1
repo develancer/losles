@@ -25,7 +25,7 @@ Supported PNG operations preserve sample values but recompress the PNG image
 data.
 .PP
 Rotation and EXIF-orientation normalization overwrite the original path
-without keeping a Trash backup.
+without keeping a Trash backup when TurboJPEG reports no warning.
 Crop moves the exact original to the system Trash before installing the
 cropped replacement.
 The
@@ -37,13 +37,22 @@ An operation fails rather than discarding incomplete edge blocks.
 JPEG crop is available only when EXIF orientation is 1; use the warning-icon
 Normalize control first when a non-default orientation is stored.
 .PP
+Every JPEG edit first stops on TurboJPEG warnings and leaves the source
+unchanged if one occurs.
+Losles then asks whether to continue.
+An approved retry allows warnings without verifying that the result is
+complete or undamaged, and moves the exact original to Trash before installing
+the replacement.
+This applies to rotation, EXIF-orientation normalization, and crop.
+.PP
 PNG editing is limited to static, non-interlaced, direct-color 8-bit
 grayscale, grayscale-alpha, RGB, and RGBA files.
 Other supported PNG encodings remain view-only.
 .PP
-Metadata is retained, but dimension-dependent metadata such as embedded
-thumbnails or EXIF pixel-dimension fields is not regenerated after editing
-and can describe the pre-edit image.
+Metadata is retained.
+The libjpeg-turbo transform may update recognized EXIF pixel-dimension fields,
+but embedded thumbnails and other dimension-dependent metadata are not
+generally regenerated after editing and can describe the pre-edit image.
 .SH KEYBOARD SHORTCUTS
 .TP
 .B Ctrl+O

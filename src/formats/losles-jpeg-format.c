@@ -343,15 +343,15 @@ create_source_backup(const gchar *source_path,
     g_set_error(error,
                 G_IO_ERROR,
                 g_io_error_from_errno(errno),
-                "Could not prepare the crop safety backup: %s",
+                "Could not prepare the edit safety backup: %s",
                 g_strerror(errno));
     return NULL;
   }
 
   /*
-   * A hard link is fast and retains the exact original inode while GIO moves
-   * the source directory entry to Trash. Fall back to a metadata-preserving
-   * copy for filesystems that do not support hard links.
+   * A hard link is fast and retains the exact original inode while the
+   * platform helper moves the source directory entry to Trash. Fall back to a
+   * metadata-preserving copy for filesystems that do not support hard links.
    */
   g_autoptr(GError) link_error = NULL;
   if (losles_platform_create_hard_link(source_path,
@@ -359,7 +359,7 @@ create_source_backup(const gchar *source_path,
                                        &link_error))
     return g_steal_pointer(&backup_path);
 
-  g_debug("Could not hard-link the crop backup: %s; copying instead",
+  g_debug("Could not hard-link the edit backup: %s; copying instead",
           link_error ? link_error->message : "unknown error");
   g_autoptr(GFile) source = g_file_new_for_path(source_path);
   g_autoptr(GFile) backup = g_file_new_for_path(backup_path);
@@ -474,12 +474,70 @@ install_transformed_file(GFile *source,
 }
 
 static gboolean
+turbojpeg_transform_bytes(const guint8 *source,
+                          unsigned long source_size,
+                          const tjtransform *requested_transform,
+                          gint flags,
+                          unsigned char **output,
+                          unsigned long *output_size,
+                          gint *failure_code,
+                          gchar **failure_message)
+{
+  *output = NULL;
+  *output_size = 0;
+  *failure_code = TJERR_FATAL;
+  *failure_message = NULL;
+
+  tjhandle transformer = tjInitTransform();
+  if (!transformer) {
+    *failure_message = g_strdup(tjGetErrorStr2(NULL));
+    return FALSE;
+  }
+
+  /* tjTransform() does not promise that the transform array is const. */
+  tjtransform transform = *requested_transform;
+  const gint result =
+    tjTransform(transformer,
+                source,
+                source_size,
+                1,
+                output,
+                output_size,
+                &transform,
+                flags);
+  if (result != 0) {
+    *failure_code = tjGetErrorCode(transformer);
+    *failure_message = g_strdup(tjGetErrorStr2(transformer));
+    if (!(flags & TJFLAG_STOPONWARNING) &&
+        *failure_code == TJERR_WARNING &&
+        *output && *output_size > 0) {
+      /*
+       * Without STOPONWARNING, TurboJPEG completes a recoverable transform
+       * but still returns -1 to report the warning. This output is usable only
+       * after explicit user approval and with the original protected in Trash.
+       */
+      tjDestroy(transformer);
+      return TRUE;
+    }
+    tjFree(*output);
+    *output = NULL;
+    *output_size = 0;
+    tjDestroy(transformer);
+    return FALSE;
+  }
+
+  tjDestroy(transformer);
+  return TRUE;
+}
+
+static gboolean
 run_turbojpeg_transform(LoslesImage *image,
                         GFile *destination,
                         gint operation,
                         const LoslesCrop *crop,
                         gboolean normalize_orientation,
                         gboolean trash_source,
+                        LoslesFormatEditFlags edit_flags,
                         GCancellable *cancellable,
                         GError **error)
 {
@@ -533,16 +591,6 @@ run_turbojpeg_transform(LoslesImage *image,
     return FALSE;
   }
 
-  tjhandle transformer = tjInitTransform();
-  if (!transformer) {
-    g_set_error(error,
-                G_IO_ERROR,
-                G_IO_ERROR_FAILED,
-                "Could not initialize TurboJPEG: %s",
-                tjGetErrorStr2(NULL));
-    return FALSE;
-  }
-
   tjtransform transform = {0};
   transform.op = operation;
   transform.options = TJXOPT_PERFECT;
@@ -556,26 +604,38 @@ run_turbojpeg_transform(LoslesImage *image,
 
   unsigned char *output = NULL;
   unsigned long output_size = 0;
-  const gint transform_result =
-    tjTransform(transformer,
-                (const unsigned char *)source_bytes,
-                (unsigned long)source_size,
-                1,
-                &output,
-                &output_size,
-                &transform,
-                TJFLAG_STOPONWARNING);
-  if (transform_result != 0) {
-    g_set_error(error,
-                G_IO_ERROR,
-                G_IO_ERROR_FAILED,
-                "TurboJPEG could not perform a perfect lossless transform: %s",
-                tjGetErrorStr2(transformer));
-    tjDestroy(transformer);
-    tjFree(output);
+  gint failure_code = TJERR_FATAL;
+  g_autofree gchar *failure_message = NULL;
+  const gboolean allow_recoverable_warnings =
+    edit_flags & LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS;
+  if (!turbojpeg_transform_bytes((const guint8 *)source_bytes,
+                                 (unsigned long)source_size,
+                                 &transform,
+                                 allow_recoverable_warnings
+                                   ? 0
+                                   : TJFLAG_STOPONWARNING,
+                                 &output,
+                                 &output_size,
+                                 &failure_code,
+                                 &failure_message)) {
+    if (!allow_recoverable_warnings && failure_code == TJERR_WARNING) {
+      g_set_error(error,
+                  LOSLES_FORMAT_ERROR,
+                  LOSLES_FORMAT_ERROR_WARNING_REQUIRES_CONFIRMATION,
+                  "%s",
+                  failure_message ? failure_message
+                                  : "unknown TurboJPEG error");
+      return FALSE;
+    }
+
+    g_set_error(
+      error,
+      G_IO_ERROR,
+      G_IO_ERROR_FAILED,
+      "TurboJPEG could not perform a perfect lossless transform: %s",
+      failure_message ? failure_message : "unknown TurboJPEG error");
     return FALSE;
   }
-  tjDestroy(transformer);
 
   if (output_size > G_MAXSSIZE) {
     tjFree(output);
@@ -625,7 +685,8 @@ run_turbojpeg_transform(LoslesImage *image,
                              destination,
                              source_path,
                              temporary_path,
-                             trash_source,
+                             trash_source ||
+                               (allow_recoverable_warnings && in_place),
                              cancellable,
                              error);
   if (!installed)
@@ -638,6 +699,7 @@ jpeg_rotate_lossless(LoslesFormat *format,
                      LoslesImage *image,
                      GFile *destination,
                      LoslesRotation rotation,
+                     LoslesFormatEditFlags flags,
                      GCancellable *cancellable,
                      GError **error)
 {
@@ -657,6 +719,7 @@ jpeg_rotate_lossless(LoslesFormat *format,
     NULL,
     FALSE,
     FALSE,
+    flags,
     cancellable,
     error);
 }
@@ -665,6 +728,7 @@ static gboolean
 jpeg_normalize_orientation_lossless(LoslesFormat *format,
                                     LoslesImage *image,
                                     GFile *destination,
+                                    LoslesFormatEditFlags flags,
                                     GCancellable *cancellable,
                                     GError **error)
 {
@@ -697,6 +761,7 @@ jpeg_normalize_orientation_lossless(LoslesFormat *format,
                                  NULL,
                                  TRUE,
                                  FALSE,
+                                 flags,
                                  cancellable,
                                  error);
 }
@@ -706,6 +771,7 @@ jpeg_crop_lossless(LoslesFormat *format,
                    LoslesImage *image,
                    GFile *destination,
                    const LoslesCrop *crop,
+                   LoslesFormatEditFlags flags,
                    GCancellable *cancellable,
                    GError **error)
 {
@@ -720,6 +786,7 @@ jpeg_crop_lossless(LoslesFormat *format,
                                  FALSE,
                                  g_file_equal(losles_image_get_file(image),
                                               destination),
+                                 flags,
                                  cancellable,
                                  error);
 }

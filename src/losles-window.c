@@ -96,7 +96,13 @@ typedef struct {
   EditKind kind;
   LoslesRotation rotation;
   LoslesCrop crop;
+  LoslesFormatEditFlags flags;
 } EditJob;
+
+typedef struct {
+  LoslesWindow *window;
+  EditJob *job;
+} EditConfirmation;
 
 typedef struct {
   GFile *file;
@@ -207,6 +213,7 @@ static void preload_neighbors(LoslesWindow *self);
 static void preload_rendered_neighbors(LoslesWindow *self);
 static void apply_zoom_layout(LoslesWindow *self);
 static void reset_zoom(LoslesWindow *self);
+static void queue_edit(LoslesWindow *self, EditJob *job);
 
 static void
 load_job_free(LoadJob *job)
@@ -250,6 +257,27 @@ edit_job_free(EditJob *job)
   g_clear_object(&job->image);
   g_clear_object(&job->destination);
   g_free(job);
+}
+
+static EditJob *
+edit_job_copy(EditJob *job)
+{
+  EditJob *copy = g_new0(EditJob, 1);
+  copy->image = g_object_ref(job->image);
+  copy->destination = g_object_ref(job->destination);
+  copy->kind = job->kind;
+  copy->rotation = job->rotation;
+  copy->crop = job->crop;
+  copy->flags = job->flags;
+  return copy;
+}
+
+static void
+edit_confirmation_free(EditConfirmation *confirmation)
+{
+  g_clear_object(&confirmation->window);
+  g_clear_pointer(&confirmation->job, edit_job_free);
+  g_free(confirmation);
 }
 
 static void
@@ -2145,6 +2173,7 @@ edit_worker(GTask *task,
                                             job->image,
                                             job->destination,
                                             job->rotation,
+                                            job->flags,
                                             cancellable,
                                             &error);
   } else if (job->kind == EDIT_NORMALIZE_ORIENTATION) {
@@ -2152,6 +2181,7 @@ edit_worker(GTask *task,
       format,
       job->image,
       job->destination,
+      job->flags,
       cancellable,
       &error);
   } else {
@@ -2159,6 +2189,7 @@ edit_worker(GTask *task,
                                           job->image,
                                           job->destination,
                                           &job->crop,
+                                          job->flags,
                                           cancellable,
                                           &error);
   }
@@ -2167,6 +2198,77 @@ edit_worker(GTask *task,
     g_task_return_error(task, g_steal_pointer(&error));
   else
     g_task_return_boolean(task, TRUE);
+}
+
+static void
+warning_confirmation_done(GObject *source_object,
+                          GAsyncResult *result,
+                          gpointer user_data)
+{
+  EditConfirmation *confirmation = user_data;
+  LoslesWindow *self = confirmation->window;
+  g_autoptr(GError) error = NULL;
+  const gint response =
+    gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source_object),
+                                   result,
+                                   &error);
+
+  if (!error && response == 1) {
+    confirmation->job->flags |=
+      LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS;
+    EditJob *job = confirmation->job;
+    confirmation->job = NULL;
+    queue_edit(self, job);
+    edit_confirmation_free(confirmation);
+    return;
+  }
+
+  self->operation_in_progress = FALSE;
+  update_controls(self);
+  if (error)
+    show_error(self, "Could not ask for confirmation", error);
+  else
+    set_status(self, "Operation cancelled");
+  edit_confirmation_free(confirmation);
+}
+
+static void
+request_warning_confirmation(LoslesWindow *self,
+                             EditJob *job,
+                             const GError *warning)
+{
+  const gchar *operation =
+    job->kind == EDIT_ROTATE
+      ? "rotation"
+      : job->kind == EDIT_NORMALIZE_ORIENTATION
+          ? "EXIF orientation correction"
+          : "crop";
+  g_autofree gchar *detail = g_strdup_printf(
+    "TurboJPEG reported during %s:\n%s\n\n"
+    "Continuing will ignore this warning. The operation will still rearrange "
+    "JPEG coefficients without lossy re-encoding, but the result may be "
+    "incomplete or damaged. The exact original file will be moved to Trash "
+    "before the replacement is installed.",
+    operation,
+    warning->message);
+  GtkAlertDialog *dialog =
+    gtk_alert_dialog_new("Continue despite the JPEG warning?");
+  const gchar *buttons[] = {"Cancel", "Continue", NULL};
+  gtk_alert_dialog_set_detail(dialog, detail);
+  gtk_alert_dialog_set_buttons(dialog, buttons);
+  gtk_alert_dialog_set_cancel_button(dialog, 0);
+  gtk_alert_dialog_set_default_button(dialog, 0);
+
+  EditConfirmation *confirmation = g_new0(EditConfirmation, 1);
+  confirmation->window = g_object_ref(self);
+  confirmation->job = edit_job_copy(job);
+  set_status(self, "Waiting for confirmation after a JPEG warning…");
+  gtk_alert_dialog_choose(dialog,
+                          GTK_WINDOW(self),
+                          NULL,
+                          warning_confirmation_done,
+                          confirmation);
+  g_object_unref(dialog);
 }
 
 static void
@@ -2179,16 +2281,61 @@ edit_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   g_autoptr(GFile) destination = g_object_ref(job->destination);
   g_autoptr(GError) error = NULL;
 
-  self->operation_in_progress = FALSE;
-  update_controls(self);
   gtk_spinner_stop(self->spinner);
   gtk_widget_set_visible(GTK_WIDGET(self->spinner), FALSE);
   if (!g_task_propagate_boolean(task, &error)) {
+    if (!(job->flags & LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS) &&
+        g_error_matches(
+          error,
+          LOSLES_FORMAT_ERROR,
+          LOSLES_FORMAT_ERROR_WARNING_REQUIRES_CONFIRMATION)) {
+      request_warning_confirmation(self, job, error);
+      return;
+    }
+
+    self->operation_in_progress = FALSE;
+    update_controls(self);
     show_error(self, "The lossless operation failed", error);
     return;
   }
 
+  self->operation_in_progress = FALSE;
+  update_controls(self);
   losles_window_open_file(self, destination);
+}
+
+static void
+queue_edit(LoslesWindow *self, EditJob *job)
+{
+  update_controls(self);
+  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+  gtk_spinner_start(self->spinner);
+  const gboolean warning_retry =
+    job->flags & LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS;
+  if (job->kind == EDIT_ROTATE)
+    set_status(self,
+               warning_retry
+                 ? "Rotating despite a JPEG warning; moving the original "
+                   "to Trash…"
+                 : "Rotating losslessly in place…");
+  else if (job->kind == EDIT_NORMALIZE_ORIENTATION)
+    set_status(
+      self,
+      warning_retry
+        ? "Correcting EXIF orientation despite a JPEG warning; moving the "
+          "original to Trash…"
+        : "Normalizing EXIF orientation losslessly in place…");
+  else
+    set_status(self,
+               warning_retry
+                 ? "Cropping despite a JPEG warning; moving the original "
+                   "to Trash…"
+                 : "Cropping losslessly; moving the original to Trash…");
+
+  GTask *task = g_task_new(self, NULL, edit_done, NULL);
+  g_task_set_task_data(task, job, (GDestroyNotify)edit_job_free);
+  g_task_run_in_thread(task, edit_worker);
+  g_object_unref(task);
 }
 
 static void
@@ -2212,21 +2359,7 @@ start_edit(LoslesWindow *self,
     job->crop = *crop;
 
   self->operation_in_progress = TRUE;
-  update_controls(self);
-  gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
-  gtk_spinner_start(self->spinner);
-  if (kind == EDIT_ROTATE)
-    set_status(self, "Rotating losslessly in place…");
-  else if (kind == EDIT_NORMALIZE_ORIENTATION)
-    set_status(self, "Normalizing EXIF orientation losslessly in place…");
-  else
-    set_status(self,
-               "Cropping losslessly; moving the original to Trash…");
-
-  GTask *task = g_task_new(self, NULL, edit_done, NULL);
-  g_task_set_task_data(task, job, (GDestroyNotify)edit_job_free);
-  g_task_run_in_thread(task, edit_worker);
-  g_object_unref(task);
+  queue_edit(self, job);
 }
 
 static void

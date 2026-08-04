@@ -5,6 +5,7 @@
 #include <png.h>
 #include <stdio.h>
 #include <string.h>
+#include <turbojpeg.h>
 
 #include "../src/formats/losles-format-registry.h"
 #include "../src/formats/losles-format.h"
@@ -306,7 +307,10 @@ fill_exif_orientation(guint8 data[32], guint orientation)
 }
 
 static void
-write_test_jpeg(const gchar *path, GBytes *profile, guint orientation)
+write_test_jpeg_with_restart(const gchar *path,
+                             GBytes *profile,
+                             guint orientation,
+                             guint restart_in_rows)
 {
   FILE *output = g_fopen(path, "wb");
   g_assert_nonnull(output);
@@ -326,6 +330,7 @@ write_test_jpeg(const gchar *path, GBytes *profile, guint orientation)
     cinfo.comp_info[i].v_samp_factor = 1;
   }
   jpeg_set_quality(&cinfo, 92, TRUE);
+  cinfo.restart_in_rows = restart_in_rows;
   jpeg_start_compress(&cinfo, TRUE);
 
   write_jpeg_icc_marker(&cinfo, profile);
@@ -364,6 +369,76 @@ write_test_jpeg(const gchar *path, GBytes *profile, guint orientation)
   jpeg_finish_compress(&cinfo);
   jpeg_destroy_compress(&cinfo);
   fclose(output);
+}
+
+static void
+write_test_jpeg(const gchar *path, GBytes *profile, guint orientation)
+{
+  write_test_jpeg_with_restart(path, profile, orientation, 0);
+}
+
+static void
+damage_first_restart_marker(const gchar *path)
+{
+  g_autofree gchar *contents = NULL;
+  gsize size = 0;
+  g_autoptr(GError) error = NULL;
+  g_assert_true(g_file_get_contents(path, &contents, &size, &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(size, >=, 4);
+
+  const guint8 *bytes = (const guint8 *)contents;
+  g_assert_cmphex(bytes[0], ==, 0xff);
+  g_assert_cmphex(bytes[1], ==, 0xd8);
+
+  gsize offset = 2;
+  gsize scan_data_offset = 0;
+  while (offset < size) {
+    g_assert_cmphex(bytes[offset], ==, 0xff);
+    while (offset < size && bytes[offset] == 0xff)
+      offset++;
+    g_assert_cmpuint(offset, <, size);
+
+    const guint8 marker = bytes[offset++];
+    g_assert_cmpuint(offset + 2, <=, size);
+    const guint marker_size =
+      ((guint)bytes[offset] << 8) | bytes[offset + 1];
+    g_assert_cmpuint(marker_size, >=, 2);
+    g_assert_cmpuint(offset + marker_size, <=, size);
+    if (marker == 0xda) {
+      scan_data_offset = offset + marker_size;
+      break;
+    }
+    offset += marker_size;
+  }
+  g_assert_cmpuint(scan_data_offset, >, 0);
+
+  gsize restart_offset = 0;
+  for (offset = scan_data_offset; offset + 1 < size; offset++) {
+    if (bytes[offset] == 0xff && bytes[offset + 1] == JPEG_RST0) {
+      restart_offset = offset;
+      break;
+    }
+  }
+  g_assert_cmpuint(restart_offset, >, scan_data_offset);
+
+  static const guint8 extraneous[] = {0x13, 0x37, 0x42};
+  GByteArray *damaged = g_byte_array_sized_new(size + sizeof(extraneous));
+  g_byte_array_append(damaged, bytes, restart_offset);
+  g_byte_array_append(damaged, extraneous, sizeof(extraneous));
+  static const guint8 unexpected_restart[] = {0xff, JPEG_RST0 + 6};
+  g_byte_array_append(damaged,
+                      unexpected_restart,
+                      sizeof(unexpected_restart));
+  g_byte_array_append(damaged,
+                      bytes + restart_offset + 2,
+                      size - restart_offset - 2);
+  g_assert_true(g_file_set_contents(path,
+                                    (const gchar *)damaged->data,
+                                    damaged->len,
+                                    &error));
+  g_assert_no_error(error);
+  g_byte_array_unref(damaged);
 }
 
 static void
@@ -731,6 +806,7 @@ test_png_edit_capabilities(void)
                                                   image,
                                                   rotated_file,
                                                   LOSLES_ROTATE_RIGHT,
+                                                  LOSLES_FORMAT_EDIT_NONE,
                                                   NULL,
                                                   &error));
       g_assert_no_error(error);
@@ -745,6 +821,7 @@ test_png_edit_capabilities(void)
                                                    image,
                                                    source_file,
                                                    LOSLES_ROTATE_RIGHT,
+                                                   LOSLES_FORMAT_EDIT_NONE,
                                                    NULL,
                                                    &error));
       g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
@@ -783,6 +860,7 @@ test_lossless_png_operations(void)
                                               original,
                                               file,
                                               LOSLES_ROTATE_RIGHT,
+                                              LOSLES_FORMAT_EDIT_NONE,
                                               NULL,
                                               &error));
   g_assert_no_error(error);
@@ -847,6 +925,7 @@ test_lossless_png_operations(void)
                                 rotated,
                                 file,
                                 &adjusted,
+                                LOSLES_FORMAT_EDIT_NONE,
                                 NULL,
                                 &error);
   g_assert_no_error(error);
@@ -931,6 +1010,7 @@ test_lossless_jpeg_operations(void)
                                               oriented,
                                               rotated_file,
                                               LOSLES_ROTATE_RIGHT,
+                                              LOSLES_FORMAT_EDIT_NONE,
                                               NULL,
                                               &error));
   g_assert_no_error(error);
@@ -994,6 +1074,7 @@ test_lossless_jpeg_operations(void)
                                             plain,
                                             cropped_file,
                                             &adjusted,
+                                            LOSLES_FORMAT_EDIT_NONE,
                                             NULL,
                                             &error));
   g_assert_no_error(error);
@@ -1046,6 +1127,7 @@ test_in_place_rotation_overwrites_source(void)
                                               image,
                                               source,
                                               LOSLES_ROTATE_RIGHT,
+                                              LOSLES_FORMAT_EDIT_NONE,
                                               NULL,
                                               &error));
   g_assert_no_error(error);
@@ -1131,6 +1213,7 @@ test_in_place_crop_uses_trash(void)
                                 image,
                                 source,
                                 &crop,
+                                LOSLES_FORMAT_EDIT_NONE,
                                 NULL,
                                 &error);
   g_assert_no_error(error);
@@ -1212,6 +1295,7 @@ test_rotation_round_trip_is_byte_identical(void)
                                               original,
                                               source,
                                               LOSLES_ROTATE_RIGHT,
+                                              LOSLES_FORMAT_EDIT_NONE,
                                               NULL,
                                               &error));
   g_assert_no_error(error);
@@ -1227,6 +1311,7 @@ test_rotation_round_trip_is_byte_identical(void)
                                               rotated,
                                               source,
                                               LOSLES_ROTATE_LEFT,
+                                              LOSLES_FORMAT_EDIT_NONE,
                                               NULL,
                                               &error));
   g_assert_no_error(error);
@@ -1253,6 +1338,199 @@ test_rotation_round_trip_is_byte_identical(void)
   g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
 
   g_assert_cmpint(g_remove(jpeg_path), ==, 0);
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
+assert_file_contents_equal(const gchar *path,
+                           const gchar *expected,
+                           gsize expected_size)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *actual = NULL;
+  gsize actual_size = 0;
+  g_assert_true(g_file_get_contents(path,
+                                    &actual,
+                                    &actual_size,
+                                    &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(actual_size, ==, expected_size);
+  g_assert_cmpmem(actual, actual_size, expected, expected_size);
+}
+
+#ifndef G_OS_WIN32
+static void
+assert_trashed_original(const gchar *name,
+                        const gchar *expected,
+                        gsize expected_size)
+{
+  g_autofree gchar *trashed_path =
+    g_build_filename(test_data_home, "Trash", "files", name, NULL);
+  assert_file_contents_equal(trashed_path, expected, expected_size);
+
+  g_autofree gchar *trash_info_name = g_strconcat(name, ".trashinfo", NULL);
+  g_autofree gchar *trash_info_path =
+    g_build_filename(test_data_home,
+                     "Trash",
+                     "info",
+                     trash_info_name,
+                     NULL);
+  g_assert_true(g_file_test(trash_info_path, G_FILE_TEST_IS_REGULAR));
+}
+#endif
+
+static void
+test_jpeg_warning_requires_confirmation(void)
+{
+  typedef enum {
+    WARNING_EDIT_ROTATE,
+    WARNING_EDIT_NORMALIZE,
+    WARNING_EDIT_CROP,
+  } WarningEdit;
+  static const struct {
+    const gchar *name;
+    guint orientation;
+    WarningEdit edit;
+  } cases[] = {
+    {"warning-rotate.jpg", 1, WARNING_EDIT_ROTATE},
+    {"warning-normalize.jpg", 6, WARNING_EDIT_NORMALIZE},
+    {"warning-crop.jpg", 1, WARNING_EDIT_CROP},
+  };
+
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-jpeg-warning-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_autoptr(GBytes) profile = make_srgb_profile();
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+
+  for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+    g_autofree gchar *jpeg_path =
+      g_build_filename(directory, cases[i].name, NULL);
+    write_test_jpeg_with_restart(jpeg_path,
+                                 profile,
+                                 cases[i].orientation,
+                                 1);
+    damage_first_restart_marker(jpeg_path);
+
+    g_autofree gchar *original_contents = NULL;
+    gsize original_size = 0;
+    g_assert_true(g_file_get_contents(jpeg_path,
+                                      &original_contents,
+                                      &original_size,
+                                      &error));
+    g_assert_no_error(error);
+
+    g_autoptr(LoslesImage) image = load_path(registry, jpeg_path);
+    LoslesFormat *format =
+      LOSLES_FORMAT(losles_image_get_format(image));
+    g_autoptr(GFile) source = g_file_new_for_path(jpeg_path);
+    const LoslesCrop crop = {.x = 8, .y = 0, .width = 8, .height = 8};
+
+    gboolean success = FALSE;
+    if (cases[i].edit == WARNING_EDIT_ROTATE) {
+      success = losles_format_rotate_lossless(format,
+                                              image,
+                                              source,
+                                              LOSLES_ROTATE_RIGHT,
+                                              LOSLES_FORMAT_EDIT_NONE,
+                                              NULL,
+                                              &error);
+    } else if (cases[i].edit == WARNING_EDIT_NORMALIZE) {
+      success = losles_format_normalize_orientation_lossless(
+        format,
+        image,
+        source,
+        LOSLES_FORMAT_EDIT_NONE,
+        NULL,
+        &error);
+    } else {
+      success = losles_format_crop_lossless(format,
+                                            image,
+                                            source,
+                                            &crop,
+                                            LOSLES_FORMAT_EDIT_NONE,
+                                            NULL,
+                                            &error);
+    }
+    g_assert_false(success);
+    g_assert_error(error,
+                   LOSLES_FORMAT_ERROR,
+                   LOSLES_FORMAT_ERROR_WARNING_REQUIRES_CONFIRMATION);
+    g_clear_error(&error);
+    assert_file_contents_equal(jpeg_path,
+                               original_contents,
+                               original_size);
+
+#ifndef G_OS_WIN32
+    g_autofree gchar *trashed_path =
+      g_build_filename(test_data_home,
+                       "Trash",
+                       "files",
+                       cases[i].name,
+                       NULL);
+    g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+#endif
+
+    if (cases[i].edit == WARNING_EDIT_ROTATE) {
+      success = losles_format_rotate_lossless(
+        format,
+        image,
+        source,
+        LOSLES_ROTATE_RIGHT,
+        LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS,
+        NULL,
+        &error);
+    } else if (cases[i].edit == WARNING_EDIT_NORMALIZE) {
+      success = losles_format_normalize_orientation_lossless(
+        format,
+        image,
+        source,
+        LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS,
+        NULL,
+        &error);
+    } else {
+      success = losles_format_crop_lossless(
+        format,
+        image,
+        source,
+        &crop,
+        LOSLES_FORMAT_EDIT_ALLOW_RECOVERABLE_WARNINGS,
+        NULL,
+        &error);
+    }
+    if (!success)
+      g_test_message("Confirmed %s retry failed: %s",
+                     cases[i].name,
+                     error ? error->message : "unknown error");
+    g_assert_true(success);
+    g_assert_no_error(error);
+
+    g_autoptr(LoslesImage) edited = load_path(registry, jpeg_path);
+    g_assert_true(g_bytes_equal(losles_image_get_icc_profile(edited),
+                                profile));
+    assert_test_metadata_preserved(jpeg_path);
+    if (cases[i].edit == WARNING_EDIT_ROTATE) {
+      g_assert_cmpuint(losles_image_get_width(edited), ==, 16);
+      g_assert_cmpuint(losles_image_get_height(edited), ==, 24);
+    } else if (cases[i].edit == WARNING_EDIT_NORMALIZE) {
+      g_assert_true(losles_image_has_exif_orientation(edited));
+      g_assert_cmpuint(losles_image_get_orientation(edited), ==, 1);
+    } else {
+      g_assert_cmpuint(losles_image_get_width(edited), ==, 8);
+      g_assert_cmpuint(losles_image_get_height(edited), ==, 8);
+    }
+
+#ifndef G_OS_WIN32
+    assert_trashed_original(cases[i].name,
+                            original_contents,
+                            original_size);
+#endif
+
+    g_assert_cmpint(g_remove(jpeg_path), ==, 0);
+  }
+
   g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
@@ -1307,6 +1585,7 @@ test_all_orientation_rotation(void)
                                                 before,
                                                 source,
                                                 LOSLES_ROTATE_RIGHT,
+                                                LOSLES_FORMAT_EDIT_NONE,
                                                 NULL,
                                                 &error));
     g_assert_no_error(error);
@@ -1336,6 +1615,7 @@ test_all_orientation_rotation(void)
                                                 rotated,
                                                 source,
                                                 LOSLES_ROTATE_LEFT,
+                                                LOSLES_FORMAT_EDIT_NONE,
                                                 NULL,
                                                 &error));
     g_assert_no_error(error);
@@ -1430,6 +1710,7 @@ test_orientation_normalization(void)
       format,
       before,
       source,
+      LOSLES_FORMAT_EDIT_NONE,
       NULL,
       &error));
     g_assert_no_error(error);
@@ -1516,6 +1797,7 @@ test_in_place_rotation_rejects_symlink(void)
                                                image,
                                                symlink_file,
                                                LOSLES_ROTATE_RIGHT,
+                                               LOSLES_FORMAT_EDIT_NONE,
                                                NULL,
                                                &error));
   g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
@@ -1621,6 +1903,8 @@ main(int argc, char **argv)
                   test_in_place_crop_uses_trash);
   g_test_add_func("/formats/rotation-round-trip-is-byte-identical",
                   test_rotation_round_trip_is_byte_identical);
+  g_test_add_func("/formats/jpeg-warning-requires-confirmation",
+                  test_jpeg_warning_requires_confirmation);
   g_test_add_func("/formats/all-orientation-rotation",
                   test_all_orientation_rotation);
   g_test_add_func("/formats/orientation-normalization",
