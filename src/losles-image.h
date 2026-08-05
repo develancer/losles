@@ -11,6 +11,11 @@ typedef enum {
   LOSLES_PIXEL_FORMAT_RGBA8,
 } LoslesPixelFormat;
 
+#define LOSLES_IMAGE_SOURCE_FILE_ATTRIBUTES                             \
+  G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_ETAG_VALUE "," \
+  G_FILE_ATTRIBUTE_ID_FILE "," G_FILE_ATTRIBUTE_TIME_MODIFIED ","     \
+  G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC
+
 #define LOSLES_TYPE_IMAGE (losles_image_get_type())
 G_DECLARE_FINAL_TYPE(LoslesImage, losles_image, LOSLES, IMAGE, GObject)
 
@@ -21,6 +26,7 @@ LoslesImage *losles_image_new(GFile *file,
                               LoslesPixelFormat pixel_format,
                               GBytes *pixels,
                               GBytes *icc_profile,
+                              GBytes *encoded_source,
                               guint orientation,
                               gboolean has_exif_orientation,
                               gboolean supports_lossless_rotation,
@@ -48,5 +54,19 @@ guint losles_image_get_jpeg_mcu_height(LoslesImage *self);
 const gchar *losles_image_get_format_name(LoslesImage *self);
 GObject *losles_image_get_format(LoslesImage *self);
 gsize losles_image_get_memory_size(LoslesImage *self);
+const gchar *losles_image_get_source_checksum(LoslesImage *self);
+void losles_image_set_source_file_state(LoslesImage *self,
+                                        const gchar *etag,
+                                        GFileInfo *info);
+gboolean losles_image_source_file_is_current(LoslesImage *self,
+                                             GCancellable *cancellable,
+                                             GError **error);
+gboolean losles_image_verify_source_data(LoslesImage *self,
+                                         const guint8 *data,
+                                         gsize size,
+                                         GError **error);
+gboolean losles_image_verify_source_file(LoslesImage *self,
+                                         GCancellable *cancellable,
+                                         GError **error);
 
 G_END_DECLS

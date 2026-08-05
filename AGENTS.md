@@ -63,6 +63,9 @@ them:
   manager.
 - Navigation should favor low latency. Adjacent images are decoded and
   color-converted in advance, within bounded memory and concurrency limits.
+- Never edit bytes which differ from the source represented by the displayed
+  `LoslesImage`. Source changes must abort before replacement, not be silently
+  accepted based only on a monitor notification or timestamp.
 - Prefer libraries shipped by the default Ubuntu repositories and the MSYS2
   UCRT64 repository. Avoid vendored frameworks or a new language runtime
   without a concrete, measured reason.
@@ -85,6 +88,9 @@ them:
   output fallback.
 - Navigation: the opened file plus supported regular files in its parent
   directory, sorted using `g_utf8_collate()`.
+- External changes: the parent directory is monitored; changed current images
+  reload after a short debounce, directory membership is refreshed, and cache
+  hits are revalidated against recorded file state before display.
 - Viewing interaction: cursor-anchored wheel zoom from fit to 16× and
   primary-button panning on overflowing axes. Adjacent navigation preserves
   zoom and normalized pan when the old and new displayed dimensions match.
@@ -358,9 +364,10 @@ The viewing pipeline is:
 
 ```text
 GFile
-  -> whole encoded file loaded by LoslesFormatRegistry
+  -> whole encoded file + GIO etag loaded by LoslesFormatRegistry
   -> magic-byte match by a LoslesFormat implementation
-  -> format-specific decode into LoslesImage
+  -> format-specific decode into LoslesImage with SHA-256 source fingerprint
+     and lightweight file state
   -> source ICC (or fallback) + display ICC resolved by LoslesColorManager
   -> LittleCMS conversion and EXIF orientation into LoslesRenderedImage
   -> GdkMemoryTexture
@@ -371,9 +378,11 @@ The editing pipeline is:
 
 ```text
 LoslesImage + requested transform
+  -> exact encoded-source fingerprint verified
   -> format-specific JPEG coefficient transform or PNG sample transform
      in a worker
   -> transformed temporary file with format metadata retained
+  -> exact source fingerprint verified again before commit
   -> warning-free rotation: overwrite original path, without a Trash entry
   -> warning-free orientation normalization: rewrite the existing tag to 1,
      then overwrite the original path without a Trash entry
@@ -386,10 +395,11 @@ LoslesImage + requested transform
 `LoslesImage` stores decoded pixels in encoded-file orientation, the embedded
 ICC bytes, effective EXIF orientation, whether a valid EXIF orientation tag
 was actually present, per-image rotation/crop capability flags, JPEG MCU
-dimensions, a format label, and a strong reference to the format object which
-created it. Keep it format-neutral. The presence flag is necessary because
-absent orientation and a stored value of `1` have the same effective rendering
-but different UI semantics.
+dimensions, a SHA-256 digest of the complete encoded source, lightweight GIO
+file state for cache validation, a format label, and a strong reference to the
+format object which created it. Keep it format-neutral. The presence flag is
+necessary because absent orientation and a stored value of `1` have the same
+effective rendering but different UI semantics.
 
 `LoslesRenderedImage` stores pixels after color conversion and orientation.
 Its output is RGB8 or RGBA8 even when the source is gray. It also records the
@@ -470,6 +480,10 @@ JPEG edits call TurboJPEG's public `tjTransform()` API in the worker thread.
 The transform uses `TJXOPT_PERFECT` and does not set `TJXOPT_COPYNONE`, so
 TurboJPEG copies extra markers including ICC and EXIF. Output first goes to a
 `.losles-output-XXXXXX` temporary file in the destination directory.
+The bytes loaded for the transform must match the SHA-256 source fingerprint
+stored in `LoslesImage`, and the path is read and verified again immediately
+before commit. A mismatch returns `G_IO_ERROR_WRONG_ETAG`; no source or Trash
+operation is performed.
 
 Every JPEG edit first calls `tjTransform()` with `TJFLAG_STOPONWARNING`. A
 `TJERR_WARNING` is returned through the format-specific confirmation error;
@@ -562,6 +576,8 @@ a known metadata-consistency limitation, not permission to drop those fields.
 - The capability is recorded on `LoslesImage` during load and is revalidated
   against the current file immediately before an edit, because the file can
   change on disk while open.
+- The same complete-source fingerprint checks as JPEG run before PNG decode
+  for editing and immediately before installing the prepared PNG.
 - Editing decodes the original samples without the viewer's palette,
   precision, or transparency expansions. It rotates or subsets 1–4 byte
   pixels, then libpng recompresses the unchanged 8-bit sample values.
@@ -647,8 +663,15 @@ Directory/navigation behavior:
   restored.
 - If an application open request contains several files, only the first is
   used.
-- There is no directory or file-change monitor; external edits do not
-  invalidate cached content.
+- One `GFileMonitor` watches the opened file's parent directory. Relevant
+  content and membership events invalidate affected source/render cache
+  entries immediately and are debounced for 200 ms before an asynchronous
+  rescan/reload. Monitoring the directory rather than an individual inode
+  preserves detection across atomic replacement and rename operations.
+- The monitor refreshes created, deleted, moved, and renamed supported files.
+  If the current file disappears it selects the next collating image, or the
+  predecessor when no later image remains. A directly opened file with an
+  unknown suffix remains current while its path is still a regular file.
 
 Two independent caches are keyed by the file URI:
 
@@ -664,6 +687,18 @@ the platform query fails or reports zero memory, each cache falls back to
 512 MiB.
 `losles_cache_policy_limit_for_memory()` owns the tested percentage and
 clamping arithmetic; keep operating-system discovery out of the policy helper.
+
+Each decoded entry records the etag returned by `g_file_load_contents()` plus
+size, file ID, and modification time where GIO supplies them. A foreground
+cache lookup synchronously re-queries this lightweight state before using the
+entry. A mismatch or unverifiable state removes both source and rendered URI
+entries and starts a fresh worker load. This check is a cache-correctness
+optimization boundary, not the edit-safety boundary: edits use the complete
+SHA-256 source fingerprint because monitor events and timestamps are advisory.
+Each rendered-cache entry also records the source checksum which produced it;
+`start_render_for_image()` rejects a URI/profile cache hit whose checksum does
+not match the freshly decoded image. This covers partial-cache cases where the
+decoded entry was evicted while an older texture remained.
 
 Each cache is eligible to retain the current image and up to five neighbors on
 either side, for at most eleven entries per cache before memory pressure is
@@ -717,11 +752,20 @@ Async correctness relies on these rules:
   newer generation.
 - Cancellation is cooperative. New decoders/render loops must check it at
   bounded intervals.
+- Directory-monitor callbacks run on the main thread. A changed URI cancels
+  stale in-flight work when necessary while preserving unaffected completed
+  cache entries. `monitor_generation` prevents an older initial or refresh
+  scan from replacing a list after a newer filesystem event. Events caused by
+  an in-place operation remain pending while `operation_in_progress` is true;
+  success installs its authoritative rescan, while failure/cancellation resumes
+  the pending external refresh.
 
 Changing cache keys requires special care. The rendered cache is keyed only by
 URI because every entry is globally discarded when the output profile
-changes. If partial/profile-specific invalidation is introduced, the target
-profile identity must become part of the key.
+changes, but every entry separately carries its source checksum and target
+profile ID and both are checked before reuse. If partial/profile-specific
+invalidation is introduced, the target profile identity must become part of
+the key.
 
 ## UI behavior and coordinate assumptions
 
@@ -802,11 +846,12 @@ operation to target a file other than the one shown. The first image still
 loads over the black canvas because there is no texture to retain. Foreground
 decode/render errors clear the retained display rather than leaving a stale
 image associated with the failed filename. Before starting the spinner,
-`show_index()` checks both the source and rendered caches for the selected
-URI. If both entries exist, it installs the cached image and texture
-synchronously and never enters the visible loading state. A partial cache hit
-still uses the spinner because a decode or display-profile conversion remains
-to be completed.
+`show_index()` validates a source-cache candidate against current file state,
+then routes it through `start_render_for_image()`, which rechecks the display
+target before accepting the rendered cache. If both validated entries exist,
+the texture is installed synchronously and the spinner never becomes visible.
+A partial cache hit still uses the spinner because a decode or display-profile
+conversion remains to be completed.
 
 Fullscreen hides the header bar and its controls. Keep
 `notify::fullscreened` as the source of truth so the header is restored even
@@ -1194,6 +1239,9 @@ fixtures at runtime and checks:
   canonical dimensions, an orientation value of `1`, preserved marker
   metadata, and no Trash entry;
 - rejection of unsafe in-place rotation through symbolic links;
+- stale-source rejection for JPEG rotation/crop/normalization and PNG
+  rotation/crop, including byte-identical preservation of the externally
+  changed file;
 - invalid JPEG/PNG rejection.
 
 For ordinary C changes, at minimum run:
@@ -1291,8 +1339,8 @@ the supported GTK baseline no longer needs it.
   metadata are not generally regenerated after coefficient edits.
 - Viewing may use any `GFile` that GIO can load, but lossless JPEG/PNG editing
   requires local filesystem paths.
-- There is no file watching, thumbnail view, recursive scanning, recent-files
-  list, settings persistence, or plugin loading at runtime.
+- There is no thumbnail view, recursive scanning, recent-files list, settings
+  persistence, or plugin loading at runtime.
 
 When resolving one of these constraints, update the relevant implementation,
 tests, `README.md`, and this file together.

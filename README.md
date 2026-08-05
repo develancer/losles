@@ -100,6 +100,8 @@ before running it. Its SHA-256 value can be compared with the release's
 - Preservation of JPEG marker metadata and non-image-data PNG chunks, subject
   to the metadata-consistency caveat below.
 - Background decode and color conversion of nearby images for fast browsing.
+- Automatic reload after an image changes on disk, with stale cache entries
+  discarded before display.
 - Cursor-anchored wheel zoom, mouse panning, fullscreen, drag-and-drop
   opening, and mouse Back/Forward navigation.
 
@@ -146,6 +148,13 @@ soft limit of 10% of total system memory, and no more than two background
 decodes and two background color conversions run at once. When adjacent
 images have identical displayed dimensions, zoom and pan are preserved.
 
+The parent directory is monitored for changes. Changes are briefly debounced
+so an image is reloaded after an external writer has finished replacing it;
+created, deleted, moved, and renamed supported files also update navigation.
+Before a decoded cache entry is displayed, its saved file identity, size, and
+GIO etag or modification time are compared with the current file. A stale or
+unverifiable entry is discarded and loaded again.
+
 The previous image remains visible under a spinner while an uncached
 replacement is prepared. A fully decoded and color-converted cache hit appears
 immediately without a spinner.
@@ -171,6 +180,12 @@ if the original cannot be moved to Trash. If TurboJPEG reports a warning for
 any JPEG edit, losles leaves the source untouched and asks whether to continue.
 An approved retry also requires Trash and preserves the exact original there,
 including for rotation and EXIF-orientation normalization.
+
+Every decoded image also records a SHA-256 fingerprint of its complete encoded
+source. An edit verifies that fingerprint before transforming and again before
+installing its result, including after a JPEG warning confirmation. If the file
+changed since it was displayed or while the operation was running, the edit is
+refused, an error is shown, and the changed image is reloaded instead.
 
 ### JPEG
 
@@ -263,8 +278,6 @@ G_MESSAGES_DEBUG=losles losles /path/to/photo.jpg
 - Animated images are not played.
 - Display output is 8-bit SDR; there is no HDR pipeline.
 - Zoom cannot go below the initial fitted size.
-- There is no file-change monitor. External edits do not invalidate cached
-  images during the current browsing session.
 - There is no recursive directory scan, thumbnail view, recent-files list,
   settings UI, or runtime plugin loader.
 - The interface is currently English only.

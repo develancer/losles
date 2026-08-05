@@ -19,6 +19,7 @@
 #define ZOOM_STEP 1.25
 #define ZOOM_MAX 16.0
 #define LOADING_SPINNER_SIZE 64
+#define DIRECTORY_RELOAD_DELAY_MS 200
 #define MOUSE_BUTTON_BACK 8
 #define MOUSE_BUTTON_FORWARD 9
 
@@ -33,7 +34,16 @@ typedef struct {
   GFile *opened_file;
   GFile *directory;
   guint generation;
+  guint monitor_generation;
 } ScanJob;
+
+typedef struct {
+  GFile *directory;
+  GFile *changed_current;
+  GFile *replacement_current;
+  guint generation;
+  guint monitor_generation;
+} DirectoryRefreshJob;
 
 typedef struct {
   LoslesColorTarget *target;
@@ -45,6 +55,7 @@ typedef struct {
 typedef struct {
   LoslesRenderedImage *rendered;
   GdkTexture *texture;
+  gchar *source_checksum;
   gsize size;
 } RenderCacheEntry;
 
@@ -147,6 +158,13 @@ struct _LoslesWindow {
 
   GPtrArray *files;
   guint current_index;
+  GFile *monitored_directory;
+  GFileMonitor *directory_monitor;
+  GFile *monitor_changed_current;
+  GFile *monitor_replacement_current;
+  guint directory_reload_source_id;
+  guint monitor_generation;
+  gboolean directory_refresh_pending;
   GHashTable *cache;
   GHashTable *inflight;
   GHashTable *decode_failed;
@@ -214,6 +232,8 @@ static void preload_rendered_neighbors(LoslesWindow *self);
 static void apply_zoom_layout(LoslesWindow *self);
 static void reset_zoom(LoslesWindow *self);
 static void queue_edit(LoslesWindow *self, EditJob *job);
+static void schedule_directory_refresh(LoslesWindow *self);
+static void clear_directory_monitor(LoslesWindow *self);
 
 static void
 load_job_free(LoadJob *job)
@@ -233,6 +253,15 @@ scan_job_free(ScanJob *job)
 }
 
 static void
+directory_refresh_job_free(DirectoryRefreshJob *job)
+{
+  g_clear_object(&job->directory);
+  g_clear_object(&job->changed_current);
+  g_clear_object(&job->replacement_current);
+  g_free(job);
+}
+
+static void
 render_job_free(RenderJob *job)
 {
   g_clear_pointer(&job->target, losles_color_target_unref);
@@ -248,6 +277,7 @@ render_cache_entry_free(RenderCacheEntry *entry)
     return;
   g_clear_object(&entry->texture);
   g_clear_pointer(&entry->rendered, losles_rendered_image_free);
+  g_clear_pointer(&entry->source_checksum, g_free);
   g_free(entry);
 }
 
@@ -803,11 +833,88 @@ cache_rendered(LoslesWindow *self,
   RenderCacheEntry *entry = g_new0(RenderCacheEntry, 1);
   entry->rendered = rendered;
   entry->texture = losles_rendered_image_create_texture(rendered);
+  entry->source_checksum =
+    g_strdup(losles_image_get_source_checksum(image));
   entry->size = size;
   self->render_cache_size += size;
   g_hash_table_replace(self->render_cache, g_strdup(uri), entry);
   g_hash_table_remove(self->render_capacity_blocked, uri);
   return entry;
+}
+
+static void
+cancel_decode_work_preserving_cache(LoslesWindow *self)
+{
+  self->generation++;
+  if (self->load_cancellable)
+    g_cancellable_cancel(self->load_cancellable);
+  g_clear_object(&self->load_cancellable);
+  self->load_cancellable = g_cancellable_new();
+  g_hash_table_remove_all(self->inflight);
+  g_hash_table_remove_all(self->decode_failed);
+  g_hash_table_remove_all(self->decode_capacity_blocked);
+}
+
+static void
+cancel_render_work_preserving_cache(LoslesWindow *self)
+{
+  self->render_generation++;
+  if (self->render_cancellable)
+    g_cancellable_cancel(self->render_cancellable);
+  g_clear_object(&self->render_cancellable);
+  self->render_cancellable = g_cancellable_new();
+  g_hash_table_remove_all(self->render_inflight);
+  g_hash_table_remove_all(self->render_failed);
+  g_hash_table_remove_all(self->render_capacity_blocked);
+}
+
+static void
+invalidate_file_content(LoslesWindow *self, GFile *file)
+{
+  g_autofree gchar *uri = file_uri(file);
+  const gboolean decode_inflight =
+    g_hash_table_contains(self->inflight, uri);
+  const gboolean render_inflight =
+    g_hash_table_contains(self->render_inflight, uri);
+
+  LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (cached)
+    self->cache_size -= losles_image_get_memory_size(cached);
+  g_hash_table_remove(self->cache, uri);
+  g_hash_table_remove(self->decode_failed, uri);
+  g_hash_table_remove(self->decode_capacity_blocked, uri);
+
+  RenderCacheEntry *rendered =
+    g_hash_table_lookup(self->render_cache, uri);
+  if (rendered)
+    self->render_cache_size -= rendered->size;
+  g_hash_table_remove(self->render_cache, uri);
+  g_hash_table_remove(self->render_failed, uri);
+  g_hash_table_remove(self->render_capacity_blocked, uri);
+
+  if (decode_inflight)
+    cancel_decode_work_preserving_cache(self);
+  if (render_inflight)
+    cancel_render_work_preserving_cache(self);
+}
+
+static LoslesImage *
+lookup_current_cached_image(LoslesWindow *self, GFile *file)
+{
+  g_autofree gchar *uri = file_uri(file);
+  LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (!cached)
+    return NULL;
+
+  g_autoptr(GError) error = NULL;
+  if (losles_image_source_file_is_current(cached, NULL, &error))
+    return cached;
+
+  g_debug("Discarding stale cache entry for %s: %s",
+          uri,
+          error ? error->message : "the source file state changed");
+  invalidate_file_content(self, file);
+  return NULL;
 }
 
 static void
@@ -898,6 +1005,8 @@ start_load(LoslesWindow *self, GFile *file, gboolean foreground)
 {
   g_autofree gchar *uri = file_uri(file);
   LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (cached && foreground)
+    cached = lookup_current_cached_image(self, file);
   if (cached) {
     if (foreground)
       set_current_image(self, cached);
@@ -1087,7 +1196,8 @@ scan_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   g_autoptr(GPtrArray) files =
     g_task_propagate_pointer(task, &error);
 
-  if (job->generation != self->generation)
+  if (job->generation != self->generation ||
+      job->monitor_generation != self->monitor_generation)
     return;
   if (!files) {
     g_debug("Could not scan image directory: %s", error->message);
@@ -1120,6 +1230,7 @@ scan_directory(LoslesWindow *self, GFile *file)
   job->opened_file = g_object_ref(file);
   job->directory = g_object_ref(directory);
   job->generation = self->generation;
+  job->monitor_generation = self->monitor_generation;
 
   GTask *task =
     g_task_new(self, self->load_cancellable, scan_done, NULL);
@@ -1311,6 +1422,13 @@ start_render_for_image(LoslesWindow *self,
     file_uri(losles_image_get_file(image));
   RenderCacheEntry *cached =
     g_hash_table_lookup(self->render_cache, uri);
+  if (cached &&
+      g_strcmp0(cached->source_checksum,
+                losles_image_get_source_checksum(image)) != 0) {
+    self->render_cache_size -= cached->size;
+    g_hash_table_remove(self->render_cache, uri);
+    cached = NULL;
+  }
   if (cached) {
     if (g_strcmp0(cached->rendered->display_profile_id,
                   target_profile_id) == 0) {
@@ -1487,6 +1605,7 @@ advance_pipeline_after_delete(LoslesWindow *self, GFile *deleted_file)
 static void
 show_no_picture(LoslesWindow *self)
 {
+  clear_directory_monitor(self);
   g_clear_pointer(&self->files, g_ptr_array_unref);
   self->files =
     g_ptr_array_new_with_free_func((GDestroyNotify)g_object_unref);
@@ -1520,17 +1639,12 @@ show_index(LoslesWindow *self,
   GFile *file = current_file(self);
   update_title(self, file);
   prepare_for_image_load(self, preserve_zoom_if_same_dimensions);
-  g_autofree gchar *uri = file_uri(file);
   LoslesImage *cached_image =
-    g_hash_table_lookup(self->cache, uri);
-  RenderCacheEntry *cached_render =
-    g_hash_table_lookup(self->render_cache, uri);
-  if (cached_image && cached_render) {
-    g_set_object(&self->current_image, cached_image);
-    display_rendered_image(self,
-                           cached_image,
-                           cached_render->rendered,
-                           cached_render->texture);
+    lookup_current_cached_image(self, file);
+  if (cached_image) {
+    /* start_render() revalidates the active display target before accepting
+     * the corresponding rendered cache entry. */
+    set_current_image(self, cached_image);
   } else {
     gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
     gtk_spinner_start(self->spinner);
@@ -1555,6 +1669,336 @@ next_image(LoslesWindow *self)
       self->files &&
       self->current_index + 1 < self->files->len)
     show_index(self, self->current_index + 1, TRUE);
+}
+
+static gboolean
+monitor_event_changes_directory(GFileMonitorEvent event_type)
+{
+  switch (event_type) {
+  case G_FILE_MONITOR_EVENT_CHANGED:
+  case G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT:
+  case G_FILE_MONITOR_EVENT_DELETED:
+  case G_FILE_MONITOR_EVENT_CREATED:
+  case G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED:
+  case G_FILE_MONITOR_EVENT_MOVED:
+  case G_FILE_MONITOR_EVENT_RENAMED:
+  case G_FILE_MONITOR_EVENT_MOVED_IN:
+  case G_FILE_MONITOR_EVENT_MOVED_OUT:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
+static gboolean
+monitored_file_is_relevant(LoslesWindow *self, GFile *file)
+{
+  return file &&
+         (is_current_file(self, file) ||
+          losles_format_registry_supports_file(file));
+}
+
+static gboolean
+cached_file_state_changed(LoslesWindow *self, GFile *file)
+{
+  if (!file)
+    return FALSE;
+
+  g_autofree gchar *uri = file_uri(file);
+  LoslesImage *cached = g_hash_table_lookup(self->cache, uri);
+  if (!cached)
+    return FALSE;
+  return !losles_image_source_file_is_current(cached, NULL, NULL);
+}
+
+static void
+directory_refresh_worker(GTask *task,
+                         gpointer source_object,
+                         gpointer task_data,
+                         GCancellable *cancellable)
+{
+  (void)source_object;
+  DirectoryRefreshJob *job = task_data;
+  g_autoptr(GError) error = NULL;
+  GPtrArray *files =
+    scan_supported_files(job->directory, cancellable, &error);
+  if (!files)
+    g_task_return_error(task, g_steal_pointer(&error));
+  else
+    g_task_return_pointer(task,
+                          files,
+                          (GDestroyNotify)g_ptr_array_unref);
+}
+
+static gint
+find_file_after_reference(GPtrArray *files,
+                          GFile *reference,
+                          GFile *preferred)
+{
+  if (!files || files->len == 0)
+    return -1;
+
+  if (preferred) {
+    const gint preferred_index = find_file_index(files, preferred);
+    if (preferred_index >= 0)
+      return preferred_index;
+  }
+
+  g_autofree gchar *reference_name = g_file_get_basename(reference);
+  for (guint i = 0; reference_name && i < files->len; i++) {
+    GFile *candidate = g_ptr_array_index(files, i);
+    g_autofree gchar *candidate_name = g_file_get_basename(candidate);
+    if (candidate_name &&
+        g_utf8_collate(candidate_name, reference_name) > 0)
+      return (gint)i;
+  }
+  return (gint)files->len - 1;
+}
+
+static void
+directory_refresh_done(GObject *source_object,
+                       GAsyncResult *result,
+                       gpointer user_data)
+{
+  (void)user_data;
+  LoslesWindow *self = LOSLES_WINDOW(source_object);
+  GTask *task = G_TASK(result);
+  DirectoryRefreshJob *job = g_task_get_task_data(task);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GPtrArray) files =
+    g_task_propagate_pointer(task, &error);
+
+  if (job->generation != self->generation ||
+      job->monitor_generation != self->monitor_generation)
+    return;
+
+  g_autoptr(GFile) old_current =
+    current_file(self) ? g_object_ref(current_file(self)) : NULL;
+  const gboolean changed_current_is_selected =
+    old_current && job->changed_current &&
+    g_file_equal(old_current, job->changed_current);
+
+  if (!files) {
+    if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+      g_debug("Could not refresh monitored image directory: %s",
+              error->message);
+    if (changed_current_is_selected && self->files)
+      show_index(self, self->current_index, TRUE);
+    return;
+  }
+
+  GFile *wanted = old_current;
+  if (changed_current_is_selected && job->replacement_current &&
+      find_file_index(files, job->replacement_current) >= 0)
+    wanted = job->replacement_current;
+
+  gint index = wanted ? find_file_index(files, wanted) : -1;
+  if (index < 0 && old_current && wanted == old_current &&
+      g_file_query_file_type(old_current,
+                             G_FILE_QUERY_INFO_NONE,
+                             NULL) == G_FILE_TYPE_REGULAR) {
+    /* Directly opened files with an unknown suffix are not discovered as
+     * neighbors, but remain part of the browsing session while they exist. */
+    g_ptr_array_add(files, g_object_ref(old_current));
+    g_ptr_array_sort(files, compare_files);
+    index = find_file_index(files, old_current);
+  }
+  if (index < 0 && old_current)
+    index = find_file_after_reference(files, old_current, NULL);
+
+  if (index < 0) {
+    reset_content_pipeline(self);
+    show_no_picture(self);
+    return;
+  }
+
+  const gboolean selected_file_changed =
+    !old_current ||
+    !g_file_equal(old_current, g_ptr_array_index(files, index));
+  g_clear_pointer(&self->files, g_ptr_array_unref);
+  self->files = g_steal_pointer(&files);
+  self->current_index = (guint)index;
+  clear_capacity_blocks(self);
+  prune_cache(self);
+  prune_render_cache(self);
+
+  if (selected_file_changed || changed_current_is_selected ||
+      !self->current_image || self->foreground_loading)
+    show_index(self, self->current_index, TRUE);
+  else {
+    update_controls(self);
+    preload_neighbors(self);
+  }
+}
+
+static gboolean
+directory_refresh_timeout(gpointer user_data)
+{
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  self->directory_reload_source_id = 0;
+  if (!self->directory_refresh_pending ||
+      self->operation_in_progress ||
+      !self->monitored_directory)
+    return G_SOURCE_REMOVE;
+
+  DirectoryRefreshJob *job = g_new0(DirectoryRefreshJob, 1);
+  job->directory = g_object_ref(self->monitored_directory);
+  job->changed_current =
+    self->monitor_changed_current
+      ? g_object_ref(self->monitor_changed_current)
+      : NULL;
+  job->replacement_current =
+    self->monitor_replacement_current
+      ? g_object_ref(self->monitor_replacement_current)
+      : NULL;
+  job->generation = self->generation;
+  job->monitor_generation = self->monitor_generation;
+
+  self->directory_refresh_pending = FALSE;
+  g_clear_object(&self->monitor_changed_current);
+  g_clear_object(&self->monitor_replacement_current);
+
+  GTask *task =
+    g_task_new(self,
+               self->load_cancellable,
+               directory_refresh_done,
+               NULL);
+  g_task_set_task_data(task,
+                       job,
+                       (GDestroyNotify)directory_refresh_job_free);
+  g_task_set_priority(task, G_PRIORITY_LOW);
+  g_task_run_in_thread(task, directory_refresh_worker);
+  g_object_unref(task);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_directory_refresh(LoslesWindow *self)
+{
+  if (!self->directory_refresh_pending ||
+      self->operation_in_progress ||
+      !self->monitored_directory)
+    return;
+
+  if (self->directory_reload_source_id)
+    g_source_remove(self->directory_reload_source_id);
+  self->directory_reload_source_id =
+    g_timeout_add_full(G_PRIORITY_DEFAULT,
+                       DIRECTORY_RELOAD_DELAY_MS,
+                       directory_refresh_timeout,
+                       g_object_ref(self),
+                       g_object_unref);
+}
+
+static void
+discard_pending_directory_refresh(LoslesWindow *self)
+{
+  if (self->directory_reload_source_id) {
+    g_source_remove(self->directory_reload_source_id);
+    self->directory_reload_source_id = 0;
+  }
+  self->directory_refresh_pending = FALSE;
+  g_clear_object(&self->monitor_changed_current);
+  g_clear_object(&self->monitor_replacement_current);
+  self->monitor_generation++;
+}
+
+static void
+directory_changed(GFileMonitor *monitor,
+                  GFile *file,
+                  GFile *other_file,
+                  GFileMonitorEvent event_type,
+                  gpointer user_data)
+{
+  (void)monitor;
+  LoslesWindow *self = LOSLES_WINDOW(user_data);
+  if (!monitor_event_changes_directory(event_type))
+    return;
+
+  const gboolean file_relevant =
+    monitored_file_is_relevant(self, file);
+  const gboolean other_relevant =
+    monitored_file_is_relevant(self, other_file);
+  if (!file_relevant && !other_relevant)
+    return;
+  if (event_type == G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED &&
+      !(file_relevant && cached_file_state_changed(self, file)) &&
+      !(other_relevant && cached_file_state_changed(self, other_file)))
+    return;
+
+  g_autoptr(GFile) selected =
+    current_file(self) ? g_object_ref(current_file(self)) : NULL;
+  const gboolean current_touched =
+    selected &&
+    ((file && g_file_equal(selected, file)) ||
+     (other_file && g_file_equal(selected, other_file)));
+
+  self->monitor_generation++;
+  self->directory_refresh_pending = TRUE;
+  if (file_relevant)
+    invalidate_file_content(self, file);
+  if (other_relevant &&
+      (!file || !g_file_equal(file, other_file)))
+    invalidate_file_content(self, other_file);
+
+  if (current_touched) {
+    g_set_object(&self->monitor_changed_current, selected);
+    if ((event_type == G_FILE_MONITOR_EVENT_RENAMED ||
+         event_type == G_FILE_MONITOR_EVENT_MOVED) &&
+        file && other_file && g_file_equal(selected, file) &&
+        losles_format_registry_supports_file(other_file))
+      g_set_object(&self->monitor_replacement_current, other_file);
+
+    if (!self->operation_in_progress) {
+      prepare_for_image_load(self, TRUE);
+      gtk_widget_set_visible(GTK_WIDGET(self->spinner), TRUE);
+      gtk_spinner_start(self->spinner);
+      set_status(self, "Reloading after the image changed on disk…");
+    }
+  }
+
+  schedule_directory_refresh(self);
+}
+
+static void
+clear_directory_monitor(LoslesWindow *self)
+{
+  discard_pending_directory_refresh(self);
+  if (self->directory_monitor)
+    g_file_monitor_cancel(self->directory_monitor);
+  g_clear_object(&self->directory_monitor);
+  g_clear_object(&self->monitored_directory);
+}
+
+static void
+set_directory_monitor(LoslesWindow *self, GFile *directory)
+{
+  discard_pending_directory_refresh(self);
+  if (self->directory_monitor && self->monitored_directory && directory &&
+      g_file_equal(self->monitored_directory, directory))
+    return;
+
+  if (self->directory_monitor)
+    g_file_monitor_cancel(self->directory_monitor);
+  g_clear_object(&self->directory_monitor);
+  g_set_object(&self->monitored_directory, directory);
+  if (!directory)
+    return;
+
+  g_autoptr(GError) error = NULL;
+  self->directory_monitor =
+    g_file_monitor_directory(directory,
+                             G_FILE_MONITOR_WATCH_MOVES,
+                             NULL,
+                             &error);
+  if (!self->directory_monitor) {
+    g_debug("Could not monitor image directory: %s", error->message);
+    return;
+  }
+  g_signal_connect(self->directory_monitor,
+                   "changed",
+                   G_CALLBACK(directory_changed),
+                   self);
 }
 
 static gboolean
@@ -2229,6 +2673,7 @@ warning_confirmation_done(GObject *source_object,
     show_error(self, "Could not ask for confirmation", error);
   else
     set_status(self, "Operation cancelled");
+  schedule_directory_refresh(self);
   edit_confirmation_free(confirmation);
 }
 
@@ -2295,12 +2740,22 @@ edit_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
 
     self->operation_in_progress = FALSE;
     update_controls(self);
-    show_error(self, "The lossless operation failed", error);
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG)) {
+      g_autoptr(GFile) source =
+        g_object_ref(losles_image_get_file(job->image));
+      show_error(self, "The image changed before it could be edited", error);
+      discard_pending_directory_refresh(self);
+      losles_window_open_file(self, source);
+    } else {
+      show_error(self, "The lossless operation failed", error);
+      schedule_directory_refresh(self);
+    }
     return;
   }
 
   self->operation_in_progress = FALSE;
   update_controls(self);
+  discard_pending_directory_refresh(self);
   losles_window_open_file(self, destination);
 }
 
@@ -2444,31 +2899,9 @@ apply_crop_clicked(GtkButton *button, LoslesWindow *self)
 static gint
 find_file_after_delete(DeleteJob *job, GPtrArray *files)
 {
-  if (!files || files->len == 0)
-    return -1;
-
-  if (job->preferred_next) {
-    const gint preferred_index =
-      find_file_index(files, job->preferred_next);
-    if (preferred_index >= 0)
-      return preferred_index;
-  }
-
-  g_autofree gchar *deleted_name = g_file_get_basename(job->file);
-  for (guint i = 0; deleted_name && i < files->len; i++) {
-    GFile *candidate = g_ptr_array_index(files, i);
-    g_autofree gchar *candidate_name =
-      g_file_get_basename(candidate);
-    if (candidate_name &&
-        g_utf8_collate(candidate_name, deleted_name) > 0)
-      return (gint)i;
-  }
-
-  /*
-   * No later image remains, so the deleted image was last relative to the
-   * rescan. Continue with its predecessor, which is now the final entry.
-   */
-  return (gint)files->len - 1;
+  return find_file_after_reference(files,
+                                   job->file,
+                                   job->preferred_next);
 }
 
 static void
@@ -2490,8 +2923,11 @@ delete_done(GObject *source_object,
   if (!delete_result) {
     update_controls(self);
     show_error(self, "Could not move the image to Trash", error);
+    schedule_directory_refresh(self);
     return;
   }
+
+  discard_pending_directory_refresh(self);
 
   if (delete_result->scan_error) {
     g_debug("The image was trashed, but its directory could not be "
@@ -3173,6 +3609,7 @@ losles_window_dispose(GObject *object)
 {
   LoslesWindow *self = LOSLES_WINDOW(object);
 
+  clear_directory_monitor(self);
   if (self->load_cancellable)
     g_cancellable_cancel(self->load_cancellable);
   if (self->render_cancellable)
@@ -3618,6 +4055,8 @@ losles_window_open_file(LoslesWindow *self, GFile *file)
     return;
 
   reset_content_pipeline(self);
+  g_autoptr(GFile) directory = g_file_get_parent(file);
+  set_directory_monitor(self, directory);
 
   g_clear_pointer(&self->files, g_ptr_array_unref);
   self->files =

@@ -17,6 +17,9 @@ fallback.
 Opening a file also discovers supported images in its parent directory for
 previous/next navigation.
 Nearby images are decoded and color-converted in the background.
+The parent directory is monitored, so externally changed images and the
+navigation list are reloaded automatically.
+Cached decoded images are checked against the current file state before use.
 .SH EDITING AND FILE SAFETY
 Editing is immediate and in place.
 Lossless JPEG operations rearrange DCT coefficients without decoding and
@@ -31,6 +34,11 @@ cropped replacement.
 The
 .B Delete
 shortcut also moves the current file to Trash.
+.PP
+Before any edit, losles compares the complete encoded file with the source
+that was decoded for display and checks it again before replacement.
+If the file changed externally or while the operation was running, the edit
+is refused without modifying the file and an error is shown.
 .PP
 JPEG transforms require a mathematically perfect coefficient operation.
 An operation fails rather than discarding incomplete edge blocks.

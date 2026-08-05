@@ -402,6 +402,7 @@ png_load(LoslesFormat *format,
                      pixel_format,
                      pixel_bytes,
                      (GBytes *)icc_profile,
+                     encoded,
                      1,
                      FALSE,
                      editable,
@@ -1013,6 +1014,11 @@ run_png_transform(LoslesImage *image,
                             error))
     return FALSE;
   g_autofree gchar *source_data = loaded;
+  if (!losles_image_verify_source_data(image,
+                                       (const guint8 *)source_data,
+                                       loaded_size,
+                                       error))
+    return FALSE;
 
   EditablePng decoded = {0};
   if (!decode_editable_png((const guint8 *)source_data,
@@ -1130,6 +1136,10 @@ run_png_transform(LoslesImage *image,
                           G_IO_ERROR,
                           G_IO_ERROR_NO_SPACE,
                           "The transformed PNG is too large to save");
+    remove_temporary_file(temporary_path);
+    return FALSE;
+  }
+  if (!losles_image_verify_source_file(image, cancellable, error)) {
     remove_temporary_file(temporary_path);
     return FALSE;
   }

@@ -628,6 +628,42 @@ load_path(LoslesFormatRegistry *registry, const gchar *path)
   return image;
 }
 
+static GBytes *
+append_external_change(const gchar *path)
+{
+  g_autofree gchar *contents = NULL;
+  gsize size = 0;
+  g_autoptr(GError) error = NULL;
+  g_assert_true(g_file_get_contents(path, &contents, &size, &error));
+  g_assert_no_error(error);
+
+  const guint8 suffix[] = {'l', 'o', 's', 'l', 'e', 's'};
+  guint8 *changed = g_malloc(size + sizeof(suffix));
+  memcpy(changed, contents, size);
+  memcpy(changed + size, suffix, sizeof(suffix));
+  g_assert_true(g_file_set_contents(path,
+                                    (const gchar *)changed,
+                                    size + sizeof(suffix),
+                                    &error));
+  g_assert_no_error(error);
+  return g_bytes_new_take(changed, size + sizeof(suffix));
+}
+
+static void
+assert_path_equals_bytes(const gchar *path, GBytes *expected)
+{
+  g_autofree gchar *contents = NULL;
+  gsize size = 0;
+  g_autoptr(GError) error = NULL;
+  g_assert_true(g_file_get_contents(path, &contents, &size, &error));
+  g_assert_no_error(error);
+
+  gsize expected_size = 0;
+  const guint8 *expected_data =
+    g_bytes_get_data(expected, &expected_size);
+  g_assert_cmpmem(contents, size, expected_data, expected_size);
+}
+
 static void
 test_embedded_profiles_and_render(void)
 {
@@ -1827,6 +1863,124 @@ test_in_place_rotation_rejects_symlink(void)
 }
 
 static void
+test_edit_rejects_changed_source(void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *directory =
+    g_dir_make_tmp("losles-source-changed-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_autofree gchar *jpeg_path =
+    g_build_filename(directory, "changed.jpg", NULL);
+  g_autofree gchar *oriented_path =
+    g_build_filename(directory, "changed-oriented.jpg", NULL);
+  g_autofree gchar *png_path =
+    g_build_filename(directory, "changed.png", NULL);
+  g_autoptr(GBytes) profile = make_srgb_profile();
+  write_test_jpeg(jpeg_path, profile, 1);
+  write_test_jpeg(oriented_path, profile, 6);
+  write_test_png(png_path, profile);
+
+  g_autoptr(LoslesFormatRegistry) registry =
+    losles_format_registry_new();
+
+  g_autoptr(LoslesImage) jpeg = load_path(registry, jpeg_path);
+  g_assert_true(losles_image_source_file_is_current(jpeg, NULL, &error));
+  g_assert_no_error(error);
+  g_autoptr(GBytes) changed_jpeg = append_external_change(jpeg_path);
+  g_assert_false(losles_image_source_file_is_current(jpeg, NULL, &error));
+  g_assert_no_error(error);
+  LoslesFormat *jpeg_format =
+    LOSLES_FORMAT(losles_image_get_format(jpeg));
+  g_autoptr(GFile) jpeg_file = g_file_new_for_path(jpeg_path);
+
+  g_assert_false(losles_format_rotate_lossless(jpeg_format,
+                                               jpeg,
+                                               jpeg_file,
+                                               LOSLES_ROTATE_RIGHT,
+                                               LOSLES_FORMAT_EDIT_NONE,
+                                               NULL,
+                                               &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
+  g_clear_error(&error);
+  assert_path_equals_bytes(jpeg_path, changed_jpeg);
+
+  const LoslesCrop jpeg_crop = {.x = 0, .y = 0, .width = 8, .height = 8};
+  g_assert_false(losles_format_crop_lossless(jpeg_format,
+                                             jpeg,
+                                             jpeg_file,
+                                             &jpeg_crop,
+                                             LOSLES_FORMAT_EDIT_NONE,
+                                             NULL,
+                                             &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
+  g_clear_error(&error);
+  assert_path_equals_bytes(jpeg_path, changed_jpeg);
+
+  g_autoptr(LoslesImage) oriented = load_path(registry, oriented_path);
+  g_autoptr(GBytes) changed_oriented =
+    append_external_change(oriented_path);
+  LoslesFormat *oriented_format =
+    LOSLES_FORMAT(losles_image_get_format(oriented));
+  g_autoptr(GFile) oriented_file = g_file_new_for_path(oriented_path);
+  g_assert_false(losles_format_normalize_orientation_lossless(
+    oriented_format,
+    oriented,
+    oriented_file,
+    LOSLES_FORMAT_EDIT_NONE,
+    NULL,
+    &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
+  g_clear_error(&error);
+  assert_path_equals_bytes(oriented_path, changed_oriented);
+
+  g_autoptr(LoslesImage) png = load_path(registry, png_path);
+  g_autoptr(GBytes) changed_png = append_external_change(png_path);
+  LoslesFormat *png_format =
+    LOSLES_FORMAT(losles_image_get_format(png));
+  g_autoptr(GFile) png_file = g_file_new_for_path(png_path);
+  g_assert_false(losles_format_rotate_lossless(png_format,
+                                               png,
+                                               png_file,
+                                               LOSLES_ROTATE_RIGHT,
+                                               LOSLES_FORMAT_EDIT_NONE,
+                                               NULL,
+                                               &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
+  g_clear_error(&error);
+  assert_path_equals_bytes(png_path, changed_png);
+
+  const LoslesCrop png_crop = {.x = 0, .y = 0, .width = 2, .height = 1};
+  g_assert_false(losles_format_crop_lossless(png_format,
+                                             png,
+                                             png_file,
+                                             &png_crop,
+                                             LOSLES_FORMAT_EDIT_NONE,
+                                             NULL,
+                                             &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
+  g_clear_error(&error);
+  assert_path_equals_bytes(png_path, changed_png);
+
+#ifndef G_OS_WIN32
+  const gchar *names[] = {
+    "changed.jpg",
+    "changed-oriented.jpg",
+    "changed.png",
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+    g_autofree gchar *trashed_path =
+      g_build_filename(test_data_home, "Trash", "files", names[i], NULL);
+    g_assert_false(g_file_test(trashed_path, G_FILE_TEST_EXISTS));
+  }
+#endif
+
+  g_assert_cmpint(g_remove(jpeg_path), ==, 0);
+  g_assert_cmpint(g_remove(oriented_path), ==, 0);
+  g_assert_cmpint(g_remove(png_path), ==, 0);
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static void
 test_invalid_inputs(void)
 {
   g_autoptr(GError) error = NULL;
@@ -1911,6 +2065,8 @@ main(int argc, char **argv)
                   test_orientation_normalization);
   g_test_add_func("/formats/in-place-rotation-rejects-symlink",
                   test_in_place_rotation_rejects_symlink);
+  g_test_add_func("/formats/edit-rejects-changed-source",
+                  test_edit_rejects_changed_source);
   g_test_add_func("/formats/invalid-inputs", test_invalid_inputs);
   const gint result = g_test_run();
   remove_tree(test_data_home);

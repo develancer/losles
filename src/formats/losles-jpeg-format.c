@@ -216,6 +216,7 @@ jpeg_load(LoslesFormat *format,
                                : LOSLES_PIXEL_FORMAT_RGB8,
                      pixel_bytes,
                      (GBytes *)icc_profile,
+                     encoded,
                      orientation,
                      has_exif_orientation,
                      TRUE,
@@ -583,6 +584,11 @@ run_turbojpeg_transform(LoslesImage *image,
                             error))
     return FALSE;
   g_autofree gchar *source_bytes = source_data;
+  if (!losles_image_verify_source_data(image,
+                                       (const guint8 *)source_bytes,
+                                       source_size,
+                                       error))
+    return FALSE;
   if (source_size > G_MAXULONG) {
     g_set_error_literal(error,
                         G_IO_ERROR,
@@ -675,6 +681,10 @@ run_turbojpeg_transform(LoslesImage *image,
       !losles_jpeg_metadata_set_orientation_in_file(temporary_path,
                                                     1,
                                                     error)) {
+    remove_temporary_file(temporary_path);
+    return FALSE;
+  }
+  if (!losles_image_verify_source_file(image, cancellable, error)) {
     remove_temporary_file(temporary_path);
     return FALSE;
   }
